@@ -29,6 +29,23 @@ local SQLite&nbsp;&nbsp;·&nbsp;&nbsp;vector recall&nbsp;&nbsp;·&nbsp;&nbsp;MCP
 
 <br>
 
+## Why this is a big deal
+
+You already know the problem: every chat with an AI is a fresh start. You re-explain your stack, your team, your taste. You catch the model making the same mistake it made yesterday because nothing carries over. The "memory" feature your assistant claims to have is a 2KB summary that forgets the nuance.
+
+Mnemo flips it.
+
+- **The agent you talk to tomorrow is the same agent you talked to today.** Not a fresh instance with a vague summary — the same memory, the same values, the same in-flight commitments.
+- **Your team's PCs become one nervous system.** Pair every machine with `mnemo-pc`. Now your agent can fix a bug on the home desktop while you're on the laptop. Same persona. Same memory. Different keyboard.
+- **It catches itself.** Promises tracked, follow-ups detected, scars recorded automatically when the owner pushes back. The agent gets better not because it's smarter — because it stops repeating the move you already corrected.
+- **Multi-tenant out of the gate.** One Mnemo can host every customer's agent in isolated SQLite files. Drop a header, get isolation. SaaS-ready without rewriting a thing.
+- **Local-first, MIT-licensed, no third parties.** No Pinecone subscription, no Weaviate cluster, no OpenAI lock-in for embeddings (we ship a local 384-dim model). Your customers' memories live on your hardware. That is increasingly the only viable position.
+- **Soon: it answers the phone.** A native iOS + Android app pairs the same way `mnemo-pc` does. Your agent makes calls from your number, reads SMS, navigates apps you have open, asks for confirmation when it matters.
+
+This isn't memory-as-a-feature. It's the substrate that lets a chat assistant become an actual assistant — one that grows with you instead of restarting under you.
+
+<br>
+
 ## What it is
 
 A persistent memory + identity engine for AI agents. Think of it as the brain layer your favourite LLM client (Claude Code, Cursor, Cline, your own loop) plugs into so it stops starting from zero on every fresh session.
