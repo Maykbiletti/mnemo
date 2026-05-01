@@ -31,9 +31,16 @@ local SQLite&nbsp;&nbsp;·&nbsp;&nbsp;vector recall&nbsp;&nbsp;·&nbsp;&nbsp;MCP
 
 ## Why this is a big deal
 
-You already know the problem: every chat with an AI is a fresh start. You re-explain your stack, your team, your taste. You catch the model making the same mistake it made yesterday because nothing carries over. The "memory" feature your assistant claims to have is a 2KB summary that forgets the nuance.
+You already know the problem. The specific moments that hurt:
 
-Mnemo flips it.
+- **Your session got compacted.** Claude Code, Cursor, ChatGPT all do it. The window hits its limit, the assistant rewrites the older half into a "summary," and the nuance you spent twenty minutes establishing — the architectural choice, the bug you finally pinned, the thing the user said about their database — turns into one-line lossy prose. Twenty minutes later you're explaining it again because the summary didn't survive.
+- **You opened a new chat.** Different window, different conversation, different model — same project. None of yesterday is here. You paste in the file you already discussed, repeat the constraint you already mentioned, ask the question you already answered.
+- **You switched IDE.** Claude Code → Cursor. Or Cursor → Claude.ai. Or Claude.ai → the API. Each one starts at zero. The agent that knew your codebase yesterday is back to "what's this repo about."
+- **Your team-mate took over.** They opened your project, asked the agent for help, got a different answer because the agent doesn't know the half-conversation you and it had on Tuesday.
+
+Every fix to this you've seen so far is the same trick at a different layer: stuff a longer summary into the system prompt, hope the model doesn't drop it, and pay for the tokens forever. That isn't memory. That's prompt-engineering pretending to be memory.
+
+Mnemo flips it. The substrate is a SQLite file that lives on your disk, holds every word verbatim, indexes them with both keyword and vector search, and exposes a 27-tool MCP surface so any assistant in any window can ask "what did we decide about X?" and get the actual answer in milliseconds. Compaction stops eating your context because the context stops living in the chat window. Session switches stop costing you anything because the session was never where the memory lived. New IDE? Wire the MCP server. Two minutes. Same memory.
 
 - **The agent you talk to tomorrow is the same agent you talked to today.** Not a fresh instance with a vague summary — the same memory, the same values, the same in-flight commitments.
 - **Your team's PCs become one nervous system.** Pair every machine with `mnemo-pc`. Now your agent can fix a bug on the home desktop while you're on the laptop. Same persona. Same memory. Different keyboard.
