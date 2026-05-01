@@ -40,14 +40,40 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 
+// ---------- Multi-tenant pool ----------
+// Each tenant gets its own SQLite file at TENANT_ROOT/<id>/mnemo.db
+// Pool keeps DB handles open; falls back to host db when no tenant header.
+const TENANT_ROOT = process.env.MNEMO_TENANT_ROOT || path.join(__dirname, "tenants");
+if (!fs.existsSync(TENANT_ROOT)) fs.mkdirSync(TENANT_ROOT, { recursive: true });
+const tenantPool = new Map();
+function safeId(id) { return String(id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64); }
+function tenantDb(id) {
+  const safe = safeId(id);
+  if (!safe) return null;
+  if (tenantPool.has(safe)) return tenantPool.get(safe);
+  const dir = path.join(TENANT_ROOT, safe);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const dbFile = path.join(dir, "mnemo.db");
+  const tdb = new Database(dbFile);
+  tdb.pragma("journal_mode = WAL");
+  tdb.pragma("synchronous = NORMAL");
+  try {
+    const schemaPath = path.join(__dirname, "schema.sql");
+    if (fs.existsSync(schemaPath)) tdb.exec(fs.readFileSync(schemaPath, "utf8"));
+  } catch (e) { console.error("[tenant-bootstrap]", safe, e.message); }
+  tenantPool.set(safe, tdb);
+  return tdb;
+}
+function dbForRequest(req) {
+  const tid = req.headers["x-tenant-id"];
+  if (!tid) return db;
+  const t = tenantDb(tid);
+  return t || db;
+}
+
 const now = () => new Date().toISOString();
 const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
-const insertMem = db.prepare(`
-  INSERT OR IGNORE INTO memory
-    (kind, source, source_ref, occurred_at, actor, actor_id, topic, importance, text, meta_json, hash)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?)
-`);
 const upsertWriter = db.prepare(`
   INSERT INTO writer_health (writer, last_write_at, rows_written, status, last_check_at)
   VALUES (?,?,?,?,?)
@@ -62,11 +88,16 @@ function recordWrite(writer, rowsAdded, status = "alive") {
   upsertWriter.run(writer, rowsAdded > 0 ? now() : null, rowsAdded, status, now());
 }
 
-function ingestEvent({ kind, source, source_ref, occurred_at, actor, actor_id, topic, importance, text, meta }) {
+function ingestEvent(target, { kind, source, source_ref, occurred_at, actor, actor_id, topic, importance, text, meta }) {
   if (!kind || !text || typeof text !== "string") return { ok: false, error: "missing kind or text" };
   const occurred = occurred_at || now();
   const hash = sha([kind, source_ref || "", occurred, text].join("|"));
-  const r = insertMem.run(
+  const stmt = target.prepare(`
+    INSERT OR IGNORE INTO memory
+      (kind, source, source_ref, occurred_at, actor, actor_id, topic, importance, text, meta_json, hash)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const r = stmt.run(
     kind, source || "http", source_ref || null, occurred,
     actor || null, actor_id || null, topic || null,
     importance ?? 5, text, meta ? JSON.stringify(meta) : null, hash
@@ -77,10 +108,13 @@ function ingestEvent({ kind, source, source_ref, occurred_at, actor, actor_id, t
 // ---------- HTTP server ----------
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const tdb = dbForRequest(req);
+  const tenantId = req.headers["x-tenant-id"] || null;
   if (req.method === "GET" && url.pathname === "/health") {
     const stats = {
-      memory_rows: db.prepare("SELECT COUNT(*) c FROM memory").get().c,
-      writers: db.prepare("SELECT writer, status, last_write_at, rows_written FROM writer_health").all(),
+      tenant: tenantId,
+      memory_rows: tdb.prepare("SELECT COUNT(*) c FROM memory").get().c,
+      writers: tdb.prepare("SELECT writer, status, last_write_at, rows_written FROM writer_health").all(),
       uptime_sec: Math.round(process.uptime()),
     };
     res.writeHead(200, { "content-type": "application/json" });
@@ -93,11 +127,11 @@ const server = http.createServer((req, res) => {
       try {
         const payload = JSON.parse(body);
         const events = Array.isArray(payload) ? payload : [payload];
-        const results = events.map(e => ingestEvent(e));
+        const results = events.map(e => ingestEvent(tdb, e));
         const added = results.filter(r => r.inserted).length;
-        recordWrite("http_ingest", added);
+        if (!tenantId) recordWrite("http_ingest", added);
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ accepted: events.length, inserted: added, results }));
+        return res.end(JSON.stringify({ tenant: tenantId, accepted: events.length, inserted: added, results }));
       } catch (e) {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: String(e.message) }));
@@ -112,7 +146,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(400); return res.end(JSON.stringify({ error: "q required" }));
     }
     try {
-      const rows = db.prepare(`
+      const rows = tdb.prepare(`
         SELECT m.id, m.kind, m.actor, m.occurred_at, substr(m.text,1,300) preview, bm25(memory_fts) rank
         FROM memory_fts JOIN memory m ON m.id=memory_fts.rowid
         WHERE memory_fts MATCH ?

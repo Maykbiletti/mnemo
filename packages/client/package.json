@@ -1,0 +1,8 @@
+{
+  "name": "@mnemo/client",
+  "version": "0.1.0",
+  "description": "Lightweight Node client for Mnemo. Tenant-aware HTTP wrapper for /ingest, /recall, /who-am-i, /promise/open, /commitment/due. Drop into any service that wants a memory layer.",
+  "license": "MIT",
+  "main": "index.js",
+  "engines": { "node": ">=18.0.0" }
+}
