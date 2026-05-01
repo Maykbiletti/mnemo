@@ -492,8 +492,9 @@ ${args.first_invocation_outcome || "(none)"}
       let corrections = 0, praises = 0;
       const correctionPatterns = /\b(nicht so|nein|stop|hör auf|falsch|kein|fantasi|verarscht|kacke|scheiße|kaputt)/i;
       const praisePatterns = /\b(geil|super|perfekt|top|stark|hammer|granate|geil gemacht)/i;
+      const ownerName = process.env.MNEMO_OWNER_NAME || "Mayk";
       for (const e of events) {
-        if (e.actor !== "Mayk") continue;
+        if (e.actor !== ownerName) continue;
         if (correctionPatterns.test(e.text)) corrections++;
         if (praisePatterns.test(e.text)) praises++;
       }
@@ -509,6 +510,248 @@ ${args.first_invocation_outcome || "(none)"}
           generated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
       `).run(d, events.length, corrections, praises, summary, "{}", "{}");
       return { date: d, events: events.length, corrections, praises, summary };
+    },
+  },
+
+  // ----------------------------------------------------------------------
+  // Phase 1.5 additions — cycles + commitments + session-route + delegate
+  // ----------------------------------------------------------------------
+
+  mem_cycle_recent: {
+    description: "Recent consolidation-cycle events. Phase: pulse (hourly cluster) | settle (nightly synth) | arc (weekly drift). Returns most-recent first with summary + delta.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        phase: { type: "string", enum: ["pulse", "settle", "arc", "all"], default: "all" },
+        limit: { type: "integer", default: 10, minimum: 1, maximum: 50 },
+      },
+    },
+    handler: ({ phase = "all", limit = 10 }) => {
+      try {
+        const where = phase === "all" ? "1=1" : "phase = ?";
+        const params = phase === "all" ? [] : [phase];
+        params.push(Math.min(limit, 50));
+        return db.prepare(
+          `SELECT id, phase, ran_at, window_from, window_to, inputs_count, promoted_count, summary, delta_json
+           FROM cycle_event WHERE ${where} ORDER BY ran_at DESC LIMIT ?`
+        ).all(...params);
+      } catch (e) { return { error: "cycle_event missing — run cycles.js first", detail: String(e.message) }; }
+    },
+  },
+
+  mem_commitment_open: {
+    description: "Owner-side inferred commitments (meetings/deadlines/events) currently open. Distinct from mem_promise_open which tracks agent-side promises.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: { type: "string", description: "filter by category: meeting | interview | deadline | event | trip" },
+        limit: { type: "integer", default: 50, minimum: 1, maximum: 200 },
+      },
+    },
+    handler: ({ category, limit = 50 }) => {
+      try {
+        const where = ["status = 'open'"];
+        const params = [];
+        if (category) { where.push("category = ?"); params.push(category); }
+        params.push(Math.min(limit, 200));
+        return db.prepare(
+          `SELECT id, text, category, expected_followup_at, detected_at, origin_memory_id
+           FROM commitment WHERE ${where.join(" AND ")} ORDER BY expected_followup_at ASC NULLS LAST LIMIT ?`
+        ).all(...params);
+      } catch (e) { return { error: "commitment table missing — run commitments.js scan first", detail: String(e.message) }; }
+    },
+  },
+
+  mem_commitment_due: {
+    description: "Commitments due within the next horizon-hours (default 24). Use during morning/evening self-checks to surface what to follow up on today.",
+    inputSchema: {
+      type: "object",
+      properties: { horizon_hours: { type: "integer", default: 24, minimum: 1, maximum: 720 } },
+    },
+    handler: ({ horizon_hours = 24 }) => {
+      try {
+        const horizon = new Date(Date.now() + horizon_hours * 3600e3).toISOString();
+        return db.prepare(
+          `SELECT id, text, category, expected_followup_at, detected_at
+           FROM commitment WHERE status='open' AND expected_followup_at IS NOT NULL AND expected_followup_at <= ?
+           ORDER BY expected_followup_at ASC`
+        ).all(horizon);
+      } catch (e) { return { error: "commitment table missing", detail: String(e.message) }; }
+    },
+  },
+
+  mem_commitment_close: {
+    description: "Mark a commitment as closed with an outcome (happened | postponed | cancelled | unknown).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        outcome: { type: "string", enum: ["happened", "postponed", "cancelled", "unknown"] },
+        notes: { type: "string" },
+      },
+      required: ["id", "outcome"],
+    },
+    handler: ({ id, outcome, notes }) => {
+      try {
+        db.prepare(
+          "UPDATE commitment SET status='closed', closed_at=?, outcome=?, notes=COALESCE(?, notes) WHERE id=?"
+        ).run(new Date().toISOString(), outcome, notes || null, id);
+        return { id, closed: true, outcome };
+      } catch (e) { return { error: String(e.message) }; }
+    },
+  },
+
+  mem_session_route_set: {
+    description: "Set the active outbound channel route for a session_id (used for mid-thread channel switching). Returns the recorded route.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        channel: { type: "string", description: "telegram | whatsapp | email | <future>" },
+        recipient: { type: "string", description: "chat_id / phone / email" },
+        set_by: { type: "string", default: "owner" },
+        notes: { type: "string" },
+      },
+      required: ["session_id", "channel", "recipient"],
+    },
+    handler: ({ session_id, channel, recipient, set_by = "owner", notes }) => {
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS session_route (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, channel TEXT NOT NULL,
+          recipient TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          set_by TEXT, notes TEXT
+        )`);
+        const r = db.prepare(
+          "INSERT INTO session_route (session_id, channel, recipient, set_by, notes) VALUES (?,?,?,?,?)"
+        ).run(session_id, channel, recipient, set_by, notes || null);
+        return { id: r.lastInsertRowid, session_id, channel, recipient };
+      } catch (e) { return { error: String(e.message) }; }
+    },
+  },
+
+  mem_session_route_get: {
+    description: "Current outbound channel route for a session_id, plus the route history.",
+    inputSchema: {
+      type: "object",
+      properties: { session_id: { type: "string" }, history_limit: { type: "integer", default: 10 } },
+      required: ["session_id"],
+    },
+    handler: ({ session_id, history_limit = 10 }) => {
+      try {
+        const current = db.prepare(
+          "SELECT channel, recipient, set_at, set_by FROM session_route WHERE session_id=? ORDER BY set_at DESC LIMIT 1"
+        ).get(session_id) || null;
+        const history = db.prepare(
+          "SELECT channel, recipient, set_at, set_by, notes FROM session_route WHERE session_id=? ORDER BY set_at DESC LIMIT ?"
+        ).all(session_id, Math.min(history_limit, 100));
+        return { current, history };
+      } catch (e) { return { error: String(e.message), current: null, history: [] }; }
+    },
+  },
+
+  mem_agent_register: {
+    description: "Register a new agent identity hosted by this Mnemo. Each agent has its own display_name + optional channels + optional SOUL.md path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "internal handle (snake_case)" },
+        display_name: { type: "string", description: "how it signs ('Dieter', 'Felix', 'Ops Bot')" },
+        email: { type: "string" },
+        channels: { type: "array", items: { type: "object", properties: { channel: { type: "string" }, recipient: { type: "string" } } } },
+        soul_path: { type: "string" },
+      },
+      required: ["name", "display_name"],
+    },
+    handler: ({ name, display_name, email, channels, soul_path }) => {
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS agent_identity (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
+          email TEXT, channels TEXT, soul_path TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), status TEXT NOT NULL DEFAULT 'active'
+        )`);
+        const r = db.prepare(
+          "INSERT OR IGNORE INTO agent_identity (name, display_name, email, channels, soul_path) VALUES (?,?,?,?,?)"
+        ).run(name, display_name, email || null, channels ? JSON.stringify(channels) : null, soul_path || null);
+        return { name, display_name, inserted: r.changes > 0 };
+      } catch (e) { return { error: String(e.message) }; }
+    },
+  },
+
+  mem_agent_list: {
+    description: "List all agent identities hosted by this Mnemo.",
+    inputSchema: { type: "object", properties: { active_only: { type: "boolean", default: true } } },
+    handler: ({ active_only = true }) => {
+      try {
+        const where = active_only ? "WHERE status='active'" : "";
+        return db.prepare(`SELECT name, display_name, email, channels, soul_path, status FROM agent_identity ${where} ORDER BY name`).all()
+          .map(r => ({ ...r, channels: r.channels ? JSON.parse(r.channels) : [] }));
+      } catch (e) { return []; }
+    },
+  },
+
+  mem_delegation_grant: {
+    description: "Grant an agent the authority to act on behalf of a principal within a scope. Scope can be 'all' | 'comms' | 'finance' | comma-list of skill names.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        principal: { type: "string", description: "name of the human/org the agent acts for" },
+        scope: { type: "string", default: "all" },
+        notes: { type: "string" },
+      },
+      required: ["agent_name", "principal"],
+    },
+    handler: ({ agent_name, principal, scope = "all", notes }) => {
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS delegation (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL, principal TEXT NOT NULL,
+          scope TEXT NOT NULL, granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          revoked_at TEXT, notes TEXT
+        )`);
+        const r = db.prepare(
+          "INSERT INTO delegation (agent_name, principal, scope, notes) VALUES (?,?,?,?)"
+        ).run(agent_name, principal, scope, notes || null);
+        return { id: r.lastInsertRowid, agent_name, principal, scope };
+      } catch (e) { return { error: String(e.message) }; }
+    },
+  },
+
+  mem_skill_run: {
+    description: "Execute a skill by name. Routes through sandbox.js — Docker-isolated for skills with needs_sandbox: true, inline for sandbox: none, surfaced as not-yet-supported for browser_only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "skill folder name in skills/" },
+        input: { type: "object", description: "JSON input passed to run.js on stdin" },
+        timeout_sec: { type: "integer", default: 60, minimum: 1, maximum: 600 },
+      },
+      required: ["name"],
+    },
+    handler: async ({ name, input = {}, timeout_sec = 60 }) => {
+      try {
+        const { runSkill } = require("./sandbox");
+        return await runSkill(name, input, { timeout_sec });
+      } catch (e) { return { ok: false, error: String(e.message) }; }
+    },
+  },
+
+  mem_delegation_active: {
+    description: "List active (non-revoked) delegations. Filter by agent_name or principal.",
+    inputSchema: {
+      type: "object",
+      properties: { agent_name: { type: "string" }, principal: { type: "string" } },
+    },
+    handler: ({ agent_name, principal }) => {
+      try {
+        const where = ["revoked_at IS NULL"];
+        const params = [];
+        if (agent_name) { where.push("agent_name=?"); params.push(agent_name); }
+        if (principal) { where.push("principal=?"); params.push(principal); }
+        return db.prepare(
+          `SELECT id, agent_name, principal, scope, granted_at, notes
+           FROM delegation WHERE ${where.join(" AND ")} ORDER BY granted_at DESC`
+        ).all(...params);
+      } catch (e) { return []; }
     },
   },
 };
