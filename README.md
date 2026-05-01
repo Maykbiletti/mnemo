@@ -1,8 +1,13 @@
 # Mnemo
 
+[![CI](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml/badge.svg)](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-green.svg)](.nvmrc)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](./ROADMAP.md)
+
 **Persistent memory + identity engine for personal and team agents.** A SQLite-backed memory layer with FTS5, vector embeddings (via sqlite-vec), an MCP server, and a multi-channel adapter — so your AI agent never starts a conversation at zero.
 
-> If you've ever told Claude/ChatGPT/Codex the same thing twice, Mnemo is the layer that keeps everything you said and let it find again. Locally. Yours. MIT-licensed.
+> If you've ever told Claude/ChatGPT/Codex the same thing twice, Mnemo is the layer that keeps everything you said and lets it find what matters again. Locally. Yours. MIT-licensed.
 
 ## What it gives you
 

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x, 22.x]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: packages/core/package-lock.json
+
+      - name: Install dependencies
+        working-directory: packages/core
+        run: npm install --no-audit --no-fund
+
+      - name: Syntax check core JS files
+        working-directory: packages/core
+        run: |
+          for f in *.js channels/*.js bin/*.js; do
+            node --check "$f"
+            echo "ok: $f"
+          done
+
+      - name: Bootstrap an empty Mnemo DB
+        working-directory: packages/core
+        env:
+          MNEMO_DB: /tmp/test-mnemo.db
+        run: |
+          node -e "
+          const Database = require('better-sqlite3');
+          const fs = require('fs');
+          const db = new Database(process.env.MNEMO_DB);
+          db.exec(fs.readFileSync('schema.sql', 'utf8'));
+          db.exec(fs.readFileSync('identity_schema.sql', 'utf8'));
+          db.close();
+          console.log('schema applied');
+          "
+          test -f /tmp/test-mnemo.db
+          echo "db file created"
+
+      - name: Smoke-test MCP initialize handshake
+        working-directory: packages/core
+        env:
+          MNEMO_DB: /tmp/test-mnemo.db
+        run: |
+          (echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}'; sleep 1) \
+            | timeout 5 node mcp.js \
+            | head -1 \
+            | grep -q 'protocolVersion'
+          echo "MCP handshake ok"
