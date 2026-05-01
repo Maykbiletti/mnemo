@@ -18,13 +18,17 @@ You access it via the **MCP server** (`mcp.js`), exposed as 13 tools.
 
 At the start of any non-trivial task, run this in order:
 
-1. **`mem_who_am_i()`** — pulls your current identity: active core values, top-weighted traits, last daily reflection. This grounds your tone and behavior. Do this once per session.
+0. **`mem_session_brief({ token_budget: 250 })`** — your wake-up call. One tool call returns your identity, top traits, open promises, open commitments, today's signals, and recent decisions, all shaped to fit in a few hundred tokens. **Do this first, always.** It replaces the next 3-4 individual calls when you only need orientation. Use a larger `token_budget` if you have headroom.
+
+1. **`mem_who_am_i()`** — full self-state when you need depth beyond `mem_session_brief`'s identity layer (every active value, every trait, last reflection in detail).
 
 2. **`mem_recall(query)`** — search for context related to the user's request. Use `mode: "hybrid"` (default) which fuses keyword + semantic. If you don't know what to query, query whatever nouns or topics appear in the user's message.
 
 3. **`mem_skill_search(query)`** — check if a recipe already exists for the task type. If so, follow it. **Never reinvent a recipe that has been recorded.** This is how Mnemo grows — the second time someone asks for a flight booking, you don't start from scratch.
 
 4. **`mem_promise_open()`** — check what you've committed to and not yet delivered. Surfacing forgotten promises is one of the highest-value things you can do for your owner.
+
+5. **`mem_commitment_due({ horizon_hours: 24 })`** — what does the owner have on their plate today? Surface time-sensitive items unprompted.
 
 ## During the task
 
@@ -82,10 +86,10 @@ The owner may have wired Mnemo to Telegram (or later: WhatsApp, Email). If so, y
 
 ```
 session_start:
-  - mem_who_am_i()
-  - mem_recall(<topic of user request>)
-  - mem_skill_search(<verb of user request>)
-  - mem_promise_open()
+  - mem_session_brief({token_budget: 250})        # one call → identity + open loops + today
+  - mem_recall(<topic of user request>)           # only if request needs depth
+  - mem_skill_search(<verb of user request>)      # don't reinvent
+  - mem_commitment_due({horizon_hours: 24})       # what hits today
 during_task:
   - mem_task_start / mem_task_finish for non-trivial work
 after_task:

@@ -716,6 +716,111 @@ ${args.first_invocation_outcome || "(none)"}
     },
   },
 
+  mem_session_brief: {
+    description: "Layered session-bootstrap. Returns identity + critical context shaped to a token budget so an agent can wake up oriented in a few hundred tokens instead of doing 30 min of mem_recall. Same surface for the host agent and any tenant agent — DB routes via the calling daemon, layer shape is identical.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token_budget: { type: "integer", default: 200, minimum: 50, maximum: 4000, description: "approximate token budget; layers are added in order until budget is reached" },
+        layers: { type: "array", items: { type: "string", enum: ["identity", "traits", "open_loops", "today", "recent_decisions"] }, description: "explicit layer set; defaults to all up to budget" },
+        owner_name: { type: "string", description: "filter open promises/commitments to this owner; default reads from $MNEMO_OWNER_NAME" },
+      },
+    },
+    handler: ({ token_budget = 200, layers, owner_name }) => {
+      // crude token estimate: ~4 chars per token
+      const est = (s) => Math.ceil(String(s || "").length / 4);
+      const owner = owner_name || process.env.MNEMO_OWNER_NAME || "owner";
+      const want = new Set(layers && layers.length ? layers : ["identity", "traits", "open_loops", "today", "recent_decisions"]);
+      const out = { generated_at: new Date().toISOString(), token_budget, layers: {} };
+      let used = 0;
+
+      // L0 — identity (~50 tokens): owner, top 3 hard-locked values, top 1 trait
+      if (want.has("identity")) {
+        try {
+          const values = db.prepare(
+            "SELECT name, statement FROM core_value WHERE is_active=1 ORDER BY name LIMIT 3"
+          ).all();
+          const trait = db.prepare(
+            "SELECT name, weight FROM personality_trait ORDER BY weight DESC LIMIT 1"
+          ).get();
+          const identity = {
+            owner,
+            top_values: values.map(v => ({ name: v.name, statement: v.statement.slice(0, 80) })),
+            top_trait: trait ? { name: trait.name, weight: trait.weight } : null,
+          };
+          out.layers.identity = identity;
+          used += est(JSON.stringify(identity));
+        } catch (e) { out.layers.identity = { error: e.message }; }
+      }
+
+      // L1 — traits + last reflection (~120 tokens cumulative)
+      if (want.has("traits") && used < token_budget) {
+        try {
+          const traits = db.prepare(
+            "SELECT name, weight, notes FROM personality_trait ORDER BY weight DESC LIMIT 8"
+          ).all();
+          const lastRefl = db.prepare(
+            "SELECT reflection_date, summary, next_day_focus FROM daily_reflection ORDER BY reflection_date DESC LIMIT 1"
+          ).get();
+          const block = { traits: traits.map(t => ({ name: t.name, w: Math.round(t.weight * 100) / 100, capped: !!(t.notes && /HARD_CAP/.test(t.notes)) })), last_reflection: lastRefl };
+          out.layers.traits = block;
+          used += est(JSON.stringify(block));
+        } catch (e) { out.layers.traits = { error: e.message }; }
+      }
+
+      // L2 — open loops: open promises + open commitments
+      if (want.has("open_loops") && used < token_budget) {
+        try {
+          let openPromises = [];
+          try {
+            openPromises = db.prepare(
+              "SELECT id, substr(text,1,120) preview, promised_at FROM promise WHERE status='open' ORDER BY promised_at DESC LIMIT 5"
+            ).all();
+          } catch {}
+          let openCommitments = [];
+          try {
+            openCommitments = db.prepare(
+              "SELECT id, substr(text,1,120) preview, category, expected_followup_at FROM commitment WHERE status='open' ORDER BY expected_followup_at ASC NULLS LAST LIMIT 5"
+            ).all();
+          } catch {}
+          const block = { open_promises: openPromises, open_commitments: openCommitments };
+          out.layers.open_loops = block;
+          used += est(JSON.stringify(block));
+        } catch (e) { out.layers.open_loops = { error: e.message }; }
+      }
+
+      // L2.5 — today: recent messages from owner (last 24h, top 5 by importance)
+      if (want.has("today") && used < token_budget) {
+        try {
+          const since = new Date(Date.now() - 24 * 3600e3).toISOString();
+          const rows = db.prepare(
+            "SELECT actor, substr(text,1,140) preview, occurred_at FROM memory WHERE kind='message' AND occurred_at > ? AND actor=? ORDER BY importance DESC, occurred_at DESC LIMIT 5"
+          ).all(since, owner);
+          const block = { window: "last_24h", from: owner, recent: rows };
+          out.layers.today = block;
+          used += est(JSON.stringify(block));
+        } catch (e) { out.layers.today = { error: e.message }; }
+      }
+
+      // L3 — recent decisions (last 7 days, kind=decision OR importance>=8)
+      if (want.has("recent_decisions") && used < token_budget) {
+        try {
+          const since = new Date(Date.now() - 7 * 86400e3).toISOString();
+          const rows = db.prepare(
+            "SELECT actor, kind, substr(text,1,180) preview, occurred_at, importance FROM memory WHERE occurred_at > ? AND (kind='decision' OR importance >= 8) ORDER BY occurred_at DESC LIMIT 8"
+          ).all(since);
+          const block = { window: "last_7d", decisions_or_high_importance: rows };
+          out.layers.recent_decisions = block;
+          used += est(JSON.stringify(block));
+        } catch (e) { out.layers.recent_decisions = { error: e.message }; }
+      }
+
+      out.estimated_tokens = used;
+      out.over_budget = used > token_budget;
+      return out;
+    },
+  },
+
   mem_skill_run: {
     description: "Execute a skill by name. Routes through sandbox.js — Docker-isolated for skills with needs_sandbox: true, inline for sandbox: none, surfaced as not-yet-supported for browser_only.",
     inputSchema: {
