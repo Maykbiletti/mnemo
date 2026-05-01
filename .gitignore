@@ -1,0 +1,22 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+.tg_offset
+.models/
+exports/
+sources/
+.env
+.env.local
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+dist/
+build/
+coverage/
+
+# Personal pack — NEVER commit private personality data
+packages/pack-dieter/data/
+packages/pack-*/data/
