@@ -4,11 +4,11 @@
 
 # &nbsp;&nbsp;**M&nbsp;N&nbsp;E&nbsp;M&nbsp;O**&nbsp;&nbsp;
 
-### the memory backbone your AI agent should ship with
+### the memory backbone — and coordination layer — your AI agent should ship with
 
 <br>
 
-local SQLite&nbsp;&nbsp;·&nbsp;&nbsp;vector recall&nbsp;&nbsp;·&nbsp;&nbsp;MCP server&nbsp;&nbsp;·&nbsp;&nbsp;multi-tenant&nbsp;&nbsp;·&nbsp;&nbsp;multi-PC
+local SQLite&nbsp;&nbsp;·&nbsp;&nbsp;vector recall&nbsp;&nbsp;·&nbsp;&nbsp;MCP server&nbsp;&nbsp;·&nbsp;&nbsp;multi-tenant&nbsp;&nbsp;·&nbsp;&nbsp;**Mnemo Connect: distributed agents across N PCs**
 
 <br>
 
@@ -24,8 +24,9 @@ local SQLite&nbsp;&nbsp;·&nbsp;&nbsp;vector recall&nbsp;&nbsp;·&nbsp;&nbsp;MCP
 
 ---
 
-> **Stop telling your AI the same thing twice.**
+> **Stop telling your AI the same thing twice. Stop coordinating your AI workforce by hand.**
 > Mnemo keeps every conversation, decision, scar and dream in one SQLite file your agent can search forever — locally, with you in control.
+> **Mnemo Connect** turns that same SQLite into the coordination layer for a distributed agent team: register N agents across N machines, post one brief to a channel, the hub fans it out by skill. One owner, many agents, shared memory. See [`packages/connect/`](packages/connect/).
 
 <br>
 
