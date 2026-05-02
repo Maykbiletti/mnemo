@@ -42,6 +42,8 @@ At the start of any non-trivial task, run this in order:
 - **`mem_skill_record(...)`** if you just learned a new repeatable recipe. Future you (or any other agent on this Mnemo) gets that recipe via `mem_skill_search` next time.
 - **`mem_add(kind, text, importance)`** for explicit memories you want to be sure stick: decisions, ratings, preferences. Set `importance: 7` or higher for things that should be embedded with high priority.
 - **`mem_link(from_id, to_id, kind)`** if this task references / corrects / resolves a previous memory row.
+- **`mem_recall_ids(query)`** when scanning a wide candidate set — returns just `[id, kind, score, snippet]` so you can filter cheap, then `mem_get(ids)` for the rows you actually want. Use this instead of `mem_recall` when token budget matters.
+- **`mem_neighbors(id, depth)`** to walk the typed-edge graph outward from a known memory — "what does this scar resolve", "what corrects this decision", "the cluster around this belief". Pairs with `mem_link` (write) and `mem_recall_ids` (find seeds).
 
 ## End of day
 

@@ -10,6 +10,9 @@
  *   - mem_health()                                      Writer health snapshot
  *   - mem_add(kind, text, source?, actor?, topic?, importance?)  Explicit insert
  *   - mem_link(from_id, to_id, kind, weight?)           Add typed edge
+ *   - mem_recall_ids(query, ...)                        Token-frugal recall (id+kind+score+snippet only)
+ *   - mem_get(ids[]|id)                                 Fetch full memory rows by id
+ *   - mem_neighbors(id, depth?, kinds?, direction?)     BFS over memory_link graph
  *   - mem_value_get(name?)                              List/fetch core values
  *   - mem_belief_get(topic?)                            List beliefs
  *   - mem_trait_get(dimension?)                         List traits
@@ -243,6 +246,108 @@ const tools = {
         "INSERT OR IGNORE INTO memory_link (from_id, to_id, kind, weight) VALUES (?,?,?,?)"
       ).run(from_id, to_id, kind, weight);
       return { inserted: r.changes > 0, id: r.lastInsertRowid };
+    },
+  },
+
+  mem_recall_ids: {
+    description: "Token-frugal recall: returns only id + kind + score + 80-char snippet per hit. Pair with mem_get / mem_timeline / mem_neighbors to fetch full payloads on the IDs you actually want. Same FTS+semantic surface as mem_recall, just stripped down so an agent can scan a wide candidate set without burning tokens.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "integer", default: 50, minimum: 1, maximum: 500 },
+        mode: { type: "string", enum: ["fts", "semantic", "hybrid"], default: "hybrid" },
+        since: { type: "string" },
+        kind: { type: "string" },
+        actor: { type: "string" },
+      },
+      required: ["query"],
+    },
+    handler: async (args) => {
+      const fat = await tools.mem_recall.handler(args);
+      return fat.map(r => ({
+        id: r.id,
+        kind: r.kind,
+        score: r.fused_score ?? (r.bm25 != null ? Math.round(r.bm25 * 1000) / 1000 : (r.distance != null ? Math.round((1 - r.distance) * 1000) / 1000 : null)),
+        snippet: (r.preview || "").replace(/\s+/g, " ").slice(0, 80),
+        at: r.occurred_at,
+      }));
+    },
+  },
+
+  mem_get: {
+    description: "Fetch one or more memory rows by id, full payload (no truncation). Companion to mem_recall_ids.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: "array", items: { type: "integer" }, description: "List of memory ids" },
+        id: { type: "integer", description: "Single id (alternative to ids[])" },
+      },
+    },
+    handler: ({ ids, id }) => {
+      const list = ids && ids.length ? ids : (id != null ? [id] : []);
+      if (!list.length) return [];
+      const placeholders = list.map(() => "?").join(",");
+      return db.prepare(`SELECT id, kind, source, source_ref, occurred_at, actor, topic, importance, text, meta_json FROM memory WHERE id IN (${placeholders}) ORDER BY occurred_at ASC`).all(...list);
+    },
+  },
+
+  mem_neighbors: {
+    description: "Walk the typed-edge graph (memory_link) outward from a seed memory id. Returns rows reachable within depth, with edge kind and hop distance. Use this for 'show me everything related to scar X', 'what does this decision resolve', 'cluster around this belief'. Pairs with mem_link (write) and mem_recall_ids (find seeds).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", description: "Seed memory id" },
+        depth: { type: "integer", default: 1, minimum: 1, maximum: 5 },
+        kinds: { type: "array", items: { type: "string" }, description: "Filter to these edge kinds (replies_to|references|corrects|resolves|partOf|causedBy|similar). Empty = all." },
+        direction: { type: "string", enum: ["out", "in", "both"], default: "both" },
+        limit: { type: "integer", default: 50, minimum: 1, maximum: 500 },
+      },
+      required: ["id"],
+    },
+    handler: ({ id, depth = 1, kinds, direction = "both", limit = 50 }) => {
+      const kindFilter = (Array.isArray(kinds) && kinds.length) ? kinds : null;
+      const visited = new Map();
+      visited.set(id, { hop: 0, via: null, edge_kind: null });
+      let frontier = [id];
+      for (let d = 1; d <= depth && frontier.length; d++) {
+        const next = [];
+        const placeholders = frontier.map(() => "?").join(",");
+        const edges = [];
+        if (direction === "out" || direction === "both") {
+          let sql = `SELECT from_id, to_id, kind, weight FROM memory_link WHERE from_id IN (${placeholders})`;
+          const p = [...frontier];
+          if (kindFilter) { sql += ` AND kind IN (${kindFilter.map(() => "?").join(",")})`; p.push(...kindFilter); }
+          edges.push(...db.prepare(sql).all(...p).map(e => ({ src: e.from_id, dst: e.to_id, kind: e.kind, weight: e.weight })));
+        }
+        if (direction === "in" || direction === "both") {
+          let sql = `SELECT from_id, to_id, kind, weight FROM memory_link WHERE to_id IN (${placeholders})`;
+          const p = [...frontier];
+          if (kindFilter) { sql += ` AND kind IN (${kindFilter.map(() => "?").join(",")})`; p.push(...kindFilter); }
+          edges.push(...db.prepare(sql).all(...p).map(e => ({ src: e.to_id, dst: e.from_id, kind: e.kind, weight: e.weight })));
+        }
+        for (const e of edges) {
+          if (!visited.has(e.dst)) {
+            visited.set(e.dst, { hop: d, via: e.src, edge_kind: e.kind, weight: e.weight });
+            next.push(e.dst);
+            if (visited.size - 1 >= limit) break;
+          }
+        }
+        frontier = next;
+        if (visited.size - 1 >= limit) break;
+      }
+      const ids = Array.from(visited.keys()).filter(x => x !== id);
+      if (!ids.length) return { seed: id, neighbors: [] };
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = db.prepare(`SELECT id, kind, actor, occurred_at, topic, importance, substr(text, 1, 200) AS preview FROM memory WHERE id IN (${placeholders})`).all(...ids);
+      const neighbors = rows.map(r => ({
+        ...r,
+        hop: visited.get(r.id).hop,
+        via: visited.get(r.id).via,
+        edge_kind: visited.get(r.id).edge_kind,
+        edge_weight: visited.get(r.id).weight,
+      })).sort((a, b) => a.hop - b.hop || (b.importance || 0) - (a.importance || 0));
+      return { seed: id, neighbors };
     },
   },
 
