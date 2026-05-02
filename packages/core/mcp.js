@@ -84,7 +84,44 @@ CREATE TABLE IF NOT EXISTS agent_brief (
 );
 CREATE INDEX IF NOT EXISTS idx_brief_agent_status ON agent_brief(agent_name, status);
 CREATE INDEX IF NOT EXISTS idx_brief_created ON agent_brief(created_at);
+
+CREATE TABLE IF NOT EXISTS agent_registry (
+  agent_name      TEXT PRIMARY KEY,
+  display_name    TEXT,
+  host            TEXT,
+  pid             INTEGER,
+  skills_json     TEXT,
+  status          TEXT NOT NULL DEFAULT 'online',
+  registered_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_seen_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  meta_json       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_registry_lastseen ON agent_registry(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_agent_registry_status ON agent_registry(status);
+
+CREATE TABLE IF NOT EXISTS channel (
+  name            TEXT PRIMARY KEY,
+  description     TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS channel_subscription (
+  channel_name    TEXT NOT NULL REFERENCES channel(name) ON DELETE CASCADE,
+  agent_name      TEXT NOT NULL REFERENCES agent_registry(agent_name) ON DELETE CASCADE,
+  subscribed_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (channel_name, agent_name)
+);
 `);
+
+// Add channel column to agent_brief if missing (idempotent migration).
+try {
+  const cols = db.prepare("PRAGMA table_info(agent_brief)").all().map(c => c.name);
+  if (!cols.includes("channel")) {
+    db.exec("ALTER TABLE agent_brief ADD COLUMN channel TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_brief_channel_status ON agent_brief(channel, status)");
+  }
+} catch (e) { console.error("[mnemo-mcp] agent_brief migration failed:", e.message); }
+
 
 // ---------------------------------------------------------------------------
 // Tool implementations
@@ -1083,6 +1120,164 @@ ${args.first_invocation_outcome || "(none)"}
          FROM agent_brief WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`
       ).all(...params);
       return { count: rows.length, briefs: rows };
+    },
+  },
+
+  mem_connect_register: {
+    description: "Mnemo Connect: register or refresh an agent in the cross-machine registry. Each running agent (CLI / daemon / bot) calls this on startup, then mem_connect_heartbeat periodically. Distinct from mem_agent_register (which manages the Mnemo-internal agent_identity / delegation table).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name:   { type: "string", description: "stable id, e.g. 'otto-pc3'" },
+        display_name: { type: "string" },
+        host:         { type: "string", description: "machine hostname" },
+        pid:          { type: "integer" },
+        skills:       { type: "array", items: { type: "string" }, description: "e.g. ['scraper','postal','deploy']" },
+        meta:         { type: "object" },
+      },
+      required: ["agent_name"],
+    },
+    handler: ({ agent_name, display_name, host, pid, skills, meta }) => {
+      db.prepare(
+        "INSERT INTO agent_registry (agent_name, display_name, host, pid, skills_json, status, registered_at, last_seen_at, meta_json) " +
+        "VALUES (?,?,?,?,?, 'online', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?) " +
+        "ON CONFLICT(agent_name) DO UPDATE SET " +
+        "display_name=excluded.display_name, host=excluded.host, pid=excluded.pid, " +
+        "skills_json=excluded.skills_json, status='online', " +
+        "last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), meta_json=excluded.meta_json"
+      ).run(
+        agent_name, display_name || agent_name, host || null, pid || null,
+        JSON.stringify(skills || []), meta ? JSON.stringify(meta) : null
+      );
+      return { agent_name, status: "online" };
+    },
+  },
+
+  mem_connect_heartbeat: {
+    description: "Mnemo Connect heartbeat. Bumps last_seen_at. Agents not seen in 5 minutes are auto-marked offline on next mem_connect_list read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        status: { type: "string", enum: ["online","busy","idle","offline"] },
+      },
+      required: ["agent_name"],
+    },
+    handler: ({ agent_name, status }) => {
+      const r = db.prepare(
+        "UPDATE agent_registry SET last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), status=COALESCE(?, status) WHERE agent_name=?"
+      ).run(status || null, agent_name);
+      return { agent_name, updated: r.changes > 0 };
+    },
+  },
+
+  mem_connect_list: {
+    description: "List agents registered with Mnemo Connect. Stale agents (>5min) auto-marked offline.",
+    inputSchema: { type: "object", properties: { only_online: { type: "boolean" } } },
+    handler: (args) => {
+      const only_online = !!(args && args.only_online);
+      db.prepare(
+        "UPDATE agent_registry SET status='offline' " +
+        "WHERE status<>'offline' AND (julianday('now') - julianday(last_seen_at)) * 86400 > 300"
+      ).run();
+      const where = only_online ? "WHERE status='online'" : "";
+      const rows = db.prepare(
+        "SELECT agent_name, display_name, host, pid, status, registered_at, last_seen_at, skills_json, meta_json " +
+        "FROM agent_registry " + where + " ORDER BY last_seen_at DESC"
+      ).all();
+      return {
+        count: rows.length,
+        agents: rows.map(r => ({
+          ...r,
+          skills: r.skills_json ? JSON.parse(r.skills_json) : [],
+          meta: r.meta_json ? JSON.parse(r.meta_json) : null,
+        })),
+      };
+    },
+  },
+
+  mem_connect_channel_upsert: {
+    description: "Mnemo Connect: create or update a channel. Channels fan briefs out to all subscribed agents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "e.g. 'listings', 'frederik-pitch'" },
+        description: { type: "string" },
+      },
+      required: ["name"],
+    },
+    handler: ({ name, description }) => {
+      db.prepare(
+        "INSERT INTO channel (name, description) VALUES (?,?) " +
+        "ON CONFLICT(name) DO UPDATE SET description=COALESCE(excluded.description, channel.description)"
+      ).run(name, description || null);
+      return { name };
+    },
+  },
+
+  mem_connect_channel_subscribe: {
+    description: "Subscribe an agent to a channel. Idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: { channel: { type: "string" }, agent_name: { type: "string" } },
+      required: ["channel","agent_name"],
+    },
+    handler: ({ channel, agent_name }) => {
+      db.prepare("INSERT INTO channel (name) VALUES (?) ON CONFLICT(name) DO NOTHING").run(channel);
+      db.prepare("INSERT INTO channel_subscription (channel_name, agent_name) VALUES (?,?) ON CONFLICT DO NOTHING")
+        .run(channel, agent_name);
+      return { channel, agent_name, subscribed: true };
+    },
+  },
+
+  mem_connect_channel_post: {
+    description: "Mnemo Connect: post a brief to a channel. Fans out one agent_brief row per subscriber, optionally filtered by required skill. Returns the list of created brief ids.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel:       { type: "string" },
+        content:       { type: "string" },
+        source_agent:  { type: "string" },
+        require_skill: { type: "string", description: "filter to subscribers whose skills include this" },
+        meta:          { type: "object" },
+      },
+      required: ["channel","content"],
+    },
+    handler: ({ channel, content, source_agent, require_skill, meta }) => {
+      let subs = db.prepare(
+        "SELECT s.agent_name, r.skills_json FROM channel_subscription s " +
+        "LEFT JOIN agent_registry r ON r.agent_name = s.agent_name " +
+        "WHERE s.channel_name = ?"
+      ).all(channel);
+      if (require_skill) {
+        subs = subs.filter(s => {
+          try { return (JSON.parse(s.skills_json || "[]")).includes(require_skill); }
+          catch { return false; }
+        });
+      }
+      const ids = [];
+      const ins = db.prepare(
+        "INSERT INTO agent_brief (agent_name, source_agent, content, channel, meta_json) VALUES (?,?,?,?,?)"
+      );
+      for (const s of subs) {
+        const info = ins.run(s.agent_name, source_agent || null, content, channel,
+                             meta ? JSON.stringify(meta) : null);
+        ids.push(info.lastInsertRowid);
+      }
+      return { channel, fanout: subs.length, brief_ids: ids };
+    },
+  },
+
+  mem_connect_channel_list: {
+    description: "List Mnemo Connect channels with subscriber counts.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const rows = db.prepare(
+        "SELECT c.name, c.description, c.created_at, " +
+        "(SELECT COUNT(*) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
+        "FROM channel c ORDER BY c.created_at ASC"
+      ).all();
+      return { count: rows.length, channels: rows };
     },
   },
 };

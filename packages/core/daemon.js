@@ -38,6 +38,37 @@ const QUIET_END = parseInt(process.env.MNEMO_QUIET_END || "7", 10);
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+// Mnemo Connect schema bootstrap (idempotent)
+db.exec(`
+CREATE TABLE IF NOT EXISTS agent_brief (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL, source_agent TEXT,
+  content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  dispatched_at TEXT, done_at TEXT, outcome TEXT, meta_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_brief_agent_status ON agent_brief(agent_name, status);
+CREATE TABLE IF NOT EXISTS agent_registry (
+  agent_name TEXT PRIMARY KEY, display_name TEXT, host TEXT, pid INTEGER, skills_json TEXT,
+  status TEXT NOT NULL DEFAULT 'online',
+  registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  meta_json TEXT
+);
+CREATE TABLE IF NOT EXISTS channel (
+  name TEXT PRIMARY KEY, description TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS channel_subscription (
+  channel_name TEXT NOT NULL REFERENCES channel(name) ON DELETE CASCADE,
+  agent_name TEXT NOT NULL REFERENCES agent_registry(agent_name) ON DELETE CASCADE,
+  subscribed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (channel_name, agent_name)
+);
+`);
+try {
+  const cols = db.prepare("PRAGMA table_info(agent_brief)").all().map(c => c.name);
+  if (!cols.includes("channel")) db.exec("ALTER TABLE agent_brief ADD COLUMN channel TEXT");
+} catch (e) {}
 db.pragma("synchronous = NORMAL");
 
 // ---------- Multi-tenant pool ----------
@@ -158,8 +189,155 @@ const server = http.createServer((req, res) => {
       res.writeHead(500); return res.end(JSON.stringify({ error: String(e.message) }));
     }
   }
+  if (req.method === "POST" && url.pathname.startsWith("/tool/")) {
+    const tool = url.pathname.slice("/tool/".length);
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      let args = {};
+      try { args = body ? JSON.parse(body) : {}; }
+      catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "invalid JSON: " + e.message }));
+      }
+      try {
+        const result = handleTool(tdb, tool, args);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ tool, result }));
+      } catch (e) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: String(e.message), tool }));
+      }
+    });
+    return;
+  }
   res.writeHead(404); res.end("not found");
 });
+
+// ---------- Connect / Brief tool dispatch (HTTP-callable subset) ----------
+function handleTool(tdb, name, a) {
+  switch (name) {
+    case "mem_connect_register": {
+      tdb.prepare(
+        "INSERT INTO agent_registry (agent_name, display_name, host, pid, skills_json, status, registered_at, last_seen_at, meta_json) " +
+        "VALUES (?,?,?,?,?, 'online', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?) " +
+        "ON CONFLICT(agent_name) DO UPDATE SET " +
+        "display_name=excluded.display_name, host=excluded.host, pid=excluded.pid, " +
+        "skills_json=excluded.skills_json, status='online', " +
+        "last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), meta_json=excluded.meta_json"
+      ).run(
+        a.agent_name, a.display_name || a.agent_name, a.host || null, a.pid || null,
+        JSON.stringify(a.skills || []), a.meta ? JSON.stringify(a.meta) : null
+      );
+      return { agent_name: a.agent_name, status: "online" };
+    }
+    case "mem_connect_heartbeat": {
+      const r = tdb.prepare(
+        "UPDATE agent_registry SET last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), status=COALESCE(?, status) WHERE agent_name=?"
+      ).run(a.status || null, a.agent_name);
+      return { agent_name: a.agent_name, updated: r.changes > 0 };
+    }
+    case "mem_connect_list": {
+      tdb.prepare(
+        "UPDATE agent_registry SET status='offline' " +
+        "WHERE status<>'offline' AND (julianday('now') - julianday(last_seen_at)) * 86400 > 300"
+      ).run();
+      const where = a.only_online ? "WHERE status='online'" : "";
+      const rows = tdb.prepare(
+        "SELECT agent_name, display_name, host, pid, status, registered_at, last_seen_at, skills_json, meta_json " +
+        "FROM agent_registry " + where + " ORDER BY last_seen_at DESC"
+      ).all();
+      return {
+        count: rows.length,
+        agents: rows.map(r => Object.assign({}, r, {
+          skills: r.skills_json ? JSON.parse(r.skills_json) : [],
+          meta: r.meta_json ? JSON.parse(r.meta_json) : null,
+        })),
+      };
+    }
+    case "mem_connect_channel_upsert": {
+      tdb.prepare(
+        "INSERT INTO channel (name, description) VALUES (?,?) " +
+        "ON CONFLICT(name) DO UPDATE SET description=COALESCE(excluded.description, channel.description)"
+      ).run(a.name, a.description || null);
+      return { name: a.name };
+    }
+    case "mem_connect_channel_subscribe": {
+      tdb.prepare("INSERT INTO channel (name) VALUES (?) ON CONFLICT(name) DO NOTHING").run(a.channel);
+      tdb.prepare("INSERT INTO channel_subscription (channel_name, agent_name) VALUES (?,?) ON CONFLICT DO NOTHING")
+        .run(a.channel, a.agent_name);
+      return { channel: a.channel, agent_name: a.agent_name, subscribed: true };
+    }
+    case "mem_connect_channel_post": {
+      let subs = tdb.prepare(
+        "SELECT s.agent_name, r.skills_json FROM channel_subscription s " +
+        "LEFT JOIN agent_registry r ON r.agent_name = s.agent_name " +
+        "WHERE s.channel_name = ?"
+      ).all(a.channel);
+      if (a.require_skill) {
+        subs = subs.filter(s => {
+          try { return (JSON.parse(s.skills_json || "[]")).includes(a.require_skill); }
+          catch { return false; }
+        });
+      }
+      const ids = [];
+      const ins = tdb.prepare(
+        "INSERT INTO agent_brief (agent_name, source_agent, content, channel, meta_json) VALUES (?,?,?,?,?)"
+      );
+      for (const s of subs) {
+        const info = ins.run(s.agent_name, a.source_agent || null, a.content, a.channel,
+                             a.meta ? JSON.stringify(a.meta) : null);
+        ids.push(info.lastInsertRowid);
+      }
+      return { channel: a.channel, fanout: subs.length, brief_ids: ids };
+    }
+    case "mem_connect_channel_list": {
+      const rows = tdb.prepare(
+        "SELECT c.name, c.description, c.created_at, " +
+        "(SELECT COUNT(*) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
+        "FROM channel c ORDER BY c.created_at ASC"
+      ).all();
+      return { count: rows.length, channels: rows };
+    }
+    case "mem_brief_drop": {
+      const info = tdb.prepare(
+        "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)"
+      ).run(a.agent_name, a.source_agent || null, a.content, a.meta ? JSON.stringify(a.meta) : null);
+      return { id: info.lastInsertRowid, agent_name: a.agent_name, status: "pending" };
+    }
+    case "mem_brief_pull": {
+      const rows = tdb.prepare(
+        "SELECT id, source_agent, content, channel, created_at, meta_json FROM agent_brief " +
+        "WHERE agent_name=? AND status='pending' ORDER BY created_at ASC LIMIT ?"
+      ).all(a.agent_name, Math.min(a.limit || 5, 50));
+      if (!a.peek && rows.length) {
+        const upd = tdb.prepare("UPDATE agent_brief SET status='dispatched', dispatched_at=? WHERE id=?");
+        const now = new Date().toISOString();
+        for (const r of rows) upd.run(now, r.id);
+      }
+      return { count: rows.length, briefs: rows };
+    }
+    case "mem_brief_done": {
+      tdb.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
+        .run(a.status, new Date().toISOString(), a.outcome || null, a.id);
+      return { id: a.id, status: a.status };
+    }
+    case "mem_brief_list": {
+      const where = ["1=1"]; const params = [];
+      if (a.agent_name) { where.push("agent_name=?"); params.push(a.agent_name); }
+      if (a.status)     { where.push("status=?");     params.push(a.status); }
+      params.push(Math.min(a.limit || 20, 200));
+      const rows = tdb.prepare(
+        "SELECT id, agent_name, source_agent, status, created_at, dispatched_at, done_at, " +
+        "substr(content,1,160) AS preview, channel, outcome " +
+        "FROM agent_brief WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT ?"
+      ).all(...params);
+      return { count: rows.length, briefs: rows };
+    }
+    default:
+      throw new Error("unknown tool: " + name);
+  }
+}
 server.listen(PORT, HOST, () => {
   console.log(`[mnemo-daemon] HTTP on ${HOST}:${PORT}`);
   recordWrite("daemon_boot", 0, "alive");
