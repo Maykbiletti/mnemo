@@ -47,6 +47,25 @@ CREATE TABLE IF NOT EXISTS agent_brief (
   dispatched_at TEXT, done_at TEXT, outcome TEXT, meta_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_brief_agent_status ON agent_brief(agent_name, status);
+CREATE TABLE IF NOT EXISTS agent_action (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT NOT NULL,
+  action_kind TEXT NOT NULL,
+  target TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  payload_json TEXT,
+  result_json TEXT,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  finished_at TEXT,
+  latency_ms INTEGER,
+  session_id TEXT,
+  topic TEXT,
+  meta_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_action_agent_started ON agent_action(agent_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_action_kind ON agent_action(action_kind);
+CREATE INDEX IF NOT EXISTS idx_action_topic ON agent_action(topic);
+
 CREATE TABLE IF NOT EXISTS agent_registry (
   agent_name TEXT PRIMARY KEY, display_name TEXT, host TEXT, pid INTEGER, skills_json TEXT,
   status TEXT NOT NULL DEFAULT 'online',
@@ -333,6 +352,58 @@ function handleTool(tdb, name, a) {
         "FROM agent_brief WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT ?"
       ).all(...params);
       return { count: rows.length, briefs: rows };
+    }
+    case "mem_action_log": {
+      const stmt = tdb.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, started_at, session_id, topic, meta_json) VALUES (?,?,?,?,?,?,?,?,?)");
+      const r = stmt.run(
+        a.agent_name || "dieter",
+        a.action_kind,
+        a.target || null,
+        a.status || "started",
+        a.payload ? JSON.stringify(a.payload) : null,
+        a.started_at || new Date().toISOString(),
+        a.session_id || null,
+        a.topic || null,
+        a.meta ? JSON.stringify(a.meta) : null
+      );
+      return { id: r.lastInsertRowid, agent_name: a.agent_name || "dieter", action_kind: a.action_kind };
+    }
+    case "mem_action_finish": {
+      const finishedAt = new Date().toISOString();
+      const startedRow = tdb.prepare("SELECT started_at FROM agent_action WHERE id=?").get(a.id);
+      let latency = null;
+      if (startedRow && startedRow.started_at) {
+        latency = Date.parse(finishedAt) - Date.parse(startedRow.started_at);
+      }
+      tdb.prepare("UPDATE agent_action SET status=?, finished_at=?, latency_ms=?, result_json=? WHERE id=?")
+        .run(a.status || "ok", finishedAt, latency, a.result ? JSON.stringify(a.result) : null, a.id);
+      return { id: a.id, status: a.status || "ok", latency_ms: latency };
+    }
+    case "mem_actions_recent": {
+      const where = ["1=1"]; const params = [];
+      if (a.agent_name) { where.push("agent_name=?"); params.push(a.agent_name); }
+      if (a.action_kind) { where.push("action_kind=?"); params.push(a.action_kind); }
+      if (a.topic) { where.push("topic=?"); params.push(a.topic); }
+      if (a.since) { where.push("started_at >= ?"); params.push(a.since); }
+      params.push(Math.min(a.limit || 50, 500));
+      const rows = tdb.prepare(
+        "SELECT id, agent_name, action_kind, target, status, started_at, finished_at, latency_ms, " +
+        "substr(payload_json,1,200) AS payload_preview, substr(result_json,1,200) AS result_preview, " +
+        "session_id, topic " +
+        "FROM agent_action WHERE " + where.join(" AND ") + " ORDER BY started_at DESC LIMIT ?"
+      ).all(...params);
+      return { count: rows.length, actions: rows };
+    }
+    case "mem_actions_search": {
+      const q = String(a.q || "").trim();
+      if (!q) throw new Error("q required");
+      const like = "%" + q + "%";
+      const rows = tdb.prepare(
+        "SELECT id, agent_name, action_kind, target, status, started_at, latency_ms " +
+        "FROM agent_action WHERE target LIKE ? OR payload_json LIKE ? OR result_json LIKE ? OR topic LIKE ? " +
+        "ORDER BY started_at DESC LIMIT ?"
+      ).all(like, like, like, like, Math.min(a.limit || 30, 200));
+      return { count: rows.length, actions: rows };
     }
     default:
       throw new Error("unknown tool: " + name);
