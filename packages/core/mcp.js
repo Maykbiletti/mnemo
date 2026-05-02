@@ -49,6 +49,28 @@ try {
 }
 try { _embeddings = require("./embeddings"); } catch (e) { console.error("[mnemo-mcp] embeddings module missing:", e.message); }
 
+// Ensure Phase 1.5 tables exist regardless of whether scanners (commitments.js) ran.
+// Without this, mem_commitment_open / mem_commitment_due fail with "table missing".
+db.exec(`
+CREATE TABLE IF NOT EXISTS commitment (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_name           TEXT NOT NULL,
+  origin_memory_id     INTEGER REFERENCES memory(id) ON DELETE CASCADE,
+  text                 TEXT NOT NULL,
+  category             TEXT,
+  expected_followup_at TEXT,
+  detected_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  surfaced_at          TEXT,
+  closed_at            TEXT,
+  outcome              TEXT,
+  notes                TEXT,
+  status               TEXT NOT NULL DEFAULT 'open',
+  UNIQUE(origin_memory_id, text)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_status ON commitment(status);
+CREATE INDEX IF NOT EXISTS idx_commit_followup ON commitment(expected_followup_at);
+`);
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -465,7 +487,6 @@ const tools = {
     handler: ({ query }) => {
       const SKILLS_DIR = process.env.MNEMO_SKILLS || path.join(__dirname, "skills");
       const fs = require("fs");
-      const path = require("path");
       const matches = [];
       try {
         const entries = fs.readdirSync(SKILLS_DIR);
@@ -519,7 +540,6 @@ const tools = {
     handler: (args) => {
       const SKILLS_DIR = process.env.MNEMO_SKILLS || path.join(__dirname, "skills");
       const fs = require("fs");
-      const path = require("path");
       const dir = path.join(SKILLS_DIR, args.name);
       try {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
