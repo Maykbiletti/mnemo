@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS commitment (
 );
 CREATE INDEX IF NOT EXISTS idx_commit_status ON commitment(status);
 CREATE INDEX IF NOT EXISTS idx_commit_followup ON commitment(expected_followup_at);
+
+CREATE TABLE IF NOT EXISTS agent_brief (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name      TEXT NOT NULL,
+  source_agent    TEXT,
+  content         TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  dispatched_at   TEXT,
+  done_at         TEXT,
+  outcome         TEXT,
+  meta_json       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_brief_agent_status ON agent_brief(agent_name, status);
+CREATE INDEX IF NOT EXISTS idx_brief_created ON agent_brief(created_at);
 `);
 
 // ---------------------------------------------------------------------------
@@ -982,6 +997,92 @@ ${args.first_invocation_outcome || "(none)"}
            FROM delegation WHERE ${where.join(" AND ")} ORDER BY granted_at DESC`
         ).all(...params);
       } catch (e) { return []; }
+    },
+  },
+
+  mem_brief_drop: {
+    description: "Drop a brief into a named agent's inbox. Used by orchestrator agents (e.g. Dieter -> Otto/Frida) to hand off work asynchronously.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string", description: "target agent name, e.g. 'Otto', 'Frida', 'Angel'" },
+        content: { type: "string", description: "the brief markdown body" },
+        source_agent: { type: "string", description: "who is dropping the brief" },
+        meta: { type: "object", description: "optional structured meta" },
+      },
+      required: ["agent_name", "content"],
+    },
+    handler: ({ agent_name, content, source_agent, meta }) => {
+      const info = db.prepare(
+        "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?, ?, ?, ?)"
+      ).run(agent_name, source_agent || null, content, meta ? JSON.stringify(meta) : null);
+      return { id: info.lastInsertRowid, agent_name, status: "pending" };
+    },
+  },
+
+  mem_brief_pull: {
+    description: "Pull pending briefs for the named agent. Marks them dispatched. Agent should process and call mem_brief_done.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        limit: { type: "integer", default: 5, minimum: 1, maximum: 50 },
+        peek: { type: "boolean", description: "if true, do not mark as dispatched" },
+      },
+      required: ["agent_name"],
+    },
+    handler: ({ agent_name, limit = 5, peek = false }) => {
+      const rows = db.prepare(
+        "SELECT id, source_agent, content, created_at, meta_json FROM agent_brief WHERE agent_name=? AND status='pending' ORDER BY created_at ASC LIMIT ?"
+      ).all(agent_name, limit);
+      if (!peek && rows.length) {
+        const now = new Date().toISOString();
+        const upd = db.prepare("UPDATE agent_brief SET status='dispatched', dispatched_at=? WHERE id=?");
+        for (const r of rows) upd.run(now, r.id);
+      }
+      return { count: rows.length, briefs: rows };
+    },
+  },
+
+  mem_brief_done: {
+    description: "Mark a brief as completed (or failed) with an outcome string.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        status: { type: "string", enum: ["done", "failed"] },
+        outcome: { type: "string" },
+      },
+      required: ["id", "status"],
+    },
+    handler: ({ id, status, outcome }) => {
+      db.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
+        .run(status, new Date().toISOString(), outcome || null, id);
+      return { id, status };
+    },
+  },
+
+  mem_brief_list: {
+    description: "List briefs for an agent (or all) optionally filtered by status. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        status: { type: "string", enum: ["pending", "dispatched", "done", "failed"] },
+        limit: { type: "integer", default: 20, minimum: 1, maximum: 200 },
+      },
+    },
+    handler: ({ agent_name, status, limit = 20 }) => {
+      const where = ["1=1"]; const params = [];
+      if (agent_name) { where.push("agent_name=?"); params.push(agent_name); }
+      if (status) { where.push("status=?"); params.push(status); }
+      params.push(Math.min(limit, 200));
+      const rows = db.prepare(
+        `SELECT id, agent_name, source_agent, status, created_at, dispatched_at, done_at,
+                substr(content,1,160) AS preview, outcome
+         FROM agent_brief WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`
+      ).all(...params);
+      return { count: rows.length, briefs: rows };
     },
   },
 };
