@@ -49,6 +49,28 @@ try {
 }
 try { _embeddings = require("./embeddings"); } catch (e) { console.error("[mnemo-mcp] embeddings module missing:", e.message); }
 
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS agent_action (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT NOT NULL,
+  action_kind TEXT NOT NULL,
+  target TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  payload_json TEXT,
+  result_json TEXT,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  finished_at TEXT,
+  latency_ms INTEGER,
+  session_id TEXT,
+  topic TEXT,
+  meta_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_action_agent_started ON agent_action(agent_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_action_kind ON agent_action(action_kind);
+CREATE INDEX IF NOT EXISTS idx_action_topic ON agent_action(topic);
+`);
+
 // Ensure Phase 1.5 tables exist regardless of whether scanners (commitments.js) ran.
 // Without this, mem_commitment_open / mem_commitment_due fail with "table missing".
 db.exec(`
@@ -524,6 +546,114 @@ const tools = {
       db.prepare(`UPDATE task_run SET completed_at=?, duration_min=?, outcome=?, notes=COALESCE(?, notes) WHERE id=?`)
         .run(completed, Math.round(minutes * 10) / 10, outcome, notes || null, id);
       return { id, completed_at: completed, duration_min: Math.round(minutes * 10) / 10, outcome };
+    },
+  },
+
+
+  mem_action_log: {
+    description: "Log the start of an action (tool call, command, edit, deploy etc.) to Mnemo's episodic action layer. Returns id; pass to mem_action_finish later. Use this to give yourself persistent memory across sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action_kind: { type: "string", description: "e.g. tool_call | bash | edit | deploy | scrape | brief | commit" },
+        target: { type: "string", description: "what was acted on (file path, URL, service name)" },
+        agent_name: { type: "string", description: "who did it (default: dieter)" },
+        payload: { type: "object", description: "structured args of the action" },
+        topic: { type: "string", description: "free-form group label" },
+        session_id: { type: "string" },
+        status: { type: "string", description: "started | ok | error (default: started)" },
+        meta: { type: "object" },
+      },
+      required: ["action_kind"],
+    },
+    handler: (a) => {
+      const r = db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, started_at, session_id, topic, meta_json) VALUES (?,?,?,?,?,?,?,?,?)")
+        .run(
+          a.agent_name || "dieter",
+          a.action_kind,
+          a.target || null,
+          a.status || "started",
+          a.payload ? JSON.stringify(a.payload) : null,
+          a.started_at || new Date().toISOString(),
+          a.session_id || null,
+          a.topic || null,
+          a.meta ? JSON.stringify(a.meta) : null
+        );
+      return { id: r.lastInsertRowid, agent_name: a.agent_name || "dieter", action_kind: a.action_kind };
+    },
+  },
+
+  mem_action_finish: {
+    description: "Mark an action as complete. Computes latency_ms automatically from started_at. Pair with every mem_action_log call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        status: { type: "string", description: "ok | error | partial (default: ok)" },
+        result: { type: "object" },
+      },
+      required: ["id"],
+    },
+    handler: (a) => {
+      const finishedAt = new Date().toISOString();
+      const row = db.prepare("SELECT started_at FROM agent_action WHERE id=?").get(a.id);
+      if (!row) return { error: "agent_action not found" };
+      const latency = Date.parse(finishedAt) - Date.parse(row.started_at);
+      db.prepare("UPDATE agent_action SET status=?, finished_at=?, latency_ms=?, result_json=? WHERE id=?")
+        .run(a.status || "ok", finishedAt, latency, a.result ? JSON.stringify(a.result) : null, a.id);
+      return { id: a.id, status: a.status || "ok", latency_ms: latency };
+    },
+  },
+
+  mem_actions_recent: {
+    description: "List recent actions, filterable by agent_name, action_kind, topic, or since-timestamp. Use to remember what you did.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        action_kind: { type: "string" },
+        topic: { type: "string" },
+        since: { type: "string", description: "ISO timestamp" },
+        limit: { type: "integer", description: "default 50, max 500" },
+      },
+    },
+    handler: (a) => {
+      const where = ["1=1"]; const params = [];
+      if (a.agent_name) { where.push("agent_name=?"); params.push(a.agent_name); }
+      if (a.action_kind) { where.push("action_kind=?"); params.push(a.action_kind); }
+      if (a.topic) { where.push("topic=?"); params.push(a.topic); }
+      if (a.since) { where.push("started_at >= ?"); params.push(a.since); }
+      params.push(Math.min(a.limit || 50, 500));
+      const rows = db.prepare(
+        "SELECT id, agent_name, action_kind, target, status, started_at, finished_at, latency_ms, " +
+        "substr(payload_json,1,200) AS payload_preview, substr(result_json,1,200) AS result_preview, " +
+        "session_id, topic " +
+        "FROM agent_action WHERE " + where.join(" AND ") + " ORDER BY started_at DESC LIMIT ?"
+      ).all(...params);
+      return { count: rows.length, actions: rows };
+    },
+  },
+
+  mem_actions_search: {
+    description: "LIKE-search across action target, payload, result and topic. For finding past actions by what they touched.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string" },
+        limit: { type: "integer" },
+      },
+      required: ["q"],
+    },
+    handler: (a) => {
+      const q = String(a.q || "").trim();
+      if (!q) return { error: "q required" };
+      const like = "%" + q + "%";
+      const rows = db.prepare(
+        "SELECT id, agent_name, action_kind, target, status, started_at, latency_ms " +
+        "FROM agent_action WHERE target LIKE ? OR payload_json LIKE ? OR result_json LIKE ? OR topic LIKE ? " +
+        "ORDER BY started_at DESC LIMIT ?"
+      ).all(like, like, like, like, Math.min(a.limit || 30, 200));
+      return { count: rows.length, actions: rows };
     },
   },
 
