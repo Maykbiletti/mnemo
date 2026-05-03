@@ -417,6 +417,48 @@ function handleTool(tdb, name, a) {
       ).all(like, like, like, like, Math.min(a.limit || 30, 200));
       return { count: rows.length, actions: rows };
     }
+    case "mem_reflect_now": {
+      const agent = a.agent_name || "dieter";
+      const lookbackMin = a.lookback_minutes || 60;
+      const sinceIso = new Date(Date.now() - lookbackMin * 60 * 1000).toISOString();
+      const recentActions = tdb.prepare(
+        "SELECT id, action_kind, target, status, started_at, latency_ms, topic " +
+        "FROM agent_action WHERE agent_name=? AND started_at >= ? " +
+        "ORDER BY started_at DESC LIMIT 20"
+      ).all(agent, sinceIso);
+      const inflightActions = tdb.prepare(
+        "SELECT id, action_kind, target, started_at FROM agent_action " +
+        "WHERE agent_name=? AND finished_at IS NULL AND started_at >= ? ORDER BY started_at DESC LIMIT 10"
+      ).all(agent, sinceIso);
+      let pendingBriefs = [];
+      try {
+        pendingBriefs = tdb.prepare(
+          "SELECT id, source_agent, channel, created_at, substr(content,1,300) AS preview " +
+          "FROM agent_brief WHERE agent_name=? AND status IN ('pending','dispatched') " +
+          "ORDER BY created_at DESC LIMIT 10"
+        ).all(agent);
+      } catch (e) {}
+      let lastReflection = null;
+      try {
+        lastReflection = tdb.prepare(
+          "SELECT date, substr(text,1,500) AS preview FROM daily_reflection ORDER BY date DESC LIMIT 1"
+        ).get();
+      } catch (e) {}
+      const summary = {
+        agent_name: agent,
+        now: new Date().toISOString(),
+        lookback_minutes: lookbackMin,
+        recent_actions_count: recentActions.length,
+        recent_actions: recentActions,
+        inflight_actions_count: inflightActions.length,
+        inflight_actions: inflightActions,
+        pending_briefs_count: pendingBriefs.length,
+        pending_briefs: pendingBriefs,
+        last_reflection: lastReflection,
+        hint: "Read recent_actions to avoid repeating yourself. Address inflight_actions before starting new work. Process pending_briefs in created_at order.",
+      };
+      return summary;
+    }
     default:
       throw new Error("unknown tool: " + name);
   }
