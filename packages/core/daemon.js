@@ -419,45 +419,50 @@ function handleTool(tdb, name, a) {
     }
     case "mem_reflect_now": {
       const agent = a.agent_name || "dieter";
-      const lookbackMin = a.lookback_minutes || 60;
-      const sinceIso = new Date(Date.now() - lookbackMin * 60 * 1000).toISOString();
-      const recentActions = tdb.prepare(
-        "SELECT id, action_kind, target, status, started_at, latency_ms, topic " +
-        "FROM agent_action WHERE agent_name=? AND started_at >= ? " +
-        "ORDER BY started_at DESC LIMIT 20"
+      const sinceIso = a.since || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const counts = tdb.prepare(
+        "SELECT COUNT(*) c, SUM(CASE WHEN finished_at IS NULL THEN 1 ELSE 0 END) inflight " +
+        "FROM agent_action WHERE agent_name=? AND started_at >= ?"
+      ).get(agent, sinceIso);
+      const topTopics = tdb.prepare(
+        "SELECT COALESCE(topic,'(none)') AS topic, COUNT(*) AS n FROM agent_action " +
+        "WHERE agent_name=? AND started_at >= ? GROUP BY topic ORDER BY n DESC LIMIT 5"
       ).all(agent, sinceIso);
-      const inflightActions = tdb.prepare(
+      const lastFew = tdb.prepare(
+        "SELECT id, action_kind, target, status, started_at FROM agent_action " +
+        "WHERE agent_name=? AND started_at >= ? ORDER BY started_at DESC LIMIT 5"
+      ).all(agent, sinceIso);
+      const inflightTop = tdb.prepare(
         "SELECT id, action_kind, target, started_at FROM agent_action " +
-        "WHERE agent_name=? AND finished_at IS NULL AND started_at >= ? ORDER BY started_at DESC LIMIT 10"
+        "WHERE agent_name=? AND finished_at IS NULL AND started_at >= ? " +
+        "ORDER BY started_at DESC LIMIT 5"
       ).all(agent, sinceIso);
       let pendingBriefs = [];
       try {
         pendingBriefs = tdb.prepare(
-          "SELECT id, source_agent, channel, created_at, substr(content,1,300) AS preview " +
+          "SELECT id, source_agent, channel, created_at, substr(content,1,160) AS preview " +
           "FROM agent_brief WHERE agent_name=? AND status IN ('pending','dispatched') " +
-          "ORDER BY created_at DESC LIMIT 10"
+          "ORDER BY created_at DESC LIMIT 5"
         ).all(agent);
       } catch (e) {}
       let lastReflection = null;
       try {
         lastReflection = tdb.prepare(
-          "SELECT date, substr(text,1,500) AS preview FROM daily_reflection ORDER BY date DESC LIMIT 1"
+          "SELECT date, substr(text,1,400) AS preview FROM daily_reflection ORDER BY date DESC LIMIT 1"
         ).get();
       } catch (e) {}
-      const summary = {
+      return {
         agent_name: agent,
         now: new Date().toISOString(),
-        lookback_minutes: lookbackMin,
-        recent_actions_count: recentActions.length,
-        recent_actions: recentActions,
-        inflight_actions_count: inflightActions.length,
-        inflight_actions: inflightActions,
-        pending_briefs_count: pendingBriefs.length,
+        since: sinceIso,
+        counts: { actions: counts.c || 0, inflight: counts.inflight || 0, pending_briefs: pendingBriefs.length },
+        top_topics: topTopics,
+        last_few_actions: lastFew,
+        inflight_actions: inflightTop,
         pending_briefs: pendingBriefs,
-        last_reflection: lastReflection,
-        hint: "Read recent_actions to avoid repeating yourself. Address inflight_actions before starting new work. Process pending_briefs in created_at order.",
+        last_daily_reflection: lastReflection,
+        hint: "actions=total today, inflight=started but not finished. Address inflight + pending_briefs before starting new work.",
       };
-      return summary;
     }
     default:
       throw new Error("unknown tool: " + name);
