@@ -156,6 +156,18 @@ function ingestEvent(target, { kind, source, source_ref, occurred_at, actor, act
 }
 
 // ---------- HTTP server ----------
+
+function sanitizeFtsQuery(q) {
+  // Quote each whitespace-separated token to avoid FTS5 operator interpretation
+  // (hyphen parses as NOT, colon as column-restrict). Already-quoted phrase passed through.
+  if (!q) return q;
+  if (/^".*"$/.test(q.trim())) return q;
+  return q.split(/\s+/).filter(Boolean).map(t => {
+    if (/^[A-Za-z0-9_]+$/.test(t)) return t;
+    return '"' + t.replace(/"/g, '""') + '"';
+  }).join(' ');
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const tdb = dbForRequest(req);
@@ -201,7 +213,7 @@ const server = http.createServer((req, res) => {
         FROM memory_fts JOIN memory m ON m.id=memory_fts.rowid
         WHERE memory_fts MATCH ?
         ORDER BY rank ASC LIMIT ?
-      `).all(q, limit);
+      `).all(sanitizeFtsQuery(q), limit);
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify(rows));
     } catch (e) {
