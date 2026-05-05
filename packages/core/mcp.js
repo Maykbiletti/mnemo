@@ -2006,7 +2006,7 @@ ${args.first_invocation_outcome || "(none)"}
     handler: ({ id, attempt_id }) => { db.prepare("UPDATE codex_consult SET used_in_attempt_id=?, status='used' WHERE id=?").run(attempt_id || null, id); return { ok: true, id, status: "used" }; },
   },
   mem_transcript_log: {
-    description: "Verbatim episodic log: append one transcript row. source='telegram'|'web'|'cli'|... direction='inbound'|'outbound'. Pass occurred_at to override timestamp; otherwise NOW. Use this for every chat message both directions so 'what was said at time X' is queryable.",
+    description: "Verbatim episodic log: append one transcript row. source='telegram'|'web'|'cli'|... direction='inbound'|'outbound'. Pass occurred_at to override timestamp; otherwise NOW. Use this for every chat message both directions so 'what was said at time X' is queryable. Auto-indexes into mnemo_search_fts so mem_question_answer covers it.",
     inputSchema: { type: "object", properties: { source: { type: "string" }, channel: { type: "string" }, direction: { type: "string", enum: ["inbound","outbound"] }, speaker: { type: "string" }, content: { type: "string" }, meta: { type: "object" }, occurred_at: { type: "string" }, ref_kind: { type: "string" }, ref_id: { type: "string" } }, required: ["source","direction","content"] },
     handler: (a) => {
       const occurredAt = a.occurred_at || null;
@@ -2014,7 +2014,43 @@ ${args.first_invocation_outcome || "(none)"}
         ? db.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
         : db.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
       );
+      try { db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)").run(String(info.lastInsertRowid), a.speaker || a.source || '', a.direction + (a.channel ? ' @ ' + a.channel : ''), (a.content || '').slice(0, 8000)); } catch (e) {}
       return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt };
+    },
+  },
+  mem_question_answer: {
+    description: "Ask a question across all stored knowledge (transcripts + briefs + memories + actions). RAG-style search returns ranked evidence with snippets. Pass date='YYYY-MM-DD' to constrain to one day. Pass scope=['transcript'] to limit to chat history.",
+    inputSchema: { type: "object", properties: { question: { type: "string" }, scope: { type: "array", items: { type: "string" } }, date: { type: "string" }, limit: { type: "integer" } }, required: ["question"] },
+    handler: (a) => {
+      const lim = Math.min(a.limit || 10, 50);
+      const scopes = Array.isArray(a.scope) && a.scope.length ? a.scope : ['transcript','brief','memory','action'];
+      const raw = String(a.question || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!raw) return { error: "question must contain searchable terms" };
+      const tokens = raw.split(/\s+/).filter(t => t.length > 1).map(t => '"' + t + '"').join(" ");
+      const placeholders = scopes.map(() => "?").join(",");
+      let dateClause = "";
+      const dateParams = [];
+      if (a.date) {
+        dateClause = " AND ref_id IN (SELECT id FROM transcript WHERE date(occurred_at) = ? UNION SELECT id FROM agent_brief WHERE date(created_at) = ? UNION SELECT id FROM agent_action WHERE date(started_at) = ?)";
+        dateParams.push(a.date, a.date, a.date);
+      }
+      try {
+        const rows = db.prepare("SELECT scope, ref_id, agent_name, summary, snippet(mnemo_search_fts, 4, '<b>', '</b>', '...', 24) AS snippet, rank FROM mnemo_search_fts WHERE scope IN (" + placeholders + ") AND mnemo_search_fts MATCH ?" + dateClause + " ORDER BY rank LIMIT ?").all(...scopes, tokens, ...dateParams, lim);
+        const evidence = rows.map(r => {
+          const ev = { scope: r.scope, ref_id: r.ref_id, agent: r.agent_name, summary: r.summary, snippet: r.snippet, rank: r.rank };
+          try {
+            if (r.scope === 'transcript') {
+              const tr = db.prepare("SELECT occurred_at, speaker, source, direction, content FROM transcript WHERE id=?").get(r.ref_id);
+              if (tr) { ev.occurred_at = tr.occurred_at; ev.speaker = tr.speaker; ev.direction = tr.direction; ev.content = tr.content; }
+            } else if (r.scope === 'brief') {
+              const br = db.prepare("SELECT created_at, agent_name, source_agent FROM agent_brief WHERE id=?").get(r.ref_id);
+              if (br) { ev.occurred_at = br.created_at; ev.agent = br.agent_name; ev.source = br.source_agent; }
+            }
+          } catch (e) {}
+          return ev;
+        });
+        return { question: a.question, count: evidence.length, scopes, date_filter: a.date || null, evidence };
+      } catch (e) { return { error: e.message }; }
     },
   },
   mem_recall_at_time: {

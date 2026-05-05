@@ -157,6 +157,17 @@ try {
       console.log("[migrate] FTS5 backfilled with " + briefs.length + " briefs");
     }
   } catch (e) { console.error("[migrate-fts-backfill]", e.message); }
+  // Phase 8 #2: backfill transcripts into FTS (idempotent — only if scope='transcript' empty)
+  try {
+    const tCount = db.prepare("SELECT COUNT(*) c FROM mnemo_search_fts WHERE scope='transcript'").get().c;
+    if (tCount === 0) {
+      const tranRows = db.prepare("SELECT id, source, channel, direction, speaker, content FROM transcript").all();
+      const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)");
+      const t = db.transaction(rows => { for (const r of rows) ins.run(String(r.id), r.speaker || r.source || '', r.direction + (r.channel ? ' @ ' + r.channel : ''), (r.content || '').slice(0, 8000)); });
+      t(tranRows);
+      if (tranRows.length) console.log("[migrate] FTS5 backfilled with " + tranRows.length + " transcripts");
+    }
+  } catch (e) { console.error("[migrate-transcript-fts-backfill]", e.message); }
   // Brief templates
   db.exec("CREATE TABLE IF NOT EXISTS brief_template (name TEXT PRIMARY KEY, body_template TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   // Seed default templates if empty
@@ -991,7 +1002,40 @@ function handleTool(tdb, name, a) {
         ? tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
         : tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
       );
+      try { tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)").run(String(info.lastInsertRowid), a.speaker || a.source || '', a.direction + (a.channel ? ' @ ' + a.channel : ''), (a.content || '').slice(0, 8000)); } catch (e) {}
       return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt };
+    }
+    case "mem_question_answer": {
+      if (!a.question) return { error: "question required" };
+      const lim = Math.min(a.limit || 10, 50);
+      const scopes = Array.isArray(a.scope) && a.scope.length ? a.scope : ['transcript','brief','memory','action'];
+      const raw = String(a.question || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!raw) return { error: "question must contain searchable terms" };
+      const tokens = raw.split(/\s+/).filter(t => t.length > 1).map(t => '"' + t + '"').join(" ");
+      const placeholders = scopes.map(() => "?").join(",");
+      let dateClause = "";
+      const dateParams = [];
+      if (a.date) {
+        dateClause = " AND ref_id IN (SELECT id FROM transcript WHERE date(occurred_at) = ? UNION SELECT id FROM agent_brief WHERE date(created_at) = ? UNION SELECT id FROM agent_action WHERE date(started_at) = ?)";
+        dateParams.push(a.date, a.date, a.date);
+      }
+      try {
+        const rows = tdb.prepare("SELECT scope, ref_id, agent_name, summary, snippet(mnemo_search_fts, 4, '<b>', '</b>', '...', 24) AS snippet, rank FROM mnemo_search_fts WHERE scope IN (" + placeholders + ") AND mnemo_search_fts MATCH ?" + dateClause + " ORDER BY rank LIMIT ?").all(...scopes, tokens, ...dateParams, lim);
+        const evidence = rows.map(r => {
+          const ev = { scope: r.scope, ref_id: r.ref_id, agent: r.agent_name, summary: r.summary, snippet: r.snippet, rank: r.rank };
+          try {
+            if (r.scope === 'transcript') {
+              const tr = tdb.prepare("SELECT occurred_at, speaker, source, direction, content FROM transcript WHERE id=?").get(r.ref_id);
+              if (tr) { ev.occurred_at = tr.occurred_at; ev.speaker = tr.speaker; ev.direction = tr.direction; ev.content = tr.content; }
+            } else if (r.scope === 'brief') {
+              const br = tdb.prepare("SELECT created_at, agent_name, source_agent FROM agent_brief WHERE id=?").get(r.ref_id);
+              if (br) { ev.occurred_at = br.created_at; ev.agent = br.agent_name; ev.source = br.source_agent; }
+            }
+          } catch (e) {}
+          return ev;
+        });
+        return { question: a.question, count: evidence.length, scopes, date_filter: a.date || null, evidence };
+      } catch (e) { return { error: e.message }; }
     }
     case "mem_recall_at_time": {
       if (!a.timestamp) return { error: "timestamp (ISO or YYYY-MM-DDTHH:MM) required" };
