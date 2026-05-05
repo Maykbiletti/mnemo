@@ -2005,6 +2005,64 @@ ${args.first_invocation_outcome || "(none)"}
     inputSchema: { type: "object", properties: { id: { type: "integer" }, attempt_id: { type: "integer" } }, required: ["id"] },
     handler: ({ id, attempt_id }) => { db.prepare("UPDATE codex_consult SET used_in_attempt_id=?, status='used' WHERE id=?").run(attempt_id || null, id); return { ok: true, id, status: "used" }; },
   },
+  mem_transcript_log: {
+    description: "Verbatim episodic log: append one transcript row. source='telegram'|'web'|'cli'|... direction='inbound'|'outbound'. Pass occurred_at to override timestamp; otherwise NOW. Use this for every chat message both directions so 'what was said at time X' is queryable.",
+    inputSchema: { type: "object", properties: { source: { type: "string" }, channel: { type: "string" }, direction: { type: "string", enum: ["inbound","outbound"] }, speaker: { type: "string" }, content: { type: "string" }, meta: { type: "object" }, occurred_at: { type: "string" }, ref_kind: { type: "string" }, ref_id: { type: "string" } }, required: ["source","direction","content"] },
+    handler: (a) => {
+      const occurredAt = a.occurred_at || null;
+      const info = (occurredAt
+        ? db.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+        : db.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+      );
+      return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt };
+    },
+  },
+  mem_recall_at_time: {
+    description: "Recall transcripts around a specific timestamp. Pass timestamp (ISO or 'YYYY-MM-DDTHH:MM') and window_minutes (default 5, max 360). Use for queries like 'what did we write at 15:00 on May 4'.",
+    inputSchema: { type: "object", properties: { timestamp: { type: "string" }, window_minutes: { type: "integer" }, limit: { type: "integer" } }, required: ["timestamp"] },
+    handler: (a) => {
+      const windowMin = Math.max(1, Math.min(a.window_minutes || 5, 360));
+      const lim = Math.min(a.limit || 50, 500);
+      const ts = String(a.timestamp);
+      const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id, ABS((julianday(occurred_at) - julianday(?)) * 1440) AS minutes_diff FROM transcript WHERE ABS((julianday(occurred_at) - julianday(?)) * 1440) <= ? ORDER BY occurred_at ASC LIMIT ?").all(ts, ts, windowMin, lim);
+      return { count: rows.length, timestamp: ts, window_minutes: windowMin, transcripts: rows };
+    },
+  },
+  mem_recall_on_date: {
+    description: "Recall all transcripts on a given date (YYYY-MM-DD). Returns chronological order.",
+    inputSchema: { type: "object", properties: { date: { type: "string" }, limit: { type: "integer" } }, required: ["date"] },
+    handler: (a) => {
+      const lim = Math.min(a.limit || 200, 1000);
+      const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE date(occurred_at) = ? ORDER BY occurred_at ASC LIMIT ?").all(String(a.date), lim);
+      return { count: rows.length, date: a.date, transcripts: rows };
+    },
+  },
+  mem_recall_between: {
+    description: "Recall transcripts between two timestamps (inclusive). ISO format expected.",
+    inputSchema: { type: "object", properties: { start: { type: "string" }, end: { type: "string" }, limit: { type: "integer" } }, required: ["start","end"] },
+    handler: (a) => {
+      const lim = Math.min(a.limit || 200, 1000);
+      const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at ASC LIMIT ?").all(String(a.start), String(a.end), lim);
+      return { count: rows.length, start: a.start, end: a.end, transcripts: rows };
+    },
+  },
+  mem_transcript_recent: {
+    description: "Most recent transcripts, optionally filtered by speaker/source/channel/direction.",
+    inputSchema: { type: "object", properties: { speaker: { type: "string" }, source: { type: "string" }, channel: { type: "string" }, direction: { type: "string" }, limit: { type: "integer" } } },
+    handler: (a) => {
+      const lim = Math.min(a.limit || 20, 200);
+      const filters = [];
+      const params = [];
+      if (a.speaker) { filters.push("speaker = ?"); params.push(a.speaker); }
+      if (a.source) { filters.push("source = ?"); params.push(a.source); }
+      if (a.channel) { filters.push("channel = ?"); params.push(a.channel); }
+      if (a.direction) { filters.push("direction = ?"); params.push(a.direction); }
+      const where = filters.length ? "WHERE " + filters.join(" AND ") : "";
+      params.push(lim);
+      const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript " + where + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, transcripts: rows };
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------

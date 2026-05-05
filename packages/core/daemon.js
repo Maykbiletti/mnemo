@@ -137,6 +137,11 @@ try {
   // Phase 7 #4: codex_consult — programming-specialist queue
   db.exec("CREATE TABLE IF NOT EXISTS codex_consult (id INTEGER PRIMARY KEY AUTOINCREMENT, requesting_agent TEXT NOT NULL, problem_id INTEGER, question TEXT NOT NULL, context_files TEXT, proposed_solution TEXT, used_in_attempt_id INTEGER, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), answered_at TEXT)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_codex_status ON codex_consult(status, created_at DESC)");
+  // Phase 8 #1: transcript — verbatim episodic log of every interaction (telegram inbound/outbound, briefs, decisions)
+  db.exec("CREATE TABLE IF NOT EXISTS transcript (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, channel TEXT, direction TEXT NOT NULL, speaker TEXT, content TEXT NOT NULL, meta_json TEXT, occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), ref_kind TEXT, ref_id TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_transcript_occurred ON transcript(occurred_at DESC)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_transcript_speaker ON transcript(speaker, occurred_at DESC)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_transcript_source_channel ON transcript(source, channel, occurred_at DESC)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -978,6 +983,49 @@ function handleTool(tdb, name, a) {
       if (!a.id) return { error: "id required" };
       tdb.prepare("UPDATE codex_consult SET used_in_attempt_id=?, status='used' WHERE id=?").run(a.attempt_id || null, a.id);
       return { ok: true, id: a.id, status: "used" };
+    }
+    case "mem_transcript_log": {
+      if (!a.source || !a.direction || !a.content) return { error: "source + direction + content required" };
+      const occurredAt = a.occurred_at || null;
+      const info = (occurredAt
+        ? tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+        : tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+      );
+      return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt };
+    }
+    case "mem_recall_at_time": {
+      if (!a.timestamp) return { error: "timestamp (ISO or YYYY-MM-DDTHH:MM) required" };
+      const windowMin = Math.max(1, Math.min(a.window_minutes || 5, 360));
+      const lim = Math.min(a.limit || 50, 500);
+      const ts = String(a.timestamp);
+      const rows = tdb.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id, ABS((julianday(occurred_at) - julianday(?)) * 1440) AS minutes_diff FROM transcript WHERE ABS((julianday(occurred_at) - julianday(?)) * 1440) <= ? ORDER BY occurred_at ASC LIMIT ?").all(ts, ts, windowMin, lim);
+      return { count: rows.length, timestamp: ts, window_minutes: windowMin, transcripts: rows };
+    }
+    case "mem_recall_on_date": {
+      if (!a.date) return { error: "date (YYYY-MM-DD) required" };
+      const lim = Math.min(a.limit || 200, 1000);
+      const date = String(a.date);
+      const rows = tdb.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE date(occurred_at) = ? ORDER BY occurred_at ASC LIMIT ?").all(date, lim);
+      return { count: rows.length, date, transcripts: rows };
+    }
+    case "mem_recall_between": {
+      if (!a.start || !a.end) return { error: "start + end (ISO timestamps) required" };
+      const lim = Math.min(a.limit || 200, 1000);
+      const rows = tdb.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at ASC LIMIT ?").all(String(a.start), String(a.end), lim);
+      return { count: rows.length, start: a.start, end: a.end, transcripts: rows };
+    }
+    case "mem_transcript_recent": {
+      const lim = Math.min(a.limit || 20, 200);
+      const filters = [];
+      const params = [];
+      if (a.speaker) { filters.push("speaker = ?"); params.push(a.speaker); }
+      if (a.source) { filters.push("source = ?"); params.push(a.source); }
+      if (a.channel) { filters.push("channel = ?"); params.push(a.channel); }
+      if (a.direction) { filters.push("direction = ?"); params.push(a.direction); }
+      const where = filters.length ? "WHERE " + filters.join(" AND ") : "";
+      params.push(lim);
+      const rows = tdb.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript " + where + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, transcripts: rows };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
