@@ -1778,6 +1778,208 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: Object.keys(bySkill).length, skills: Object.values(bySkill) };
     },
   },
+  mem_project_create: {
+    description: "Create a long-running project owned by an agent. Each agent owns N projects, briefs/actions can link via project_id.",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, owner_agent: { type: "string" }, goal_text: { type: "string" }, current_milestone: { type: "string" } }, required: ["name","owner_agent"] },
+    handler: ({ name, owner_agent, goal_text, current_milestone }) => {
+      try { const info = db.prepare("INSERT INTO agent_project (name, owner_agent, goal_text, current_milestone) VALUES (?,?,?,?)").run(name, owner_agent, goal_text || null, current_milestone || null); return { id: info.lastInsertRowid, name, owner_agent, status: "active" }; }
+      catch (e) { return String(e.message).includes("UNIQUE") ? { error: "project_exists", name } : { error: e.message }; }
+    },
+  },
+  mem_project_update: {
+    description: "Update project fields (owner_agent, goal_text, status, current_milestone, blocker).",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, name: { type: "string" }, owner_agent: { type: "string" }, goal_text: { type: "string" }, status: { type: "string" }, current_milestone: { type: "string" }, blocker: { type: "string" } } },
+    handler: (a) => {
+      const fields = []; const params = [];
+      for (const k of ["owner_agent","goal_text","status","current_milestone","blocker"]) if (a[k] !== undefined) { fields.push(k + "=?"); params.push(a[k]); }
+      fields.push("last_active_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+      const where = a.id ? "id=?" : "name=?";
+      params.push(a.id || a.name);
+      db.prepare("UPDATE agent_project SET " + fields.join(", ") + " WHERE " + where).run(...params);
+      return { ok: true, identifier: a.id || a.name };
+    },
+  },
+  mem_project_list: {
+    description: "List projects (filter by owner_agent, status).",
+    inputSchema: { type: "object", properties: { owner_agent: { type: "string" }, status: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ owner_agent, status, limit }) => {
+      const where = []; const params = [];
+      if (owner_agent) { where.push("owner_agent=?"); params.push(owner_agent); }
+      if (status) { where.push("status=?"); params.push(status); }
+      params.push(Math.min(limit || 50, 200));
+      const rows = db.prepare("SELECT id, name, owner_agent, goal_text, status, current_milestone, blocker, started_at, last_active_at FROM agent_project" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY last_active_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, projects: rows };
+    },
+  },
+  mem_project_close: {
+    description: "Close project (status=done).",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, name: { type: "string" } } },
+    handler: ({ id, name }) => {
+      const where = id ? "id=?" : "name=?";
+      db.prepare("UPDATE agent_project SET status='done', last_active_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE " + where).run(id || name);
+      return { ok: true };
+    },
+  },
+  mem_task_create: {
+    description: "Create shared task on the team task-board. Optional project_id, priority H/M/L, skills_required array.",
+    inputSchema: { type: "object", properties: { project_id: { type: "integer" }, title: { type: "string" }, description: { type: "string" }, priority: { type: "string" }, skills_required: { type: "array", items: { type: "string" } } }, required: ["title"] },
+    handler: ({ project_id, title, description, priority, skills_required }) => {
+      const skills = Array.isArray(skills_required) ? skills_required : [];
+      const info = db.prepare("INSERT INTO shared_task (project_id, title, description, priority, skills_required) VALUES (?,?,?,?,?)").run(project_id || null, title, description || null, priority || 'M', JSON.stringify(skills));
+      return { id: info.lastInsertRowid, title, status: "open" };
+    },
+  },
+  mem_task_claim: {
+    description: "Atomic claim — fails if already claimed by another agent.",
+    inputSchema: { type: "object", properties: { task_id: { type: "integer" }, agent_name: { type: "string" } }, required: ["task_id","agent_name"] },
+    handler: ({ task_id, agent_name }) => {
+      const r = db.prepare("UPDATE shared_task SET claim_agent=?, status='claimed', claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status='open'").run(agent_name, task_id);
+      if (r.changes === 0) { const cur = db.prepare("SELECT status, claim_agent FROM shared_task WHERE id=?").get(task_id); return { error: "claim_failed", current: cur }; }
+      return { ok: true, task_id, agent_name };
+    },
+  },
+  mem_task_release: {
+    description: "Release claim, task back to open.",
+    inputSchema: { type: "object", properties: { task_id: { type: "integer" } }, required: ["task_id"] },
+    handler: ({ task_id }) => { db.prepare("UPDATE shared_task SET claim_agent=NULL, status='open', claimed_at=NULL WHERE id=?").run(task_id); return { ok: true }; },
+  },
+  mem_task_block: {
+    description: "Mark task blocked with reason.",
+    inputSchema: { type: "object", properties: { task_id: { type: "integer" }, reason: { type: "string" } }, required: ["task_id","reason"] },
+    handler: ({ task_id, reason }) => { db.prepare("UPDATE shared_task SET status='blocked', blocker_reason=? WHERE id=?").run(reason, task_id); return { ok: true }; },
+  },
+  mem_task_done: {
+    description: "Mark task done.",
+    inputSchema: { type: "object", properties: { task_id: { type: "integer" } }, required: ["task_id"] },
+    handler: ({ task_id }) => { db.prepare("UPDATE shared_task SET status='done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(task_id); return { ok: true }; },
+  },
+  mem_task_available: {
+    description: "List open tasks the calling agent could claim. Filters by skills, priority H>M>L.",
+    inputSchema: { type: "object", properties: { skills: { type: "array", items: { type: "string" } }, limit: { type: "integer" } } },
+    handler: ({ skills, limit }) => {
+      const lim = Math.min(limit || 20, 100);
+      let rows = db.prepare("SELECT id, project_id, title, description, priority, skills_required, created_at FROM shared_task WHERE status='open' ORDER BY CASE priority WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at ASC LIMIT ?").all(lim * 3);
+      if (Array.isArray(skills) && skills.length) rows = rows.filter(r => { let req = []; try { req = JSON.parse(r.skills_required || "[]"); } catch {} return !req.length || req.some(x => skills.includes(x)); });
+      return { count: rows.slice(0, lim).length, tasks: rows.slice(0, lim) };
+    },
+  },
+  mem_watchdog_register: {
+    description: "Register http portal-monitor (target URL, owner_agent, optional thresholds).",
+    inputSchema: { type: "object", properties: { target: { type: "string" }, check_kind: { type: "string" }, owner_agent: { type: "string" }, threshold: { type: "object" }, enabled: { type: "boolean" } }, required: ["target"] },
+    handler: ({ target, check_kind, owner_agent, threshold, enabled }) => { const info = db.prepare("INSERT INTO watchdog (target, check_kind, owner_agent, threshold_json, enabled) VALUES (?,?,?,?,?)").run(target, check_kind || 'http', owner_agent || null, threshold ? JSON.stringify(threshold) : null, enabled === false ? 0 : 1); return { id: info.lastInsertRowid, target }; },
+  },
+  mem_watchdog_list: {
+    description: "List all registered watchdogs.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => { const rows = db.prepare("SELECT id, target, check_kind, owner_agent, enabled, last_check_at, last_status, consecutive_failures FROM watchdog ORDER BY enabled DESC, target").all(); return { count: rows.length, watchdogs: rows }; },
+  },
+  mem_watchdog_incidents: {
+    description: "Watchdog incidents (open or all).",
+    inputSchema: { type: "object", properties: { status: { type: "string" }, watchdog_id: { type: "integer" }, limit: { type: "integer" } } },
+    handler: (a) => {
+      const where = []; const params = [];
+      if (a.status) { where.push("i.status=?"); params.push(a.status); }
+      if (a.watchdog_id) { where.push("i.watchdog_id=?"); params.push(a.watchdog_id); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = db.prepare("SELECT i.id, i.watchdog_id, w.target, i.opened_at, i.closed_at, i.status, i.notes FROM watchdog_incident i LEFT JOIN watchdog w ON w.id=i.watchdog_id" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY i.opened_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, incidents: rows };
+    },
+  },
+  mem_escalate: {
+    description: "Escalate decision/blocker/customer/legal with kind+urgency+requested_authority. Auto-routes: H+mayk → telegram immediate; decision+dieter → brief; L → digest.",
+    inputSchema: { type: "object", properties: { source_agent: { type: "string" }, kind: { type: "string" }, urgency: { type: "string" }, summary: { type: "string" }, requested_authority: { type: "string" } }, required: ["kind","summary"] },
+    handler: (a) => {
+      const info = db.prepare("INSERT INTO escalation (source_agent, kind, urgency, summary, requested_authority) VALUES (?,?,?,?,?)").run(a.source_agent || null, a.kind, a.urgency || 'M', a.summary, a.requested_authority || 'dieter');
+      const id = info.lastInsertRowid;
+      const route = (a.kind === 'blocker' && a.urgency === 'H' && a.requested_authority === 'mayk') ? 'telegram_immediate' : (a.kind === 'customer' && a.urgency === 'H') ? 'telegram_immediate' : (a.kind === 'decision' && a.requested_authority === 'dieter') ? 'brief_to_dieter' : (a.urgency === 'L') ? 'digest_only' : 'brief_to_dieter';
+      try { if (route === 'brief_to_dieter') db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content) VALUES (?,?,?)").run('Dieter', a.source_agent || null, "[ESCALATION #" + id + "] " + a.kind + "/" + a.urgency + ": " + a.summary); } catch (e) {}
+      return { id, route, kind: a.kind, urgency: a.urgency };
+    },
+  },
+  mem_escalate_resolve: {
+    description: "Mark escalation resolved.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, resolution: { type: "string" } }, required: ["id"] },
+    handler: ({ id, resolution }) => { db.prepare("UPDATE escalation SET status='resolved', resolution=?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(resolution || null, id); return { ok: true, id }; },
+  },
+  mem_escalations_pending: {
+    description: "List pending escalations sorted by urgency.",
+    inputSchema: { type: "object", properties: { kind: { type: "string" }, urgency: { type: "string" }, limit: { type: "integer" } } },
+    handler: (a) => {
+      const where = ["status='open'"]; const params = [];
+      if (a.kind) { where.push("kind=?"); params.push(a.kind); }
+      if (a.urgency) { where.push("urgency=?"); params.push(a.urgency); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = db.prepare("SELECT id, source_agent, kind, urgency, summary, requested_authority, created_at FROM escalation WHERE " + where.join(" AND ") + " ORDER BY CASE urgency WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, escalations: rows };
+    },
+  },
+  mem_problem_create: {
+    description: "Open-problems registry. Pre-retry: list mem_problem_attempts → wenn ähnlicher approach 2x failed → escalate.",
+    inputSchema: { type: "object", properties: { title: { type: "string" }, project_id: { type: "integer" }, severity: { type: "string" }, owner_agent: { type: "string" } }, required: ["title"] },
+    handler: ({ title, project_id, severity, owner_agent }) => { const info = db.prepare("INSERT INTO open_problem (title, project_id, severity, owner_agent) VALUES (?,?,?,?)").run(title, project_id || null, severity || 'M', owner_agent || null); return { id: info.lastInsertRowid, title, status: "open" }; },
+  },
+  mem_problem_attempt: {
+    description: "Log an attempted approach to a problem (success or fail with reason).",
+    inputSchema: { type: "object", properties: { problem_id: { type: "integer" }, agent_name: { type: "string" }, approach: { type: "string" }, outcome: { type: "string" }, failure_reason: { type: "string" } }, required: ["problem_id","agent_name"] },
+    handler: ({ problem_id, agent_name, approach, outcome, failure_reason }) => { const info = db.prepare("INSERT INTO problem_attempt (problem_id, agent_name, approach, outcome, failure_reason) VALUES (?,?,?,?,?)").run(problem_id, agent_name, approach || null, outcome || null, failure_reason || null); return { id: info.lastInsertRowid }; },
+  },
+  mem_problem_attempts: {
+    description: "List all attempts on a problem (newest first).",
+    inputSchema: { type: "object", properties: { problem_id: { type: "integer" } }, required: ["problem_id"] },
+    handler: ({ problem_id }) => { const rows = db.prepare("SELECT id, agent_name, approach, outcome, failure_reason, created_at FROM problem_attempt WHERE problem_id=? ORDER BY created_at DESC").all(problem_id); return { count: rows.length, attempts: rows }; },
+  },
+  mem_problem_close: {
+    description: "Close problem with resolution.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, resolution: { type: "string" } }, required: ["id"] },
+    handler: ({ id, resolution }) => { db.prepare("UPDATE open_problem SET status='closed', solved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), resolution=? WHERE id=?").run(resolution || null, id); return { ok: true }; },
+  },
+  mem_problems_open: {
+    description: "List open problems.",
+    inputSchema: { type: "object", properties: { owner_agent: { type: "string" }, project_id: { type: "integer" }, limit: { type: "integer" } } },
+    handler: (a) => {
+      const where = ["status='open'"]; const params = [];
+      if (a.owner_agent) { where.push("owner_agent=?"); params.push(a.owner_agent); }
+      if (a.project_id) { where.push("project_id=?"); params.push(a.project_id); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = db.prepare("SELECT id, title, project_id, severity, owner_agent, opened_at FROM open_problem WHERE " + where.join(" AND ") + " ORDER BY CASE severity WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, opened_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, problems: rows };
+    },
+  },
+  mem_consult_peer: {
+    description: "Lightweight back-and-forth ask between agents (lighter than brief, heavier than reaction).",
+    inputSchema: { type: "object", properties: { source_agent: { type: "string" }, target_agent: { type: "string" }, question: { type: "string" }, context: { type: "string" } }, required: ["source_agent","target_agent","question"] },
+    handler: (a) => { const info = db.prepare("INSERT INTO peer_consult (source_agent, target_agent, question, context) VALUES (?,?,?,?)").run(a.source_agent, a.target_agent, a.question, a.context || null); return { id: info.lastInsertRowid, target_agent: a.target_agent }; },
+  },
+  mem_consults_inbox: {
+    description: "Open peer-consults addressed to the calling agent.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, limit: { type: "integer" } }, required: ["agent_name"] },
+    handler: ({ agent_name, limit }) => { const rows = db.prepare("SELECT id, source_agent, question, context, status, created_at FROM peer_consult WHERE target_agent=? AND status='open' ORDER BY created_at DESC LIMIT ?").all(agent_name, Math.min(limit || 20, 100)); return { count: rows.length, consults: rows }; },
+  },
+  mem_consult_answer: {
+    description: "Reply to a peer-consult.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, response: { type: "string" } }, required: ["id","response"] },
+    handler: ({ id, response }) => { db.prepare("UPDATE peer_consult SET response=?, status='answered', answered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(response, id); return { ok: true }; },
+  },
+  mem_meeting_open: {
+    description: "Open a multi-agent collaborative thread on a topic/problem/project.",
+    inputSchema: { type: "object", properties: { topic: { type: "string" }, project_id: { type: "integer" }, problem_id: { type: "integer" }, created_by: { type: "string" } }, required: ["topic"] },
+    handler: (a) => { const info = db.prepare("INSERT INTO meeting (topic, project_id, problem_id, created_by) VALUES (?,?,?,?)").run(a.topic, a.project_id || null, a.problem_id || null, a.created_by || null); return { id: info.lastInsertRowid, topic: a.topic, status: "open" }; },
+  },
+  mem_meeting_post: {
+    description: "Post a turn in meeting (turn_kind: propose|agree|disagree|question|synthesis).",
+    inputSchema: { type: "object", properties: { meeting_id: { type: "integer" }, agent_name: { type: "string" }, content: { type: "string" }, turn_kind: { type: "string" } }, required: ["meeting_id","agent_name","content"] },
+    handler: (a) => { const valid = ['propose','agree','disagree','question','synthesis']; const kind = valid.includes(a.turn_kind) ? a.turn_kind : 'propose'; const info = db.prepare("INSERT INTO meeting_turn (meeting_id, agent_name, content, turn_kind) VALUES (?,?,?,?)").run(a.meeting_id, a.agent_name, a.content, kind); return { id: info.lastInsertRowid, turn_kind: kind }; },
+  },
+  mem_meeting_close: {
+    description: "Close meeting with decision_summary (auto-logged for audit).",
+    inputSchema: { type: "object", properties: { meeting_id: { type: "integer" }, decision_summary: { type: "string" } }, required: ["meeting_id"] },
+    handler: ({ meeting_id, decision_summary }) => { db.prepare("UPDATE meeting SET status='closed', decision_summary=?, closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(decision_summary || null, meeting_id); return { ok: true }; },
+  },
+  mem_meeting_turns: {
+    description: "Read all turns of a meeting.",
+    inputSchema: { type: "object", properties: { meeting_id: { type: "integer" } }, required: ["meeting_id"] },
+    handler: ({ meeting_id }) => { const rows = db.prepare("SELECT id, agent_name, content, turn_kind, created_at FROM meeting_turn WHERE meeting_id=? ORDER BY created_at ASC").all(meeting_id); return { count: rows.length, turns: rows }; },
+  },
 };
 
 // ---------------------------------------------------------------------------
