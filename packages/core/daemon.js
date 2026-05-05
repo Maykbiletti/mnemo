@@ -120,7 +120,52 @@ try {
       seed.run("question", "# Frage an {{recipient}}\n\n{{question}}\n\nKontext: {{context}}\n", "structured question");
     }
   } catch (e) { console.error("[migrate-template-seed]", e.message); }
+  db.exec("CREATE TABLE IF NOT EXISTS skill_registry (name TEXT PRIMARY KEY, description TEXT, trigger_phrases TEXT, sandbox TEXT DEFAULT 'none', requires_confirmation INTEGER DEFAULT 0, sensitive_data TEXT, body TEXT, source_path TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE TABLE IF NOT EXISTS skill_invocation (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL, agent_name TEXT, input TEXT, output TEXT, exit_code INTEGER, duration_ms INTEGER, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), finished_at TEXT, status TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_invoc_skill ON skill_invocation(skill_name, started_at DESC)");
 } catch (e) { console.error("[migrate]", e.message); }
+
+// Auto-load skills from /root/mnemo/packages/core/skills/*/SKILL.md on startup
+try {
+  const skillsDir = path.join(__dirname, "skills");
+  if (fs.existsSync(skillsDir)) {
+    const dirs = fs.readdirSync(skillsDir).filter(d => {
+      try { return fs.statSync(path.join(skillsDir, d)).isDirectory() && fs.existsSync(path.join(skillsDir, d, "SKILL.md")); } catch { return false; }
+    });
+    const upsert = db.prepare("INSERT INTO skill_registry (name, description, trigger_phrases, sandbox, requires_confirmation, sensitive_data, body, source_path, status, updated_at) VALUES (?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(name) DO UPDATE SET description=excluded.description, trigger_phrases=excluded.trigger_phrases, sandbox=excluded.sandbox, requires_confirmation=excluded.requires_confirmation, sensitive_data=excluded.sensitive_data, body=excluded.body, source_path=excluded.source_path, status=excluded.status, updated_at=excluded.updated_at");
+    for (const dname of dirs) {
+      try {
+        const fp = path.join(skillsDir, dname, "SKILL.md");
+        const text = fs.readFileSync(fp, "utf8");
+        const fm = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+        if (!fm) continue;
+        const meta = {};
+        for (const raw of fm[1].split(/\n/)) {
+          const line = raw.trim(); if (!line || line.startsWith("#")) continue;
+          const idx = line.indexOf(":"); if (idx < 0) continue;
+          const k = line.slice(0,idx).trim(); let v = line.slice(idx+1).trim();
+          if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1,-1).split(",").map(x=>x.trim().replace(/^['"]|['"]$/g,"")).filter(Boolean);
+          else if (v === "true") v = true; else if (v === "false") v = false;
+          else if ((v.startsWith("'") && v.endsWith("'")) || (v.startsWith('"') && v.endsWith('"'))) v = v.slice(1,-1);
+          meta[k] = v;
+        }
+        const body = fm[2];
+        const triggers = Array.isArray(meta.trigger_phrases) ? meta.trigger_phrases : [];
+        // Also handle YAML list block: lines starting with -
+        if (!triggers.length) {
+          const tpMatch = fm[1].match(/trigger_phrases:\s*\n((?:\s*-\s+.+\n?)+)/);
+          if (tpMatch) for (const ln of tpMatch[1].split(/\n/)) {
+            const m = ln.match(/^\s*-\s+['"]?(.+?)['"]?\s*$/); if (m) triggers.push(m[1]);
+          }
+        }
+        const sensitive = Array.isArray(meta.sensitive_data) ? meta.sensitive_data : [];
+        upsert.run(meta.name || dname, meta.description || "", JSON.stringify(triggers), meta.sandbox || "none", meta.requires_confirmation ? 1 : 0, JSON.stringify(sensitive), body, fp, meta.status || "active");
+      } catch (e) { console.error("[skill-load]", dname, e.message); }
+    }
+    const cnt = db.prepare("SELECT COUNT(*) c FROM skill_registry").get().c;
+    console.log("[skills] " + cnt + " skills in registry");
+  }
+} catch (e) { console.error("[skills-init]", e.message); }
 db.pragma("synchronous = NORMAL");
 
 // ---------- Multi-tenant pool ----------
@@ -313,6 +358,24 @@ function fireBriefHook(tdb, briefId, eventType, ctx) {
   } catch (e) { /* hook never throws */ }
 }
 
+function matchSkillsForText(tdb, text) {
+  if (!text) return [];
+
+  const skills = tdb.prepare("SELECT name, description, trigger_phrases FROM skill_registry WHERE status IN ('active','stub')").all();
+  const matches = [];
+  for (const sk of skills) {
+    let triggers = [];
+    try { triggers = JSON.parse(sk.trigger_phrases || "[]"); } catch {}
+    for (const tp of triggers) {
+      try {
+        const re = new RegExp(tp, "i");
+        if (re.test(text)) { matches.push({ name: sk.name, description: sk.description, matched: tp }); break; }
+      } catch {}
+    }
+  }
+  return matches;
+}
+
 function ftsIndex(tdb, scope, refId, agentName, summary, content) {
   try {
     tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES (?,?,?,?,?)")
@@ -417,6 +480,13 @@ function handleTool(tdb, name, a) {
       }
       try { fireBriefHook(tdb, newId, "drop", { agent_name: a.agent_name }); } catch (e) {}
       try { ftsIndex(tdb, "brief", newId, a.agent_name, a.source_agent || "", a.content); } catch (e) {}
+      try {
+        const skMatches = matchSkillsForText(tdb, a.content);
+        if (skMatches.length) {
+          const insR = tdb.prepare("INSERT INTO agent_brief_reaction (brief_id, agent_name, kind, payload) VALUES (?,?,?,?)");
+          for (const m of skMatches) insR.run(newId, "mnemo-skills-engine", "skill_suggested", JSON.stringify(m));
+        }
+      } catch (e) {}
       return { id: newId, agent_name: a.agent_name, status: "pending", supersedes: a.supersedes || null };
     }
     case "mem_brief_pull": {
@@ -435,6 +505,60 @@ function handleTool(tdb, name, a) {
       tdb.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
         .run(a.status, new Date().toISOString(), a.outcome || null, a.id);
       return { id: a.id, status: a.status };
+    }
+    case "mem_skill_list": {
+      const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
+      return { count: rows.length, skills: rows };
+    }
+    case "mem_skill_get": {
+      const row = tdb.prepare("SELECT name, description, trigger_phrases, sandbox, requires_confirmation, sensitive_data, body, source_path, status, created_at, updated_at FROM skill_registry WHERE name=?").get(a.name);
+      if (!row) return { error: "skill_not_found", name: a.name };
+      try { row.trigger_phrases = JSON.parse(row.trigger_phrases || "[]"); } catch {}
+      try { row.sensitive_data = JSON.parse(row.sensitive_data || "[]"); } catch {}
+      return row;
+    }
+    case "mem_skill_match": {
+      if (!a.text) return { error: "text required" };
+      return { matches: matchSkillsForText(tdb, a.text) };
+    }
+    case "mem_skill_register": {
+      const triggers = Array.isArray(a.trigger_phrases) ? a.trigger_phrases : [];
+      const sensitive = Array.isArray(a.sensitive_data) ? a.sensitive_data : [];
+      tdb.prepare("INSERT INTO skill_registry (name, description, trigger_phrases, sandbox, requires_confirmation, sensitive_data, body, source_path, status, updated_at) VALUES (?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(name) DO UPDATE SET description=excluded.description, trigger_phrases=excluded.trigger_phrases, sandbox=excluded.sandbox, requires_confirmation=excluded.requires_confirmation, sensitive_data=excluded.sensitive_data, body=excluded.body, source_path=excluded.source_path, status=excluded.status, updated_at=excluded.updated_at").run(a.name, a.description || "", JSON.stringify(triggers), a.sandbox || "none", a.requires_confirmation ? 1 : 0, JSON.stringify(sensitive), a.body || "", a.source_path || null, a.status || "active");
+      return { name: a.name, status: "registered" };
+    }
+    case "mem_skill_run": {
+      const sk = tdb.prepare("SELECT name, source_path, sandbox, requires_confirmation FROM skill_registry WHERE name=? AND status='active'").get(a.name);
+      if (!sk) return { error: "skill_not_found_or_inactive", name: a.name };
+      if (sk.requires_confirmation && !a.confirmed) return { error: "requires_confirmation", name: a.name, hint: "pass confirmed: true to authorize" };
+      const skillDir = sk.source_path ? path.dirname(sk.source_path) : null;
+      if (!skillDir) return { error: "no_runnable", name: a.name };
+      const t0 = Date.now();
+      const inv = tdb.prepare("INSERT INTO skill_invocation (skill_name, agent_name, input, status) VALUES (?,?,?,?)").run(a.name, a.agent_name || null, a.input || "", "running");
+      const invId = inv.lastInsertRowid;
+      try {
+        const cp = require("child_process");
+        const runScript = path.join(__dirname, "skills", "skill_runner.js");
+        const args = [runScript, skillDir];
+        if (a.input) { args.push("--input", a.input); }
+        if (a.confirmed) { args.push("--allow-confirm"); }
+        const out = cp.spawnSync("node", args, { encoding: "utf8", timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+        const dur = Date.now() - t0;
+        const outputCombined = (out.stdout || "") + (out.stderr ? "\n[stderr]\n" + out.stderr : "");
+        tdb.prepare("UPDATE skill_invocation SET output=?, exit_code=?, duration_ms=?, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), status=? WHERE id=?").run(outputCombined.slice(0, 16384), out.status, dur, out.status === 0 ? "ok" : "error", invId);
+        return { invocation_id: invId, name: a.name, exit_code: out.status, duration_ms: dur, output_preview: outputCombined.slice(0, 2000) };
+      } catch (e) {
+        tdb.prepare("UPDATE skill_invocation SET output=?, exit_code=?, status=? WHERE id=?").run(String(e.message), -1, "error", invId);
+        return { error: "run_failed", name: a.name, message: e.message };
+      }
+    }
+    case "mem_skill_invocations": {
+      const where = []; const params = [];
+      if (a.skill_name) { where.push("skill_name=?"); params.push(a.skill_name); }
+      params.push(Math.min(a.limit || 20, 100));
+      const sql = "SELECT id, skill_name, agent_name, exit_code, duration_ms, started_at, finished_at, status, substr(input,1,200) AS input_preview, substr(output,1,200) AS output_preview FROM skill_invocation" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY started_at DESC LIMIT ?";
+      const rows = tdb.prepare(sql).all(...params);
+      return { count: rows.length, invocations: rows };
     }
     case "mem_brief_drop_batch": {
       const items = Array.isArray(a.briefs) ? a.briefs : [];
