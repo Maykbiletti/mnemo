@@ -87,7 +87,15 @@ CREATE TABLE IF NOT EXISTS channel_subscription (
 try {
   const cols = db.prepare("PRAGMA table_info(agent_brief)").all().map(c => c.name);
   if (!cols.includes("channel")) db.exec("ALTER TABLE agent_brief ADD COLUMN channel TEXT");
-} catch (e) {}
+  if (!cols.includes("parent_id")) db.exec("ALTER TABLE agent_brief ADD COLUMN parent_id INTEGER");
+  if (!cols.includes("supersedes_id")) db.exec("ALTER TABLE agent_brief ADD COLUMN supersedes_id INTEGER");
+  if (!cols.includes("superseded_by_id")) db.exec("ALTER TABLE agent_brief ADD COLUMN superseded_by_id INTEGER");
+  const rcols = db.prepare("PRAGMA table_info(agent_registry)").all().map(c => c.name);
+  if (!rcols.includes("notify_webhook")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_webhook TEXT");
+  if (!rcols.includes("notify_telegram_chat")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_telegram_chat TEXT");
+  db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
+} catch (e) { console.error("[migrate]", e.message); }
 db.pragma("synchronous = NORMAL");
 
 // ---------- Multi-tenant pool ----------
@@ -245,6 +253,41 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end("not found");
 });
 
+// ---------- Push hook: fires telegram/webhook on brief insert/reaction ----------
+function fireBriefHook(tdb, briefId, eventType, ctx) {
+
+  try {
+    const brief = tdb.prepare("SELECT id, agent_name, source_agent, channel, substr(content,1,500) AS preview FROM agent_brief WHERE id=?").get(briefId);
+    if (!brief) return;
+    const agent = tdb.prepare("SELECT notify_webhook, notify_telegram_chat FROM agent_registry WHERE agent_name=?").get(brief.agent_name);
+    if (!agent) return;
+    const payload = { event: eventType, brief_id: briefId, agent_name: brief.agent_name, source_agent: brief.source_agent, channel: brief.channel, preview: brief.preview, ctx: ctx || null, ts: new Date().toISOString() };
+    if (agent.notify_webhook) {
+      try {
+        const url = new URL(agent.notify_webhook);
+        const lib = url.protocol === "https:" ? require("https") : require("http");
+        const body = Buffer.from(JSON.stringify(payload));
+        const req = lib.request({ method: "POST", hostname: url.hostname, port: url.port, path: url.pathname + url.search, headers: { "Content-Type": "application/json", "Content-Length": body.length } }, (rs) => { rs.resume(); });
+        req.on("error", () => {}); req.write(body); req.end();
+      } catch (e) {}
+    }
+    if (agent.notify_telegram_chat) {
+      try {
+        const tokenFile = process.env.TELEGRAM_BOT_TOKEN_FILE || "/root/.dieter/telegram_bot_token";
+        let token = process.env.TELEGRAM_BOT_TOKEN || "";
+        if (!token && require("fs").existsSync(tokenFile)) token = require("fs").readFileSync(tokenFile,"utf8").trim();
+        if (token) {
+          const text = "[mnemo " + eventType + "] #" + briefId + " -> " + brief.agent_name + "\nfrom: " + (brief.source_agent || "?") + "\nchannel: " + (brief.channel || "-") + "\n\n" + ((brief.preview || "").slice(0,200));
+          const https = require("https");
+          const data = JSON.stringify({ chat_id: agent.notify_telegram_chat, text, disable_notification: false });
+          const req = https.request({ method: "POST", hostname: "api.telegram.org", path: "/bot" + token + "/sendMessage", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } }, (rs) => { rs.resume(); });
+          req.on("error", () => {}); req.write(data); req.end();
+        }
+      } catch (e) {}
+    }
+  } catch (e) { /* hook never throws */ }
+}
+
 // ---------- Connect / Brief tool dispatch (HTTP-callable subset) ----------
 function handleTool(tdb, name, a) {
   switch (name) {
@@ -319,6 +362,7 @@ function handleTool(tdb, name, a) {
         const info = ins.run(s.agent_name, a.source_agent || null, a.content, a.channel,
                              a.meta ? JSON.stringify(a.meta) : null);
         ids.push(info.lastInsertRowid);
+        try { fireBriefHook(tdb, info.lastInsertRowid, "channel_post", { agent_name: s.agent_name, channel: a.channel, source: a.source_agent || null }); } catch (e) {}
       }
       return { channel: a.channel, fanout: subs.length, brief_ids: ids };
     }
@@ -332,9 +376,14 @@ function handleTool(tdb, name, a) {
     }
     case "mem_brief_drop": {
       const info = tdb.prepare(
-        "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)"
-      ).run(a.agent_name, a.source_agent || null, a.content, a.meta ? JSON.stringify(a.meta) : null);
-      return { id: info.lastInsertRowid, agent_name: a.agent_name, status: "pending" };
+        "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)"
+      ).run(a.agent_name, a.source_agent || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.parent_id || null, a.supersedes || null);
+      const newId = info.lastInsertRowid;
+      if (a.supersedes) {
+        try { tdb.prepare("UPDATE agent_brief SET superseded_by_id=?, status=CASE WHEN status='pending' THEN 'superseded' ELSE status END WHERE id=?").run(newId, a.supersedes); } catch (e) {}
+      }
+      try { fireBriefHook(tdb, newId, "drop", { agent_name: a.agent_name }); } catch (e) {}
+      return { id: newId, agent_name: a.agent_name, status: "pending", supersedes: a.supersedes || null };
     }
     case "mem_brief_pull": {
       const rows = tdb.prepare(
@@ -352,6 +401,33 @@ function handleTool(tdb, name, a) {
       tdb.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
         .run(a.status, new Date().toISOString(), a.outcome || null, a.id);
       return { id: a.id, status: a.status };
+    }
+    case "mem_brief_status": {
+      const row = tdb.prepare("SELECT id, agent_name, source_agent, channel, status, created_at, dispatched_at, done_at, outcome, parent_id, supersedes_id, superseded_by_id, length(content) AS content_len FROM agent_brief WHERE id=?").get(a.id);
+      if (!row) return { error: "not_found", id: a.id };
+      const reactions = tdb.prepare("SELECT id, agent_name, kind, payload, created_at FROM agent_brief_reaction WHERE brief_id=? ORDER BY created_at ASC").all(a.id);
+      row.reactions = reactions;
+      return row;
+    }
+    case "mem_brief_react": {
+      const info = tdb.prepare("INSERT INTO agent_brief_reaction (brief_id, agent_name, kind, payload) VALUES (?,?,?,?)").run(a.brief_id, a.agent_name, a.kind, a.payload ? (typeof a.payload === "string" ? a.payload : JSON.stringify(a.payload)) : null);
+      try { fireBriefHook(tdb, a.brief_id, "reaction", { agent_name: a.agent_name, kind: a.kind }); } catch (e) {}
+      return { id: info.lastInsertRowid, brief_id: a.brief_id, agent_name: a.agent_name, kind: a.kind };
+    }
+    case "mem_agent_set_notify": {
+      const cur = tdb.prepare("SELECT agent_name FROM agent_registry WHERE agent_name=?").get(a.agent_name);
+      if (!cur) return { error: "agent_not_registered", agent_name: a.agent_name };
+      tdb.prepare("UPDATE agent_registry SET notify_webhook=?, notify_telegram_chat=? WHERE agent_name=?").run(a.webhook || null, a.telegram_chat ? String(a.telegram_chat) : null, a.agent_name);
+      return { agent_name: a.agent_name, webhook: a.webhook || null, telegram_chat: a.telegram_chat || null };
+    }
+    case "mem_health": {
+      const tot = tdb.prepare("SELECT COUNT(*) c FROM agent_brief").get().c;
+      const pending = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='pending'").get().c;
+      const dispatched = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='dispatched'").get().c;
+      const done = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='done' OR status='deploy-issue'").get().c;
+      const perAgent = tdb.prepare("SELECT agent_name, COUNT(*) pending FROM agent_brief WHERE status='pending' GROUP BY agent_name ORDER BY 2 DESC").all();
+      const lastHour = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE created_at > datetime('now','-1 hour')").get().c;
+      return { briefs_total: tot, pending, dispatched, done, last_hour_drops: lastHour, queue_per_agent: perAgent, limits: { payload_max_kb: 4096, drops_per_hour_per_agent: 200, default_pull_limit: 50 } };
     }
     case "mem_brief_list": {
       const where = ["1=1"]; const params = [];
