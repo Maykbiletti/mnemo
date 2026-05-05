@@ -109,6 +109,13 @@ try {
   db.exec("CREATE TABLE IF NOT EXISTS agent_mode (agent_name TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'active', until TEXT, digest_chat_id TEXT, last_digest_at TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE TABLE IF NOT EXISTS skill_outcome (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL, proposal_id INTEGER, brief_id INTEGER, reaction TEXT, metric_json TEXT, recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_outcome_skill ON skill_outcome(skill_name, recorded_at DESC)");
+  // Phase 6: agent_project + shared_task
+  db.exec("CREATE TABLE IF NOT EXISTS agent_project (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, owner_agent TEXT NOT NULL, goal_text TEXT, status TEXT DEFAULT 'active', current_milestone TEXT, blocker TEXT, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), last_active_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_project_owner_status ON agent_project(owner_agent, status)");
+  db.exec("CREATE TABLE IF NOT EXISTS shared_task (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER, title TEXT NOT NULL, description TEXT, claim_agent TEXT, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'M', skills_required TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), claimed_at TEXT, done_at TEXT, blocker_reason TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_status ON shared_task(status, priority)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_project ON shared_task(project_id, status)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_claim ON shared_task(claim_agent, status)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -695,6 +702,97 @@ function handleTool(tdb, name, a) {
         obj.success_rate = obj.total > 0 ? Math.round(1000 * ok / obj.total) / 1000 : 0;
       }
       return { count: Object.keys(bySkill).length, skills: Object.values(bySkill) };
+    }
+    case "mem_project_create": {
+      if (!a.name || !a.owner_agent) return { error: "name + owner_agent required" };
+      try {
+        const info = tdb.prepare("INSERT INTO agent_project (name, owner_agent, goal_text, current_milestone) VALUES (?,?,?,?)").run(a.name, a.owner_agent, a.goal_text || null, a.current_milestone || null);
+        return { id: info.lastInsertRowid, name: a.name, owner_agent: a.owner_agent, status: "active" };
+      } catch (e) {
+        if (String(e.message).includes("UNIQUE")) return { error: "project_exists", name: a.name };
+        return { error: e.message };
+      }
+    }
+    case "mem_project_update": {
+      if (!a.name && !a.id) return { error: "name or id required" };
+      const fields = []; const params = [];
+      for (const k of ["owner_agent","goal_text","status","current_milestone","blocker"]) {
+        if (a[k] !== undefined) { fields.push(k + "=?"); params.push(a[k]); }
+      }
+      fields.push("last_active_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+      if (!fields.length) return { error: "no fields" };
+      const where = a.id ? "id=?" : "name=?";
+      params.push(a.id || a.name);
+      tdb.prepare("UPDATE agent_project SET " + fields.join(", ") + " WHERE " + where).run(...params);
+      return { ok: true, identifier: a.id || a.name };
+    }
+    case "mem_project_list": {
+      const where = []; const params = [];
+      if (a.owner_agent) { where.push("owner_agent=?"); params.push(a.owner_agent); }
+      if (a.status) { where.push("status=?"); params.push(a.status); }
+      const sql = "SELECT id, name, owner_agent, goal_text, status, current_milestone, blocker, started_at, last_active_at FROM agent_project" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY last_active_at DESC LIMIT ?";
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = tdb.prepare(sql).all(...params);
+      return { count: rows.length, projects: rows };
+    }
+    case "mem_project_close": {
+      if (!a.name && !a.id) return { error: "name or id required" };
+      const where = a.id ? "id=?" : "name=?";
+      tdb.prepare("UPDATE agent_project SET status='done', last_active_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE " + where).run(a.id || a.name);
+      return { ok: true, identifier: a.id || a.name };
+    }
+    case "mem_task_create": {
+      if (!a.title) return { error: "title required" };
+      const skills = Array.isArray(a.skills_required) ? a.skills_required : [];
+      const info = tdb.prepare("INSERT INTO shared_task (project_id, title, description, priority, skills_required) VALUES (?,?,?,?,?)").run(a.project_id || null, a.title, a.description || null, a.priority || 'M', JSON.stringify(skills));
+      return { id: info.lastInsertRowid, title: a.title, status: "open" };
+    }
+    case "mem_task_claim": {
+      if (!a.task_id || !a.agent_name) return { error: "task_id + agent_name required" };
+      const r = tdb.prepare("UPDATE shared_task SET claim_agent=?, status='claimed', claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status='open'").run(a.agent_name, a.task_id);
+      if (r.changes === 0) {
+        const cur = tdb.prepare("SELECT status, claim_agent FROM shared_task WHERE id=?").get(a.task_id);
+        return { error: "claim_failed", current: cur };
+      }
+      return { ok: true, task_id: a.task_id, agent_name: a.agent_name };
+    }
+    case "mem_task_release": {
+      if (!a.task_id) return { error: "task_id required" };
+      tdb.prepare("UPDATE shared_task SET claim_agent=NULL, status='open', claimed_at=NULL WHERE id=?").run(a.task_id);
+      return { ok: true, task_id: a.task_id };
+    }
+    case "mem_task_block": {
+      if (!a.task_id || !a.reason) return { error: "task_id + reason required" };
+      tdb.prepare("UPDATE shared_task SET status='blocked', blocker_reason=? WHERE id=?").run(a.reason, a.task_id);
+      return { ok: true, task_id: a.task_id, status: "blocked" };
+    }
+    case "mem_task_done": {
+      if (!a.task_id) return { error: "task_id required" };
+      tdb.prepare("UPDATE shared_task SET status='done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.task_id);
+      return { ok: true, task_id: a.task_id };
+    }
+    case "mem_task_available": {
+      const skills = Array.isArray(a.skills) ? a.skills : null;
+      const limit = Math.min(a.limit || 20, 100);
+      let rows = tdb.prepare("SELECT id, project_id, title, description, priority, skills_required, created_at FROM shared_task WHERE status='open' ORDER BY CASE priority WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at ASC LIMIT ?").all(limit * 3);
+      if (skills && skills.length) {
+        rows = rows.filter(r => {
+          let req = []; try { req = JSON.parse(r.skills_required || "[]"); } catch {}
+          if (!req.length) return true;
+          return req.some(s => skills.includes(s));
+        });
+      }
+      return { count: rows.slice(0, limit).length, tasks: rows.slice(0, limit) };
+    }
+    case "mem_task_list": {
+      const where = []; const params = [];
+      if (a.project_id) { where.push("project_id=?"); params.push(a.project_id); }
+      if (a.claim_agent) { where.push("claim_agent=?"); params.push(a.claim_agent); }
+      if (a.status) { where.push("status=?"); params.push(a.status); }
+      params.push(Math.min(a.limit || 50, 200));
+      const sql = "SELECT id, project_id, title, claim_agent, status, priority, created_at, claimed_at, done_at FROM shared_task" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY created_at DESC LIMIT ?";
+      const rows = tdb.prepare(sql).all(...params);
+      return { count: rows.length, tasks: rows };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
