@@ -122,6 +122,8 @@ try {
   db.exec("CREATE TABLE IF NOT EXISTS watchdog_incident (id INTEGER PRIMARY KEY AUTOINCREMENT, watchdog_id INTEGER NOT NULL, opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), closed_at TEXT, status TEXT DEFAULT 'open', notes TEXT)");
   db.exec("CREATE TABLE IF NOT EXISTS escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, source_agent TEXT, kind TEXT, urgency TEXT DEFAULT 'M', summary TEXT, requested_authority TEXT, status TEXT DEFAULT 'open', resolution TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), resolved_at TEXT)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_escalation_status ON escalation(status, urgency)");
+  // Phase 6 Sprint 3: rename active→autonomous (idempotent)
+  try { db.exec("UPDATE agent_mode SET mode = 'autonomous' WHERE mode = 'active'"); } catch (e) {}
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -670,7 +672,7 @@ function handleTool(tdb, name, a) {
     }
     case "mem_set_mode": {
       if (!a.agent_name || !a.mode) return { error: "agent_name + mode required" };
-      const validModes = ['active','vacation','maintenance'];
+      const validModes = ['autonomous','meeting','offline','maintenance','active','vacation'];
       if (!validModes.includes(a.mode)) return { error: "mode must be active|vacation|maintenance" };
       tdb.prepare("INSERT INTO agent_mode (agent_name, mode, until, digest_chat_id, updated_at) VALUES (?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(agent_name) DO UPDATE SET mode=excluded.mode, until=excluded.until, digest_chat_id=COALESCE(excluded.digest_chat_id, agent_mode.digest_chat_id), updated_at=excluded.updated_at").run(a.agent_name, a.mode, a.until || null, a.digest_chat_id ? String(a.digest_chat_id) : null);
       return { agent_name: a.agent_name, mode: a.mode, until: a.until || null };
