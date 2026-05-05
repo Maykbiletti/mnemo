@@ -392,6 +392,7 @@ const server = http.createServer((req, res) => {
       }
       try {
         const result = handleTool(tdb, tool, args);
+        injectContext(tdb, tool, args, result);
         return sendJson(req, res, 200, { tool, result });
       } catch (e) {
         return sendJson(req, res, 500, { error: String(e.message), tool });
@@ -491,6 +492,66 @@ function ftsIndex(tdb, scope, refId, agentName, summary, content) {
   try {
     tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES (?,?,?,?,?)")
        .run(scope, String(refId), agentName || '', (summary || '').slice(0, 200), (content || '').slice(0, 8000));
+  } catch (e) { /* silent */ }
+}
+
+// ---------- Phase 8 #3: auto-inject relevant context into tool responses ----------
+// Tools we never auto-inject for (recall-style, status-views, high-volume noise, recursion-risk)
+const AUTO_INJECT_SKIP = new Set([
+  "mem_recall","mem_recall_ids","mem_recall_layered","mem_recall_at_time","mem_recall_on_date","mem_recall_between",
+  "mem_search","mem_question_answer","mem_neighbors","mem_get","mem_who_am_i",
+  "mem_health","mem_brief_health","mem_brief_status","mem_brief_list","mem_brief_pull","mem_brief_done",
+  "mem_action_log","mem_action_finish","mem_actions_recent","mem_actions_search",
+  "mem_transcript_log","mem_transcript_recent",
+  "mem_idle_loop_set","mem_idle_loop_status","mem_set_mode","mem_get_mode",
+  "mem_connect_register","mem_connect_heartbeat","mem_connect_list","mem_agent_list","mem_agent_register",
+  "mem_skill_list","mem_skill_get","mem_skill_match","mem_skill_search","mem_skill_run","mem_skill_record",
+  "mem_consults_inbox","mem_consult_codex_pending","mem_consult_codex_status",
+  "mem_proposals_pending","mem_project_list","mem_task_available","mem_task_list",
+  "mem_watchdog_list","mem_escalations_pending","mem_problems_open","mem_problem_attempts",
+  "mem_meeting_turns","mem_brief_template_list","mem_skill_outcome_stats",
+]);
+
+function buildContextQuery(name, a) {
+  if (!a || typeof a !== 'object') return '';
+  const parts = [];
+  // Pull text from common fields where agents put their semantic content
+  for (const k of ['topic','target','agent_name','source_agent','text','content','summary','title','question','idea','name','goal_text','description','approach','decision_summary']) {
+    const v = a[k];
+    if (typeof v === 'string' && v.trim()) parts.push(v);
+  }
+  return parts.join(' ').slice(0, 500);
+}
+
+function injectContext(tdb, name, args, result) {
+  if (AUTO_INJECT_SKIP.has(name)) return;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return;
+  if (result.error) return;
+  if (result._context) return; // don't overwrite if handler already set
+  const queryText = buildContextQuery(name, args);
+  if (!queryText || queryText.length < 3) return;
+  const tokens = queryText
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(t => t.length > 2)
+    .slice(0, 8)
+    .map(t => '"' + t + '"')
+    .join(' OR ');
+  if (!tokens) return;
+  try {
+    const rows = tdb.prepare(
+      "SELECT scope, ref_id, agent_name, summary, snippet(mnemo_search_fts, 4, '<b>', '</b>', '...', 16) AS snippet, rank " +
+      "FROM mnemo_search_fts WHERE mnemo_search_fts MATCH ? ORDER BY rank LIMIT 3"
+    ).all(tokens);
+    if (rows.length) {
+      result._context = {
+        relevant_memories: rows.map(r => ({
+          scope: r.scope, ref_id: r.ref_id, agent: r.agent_name,
+          summary: r.summary, snippet: r.snippet
+        })),
+        hint: "Relevant prior context auto-injected. Read before acting if not already familiar.",
+      };
+    }
   } catch (e) { /* silent */ }
 }
 
