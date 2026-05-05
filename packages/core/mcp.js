@@ -1469,6 +1469,182 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: rows.length, channels: rows };
     },
   },
+  mem_brief_status: {
+    description: "Full status of a brief by id (status, timestamps, supersedes-chain, parent_id, reactions).",
+    inputSchema: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+    handler: ({ id }) => {
+      const row = db.prepare("SELECT id, agent_name, source_agent, channel, status, created_at, dispatched_at, done_at, outcome, parent_id, supersedes_id, superseded_by_id, length(content) AS content_len FROM agent_brief WHERE id=?").get(id);
+      if (!row) return { error: "not_found", id };
+      const reactions = db.prepare("SELECT id, agent_name, kind, payload, created_at FROM agent_brief_reaction WHERE brief_id=? ORDER BY created_at ASC").all(id);
+      row.reactions = reactions;
+      return row;
+    },
+  },
+  mem_brief_react: {
+    description: "Lightweight reaction on a brief (ack/blocker/question/progress/done) instead of full reply-brief.",
+    inputSchema: { type: "object", properties: { brief_id: { type: "integer" }, agent_name: { type: "string" }, kind: { type: "string" }, payload: {} }, required: ["brief_id","agent_name","kind"] },
+    handler: ({ brief_id, agent_name, kind, payload }) => {
+      const info = db.prepare("INSERT INTO agent_brief_reaction (brief_id, agent_name, kind, payload) VALUES (?,?,?,?)").run(brief_id, agent_name, kind, payload ? (typeof payload === "string" ? payload : JSON.stringify(payload)) : null);
+      return { id: info.lastInsertRowid, brief_id, agent_name, kind };
+    },
+  },
+  mem_agent_set_notify: {
+    description: "Configure per-agent push (telegram_chat or webhook URL) for brief insert/reaction events.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, webhook: { type: "string" }, telegram_chat: { type: "string" } }, required: ["agent_name"] },
+    handler: ({ agent_name, webhook, telegram_chat }) => {
+      const cur = db.prepare("SELECT agent_name FROM agent_registry WHERE agent_name=?").get(agent_name);
+      if (!cur) return { error: "agent_not_registered", agent_name };
+      db.prepare("UPDATE agent_registry SET notify_webhook=?, notify_telegram_chat=? WHERE agent_name=?").run(webhook || null, telegram_chat ? String(telegram_chat) : null, agent_name);
+      return { agent_name, webhook: webhook || null, telegram_chat: telegram_chat || null };
+    },
+  },
+  mem_agent_set_peer: {
+    description: "Set agent peer_endpoint URL for direct P2P delivery + idle_after_min for hibernate signaling.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, peer_endpoint: { type: "string" }, idle_after_min: { type: "integer" } }, required: ["agent_name"] },
+    handler: ({ agent_name, peer_endpoint, idle_after_min }) => {
+      const cur = db.prepare("SELECT agent_name FROM agent_registry WHERE agent_name=?").get(agent_name);
+      if (!cur) return { error: "agent_not_registered", agent_name };
+      db.prepare("UPDATE agent_registry SET peer_endpoint=?, idle_after_min=? WHERE agent_name=?").run(peer_endpoint || null, idle_after_min || null, agent_name);
+      return { agent_name, peer_endpoint: peer_endpoint || null, idle_after_min: idle_after_min || null };
+    },
+  },
+  mem_brief_health: {
+    description: "Brief-queue health snapshot.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const tot = db.prepare("SELECT COUNT(*) c FROM agent_brief").get().c;
+      const pending = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='pending'").get().c;
+      const dispatched = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='dispatched'").get().c;
+      const done = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='done' OR status='deploy-issue'").get().c;
+      const stale = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='stale'").get().c;
+      const superseded = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='superseded'").get().c;
+      const perAgent = db.prepare("SELECT agent_name, COUNT(*) pending FROM agent_brief WHERE status='pending' GROUP BY agent_name ORDER BY 2 DESC").all();
+      const lastHour = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE created_at > datetime('now','-1 hour')").get().c;
+      return { briefs_total: tot, pending, dispatched, done, stale, superseded, last_hour_drops: lastHour, queue_per_agent: perAgent, limits: { payload_max_kb: 4096, drops_per_hour_per_agent: 200, default_pull_limit: 50 } };
+    },
+  },
+  mem_search: {
+    description: "FTS5 cross-source search (default scope: ['brief']) with porter+unicode61 tokenizer + snippet highlighting.",
+    inputSchema: { type: "object", properties: { query: { type: "string" }, scope: { type: "array", items: { type: "string" } }, limit: { type: "integer" } }, required: ["query"] },
+    handler: ({ query, scope, limit }) => {
+      const scopes = Array.isArray(scope) && scope.length ? scope : ["brief"];
+      const lim = Math.min(limit || 20, 100);
+      const raw = String(query || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!raw) return { error: "query required" };
+      const q = raw.split(/\s+/).filter(Boolean).map(t => '"' + t + '"').join(" ");
+      const placeholders = scopes.map(() => "?").join(",");
+      try {
+        const rows = db.prepare("SELECT scope, ref_id, agent_name, summary, snippet(mnemo_search_fts, 4, '<b>', '</b>', '...', 24) AS snippet, rank FROM mnemo_search_fts WHERE scope IN (" + placeholders + ") AND mnemo_search_fts MATCH ? ORDER BY rank LIMIT ?").all(...scopes, q, lim);
+        return { count: rows.length, query: q, scopes, results: rows };
+      } catch (e) { return { error: e.message }; }
+    },
+  },
+  mem_brief_drop_batch: {
+    description: "Atomic multi-insert: array of briefs in single call.",
+    inputSchema: { type: "object", properties: { briefs: { type: "array" }, source_agent: { type: "string" } }, required: ["briefs"] },
+    handler: ({ briefs, source_agent }) => {
+      const items = Array.isArray(briefs) ? briefs : [];
+      if (!items.length) return { error: "briefs array required" };
+      const ins = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)");
+      const txn = db.transaction(rows => { const out = []; for (const r of rows) { const info = ins.run(r.agent_name, r.source_agent || source_agent || null, r.content, r.meta ? JSON.stringify(r.meta) : null, r.parent_id || null, r.supersedes || null); out.push({ id: info.lastInsertRowid, agent_name: r.agent_name }); } return out; });
+      const inserted = txn(items);
+      return { count: inserted.length, ids: inserted.map(x => x.id), inserted };
+    },
+  },
+  mem_brief_drop_multi: {
+    description: "Fan-out one content to N agents.",
+    inputSchema: { type: "object", properties: { agent_names: { type: "array", items: { type: "string" } }, content: { type: "string" }, source_agent: { type: "string" }, parent_id: { type: "integer" }, supersedes: { type: "integer" } }, required: ["agent_names","content"] },
+    handler: ({ agent_names, content, source_agent, parent_id, supersedes }) => {
+      const targets = Array.isArray(agent_names) ? agent_names : [];
+      if (!targets.length) return { error: "agent_names required" };
+      const ins = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)");
+      const ids = [];
+      const txn = db.transaction(names => { for (const n of names) { const info = ins.run(n, source_agent || null, content, null, parent_id || null, supersedes || null); ids.push({ id: info.lastInsertRowid, agent_name: n }); } });
+      txn(targets);
+      return { fanout: ids.length, brief_ids: ids.map(x => x.id), inserted: ids };
+    },
+  },
+  mem_brief_drop_from_template: {
+    description: "Drop using registered template + var substitution.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, template: { type: "string" }, vars: { type: "object" }, source_agent: { type: "string" } }, required: ["agent_name","template"] },
+    handler: ({ agent_name, template, vars, source_agent }) => {
+      const tpl = db.prepare("SELECT body_template FROM brief_template WHERE name=?").get(template);
+      if (!tpl) return { error: "template_not_found", template };
+      let body = tpl.body_template;
+      const v = vars || {};
+      for (const k of Object.keys(v)) { const re = new RegExp("\\{\\{\\s*" + k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\}\\}", "g"); body = body.replace(re, String(v[k] == null ? "" : v[k])); }
+      const info = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content) VALUES (?,?,?)").run(agent_name, source_agent || null, body);
+      return { id: info.lastInsertRowid, agent_name, template };
+    },
+  },
+  mem_brief_template_list: {
+    description: "List brief templates.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const rows = db.prepare("SELECT name, description, length(body_template) AS body_len FROM brief_template ORDER BY name").all();
+      return { count: rows.length, templates: rows };
+    },
+  },
+  mem_skill_list: {
+    description: "List registered skills.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const rows = db.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
+      return { count: rows.length, skills: rows };
+    },
+  },
+  mem_skill_match: {
+    description: "Regex-match input text against registered skill trigger_phrases.",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+    handler: ({ text }) => {
+      if (!text) return { matches: [] };
+      const skills = db.prepare("SELECT name, description, trigger_phrases FROM skill_registry WHERE status IN ('active','stub')").all();
+      const matches = [];
+      for (const sk of skills) {
+        let triggers = [];
+        try { triggers = JSON.parse(sk.trigger_phrases || "[]"); } catch {}
+        for (const tp of triggers) {
+          try { if (new RegExp(tp, "i").test(text)) { matches.push({ name: sk.name, description: sk.description, matched: tp }); break; } } catch {}
+        }
+      }
+      return { matches };
+    },
+  },
+  mem_query_layer: {
+    description: "Query memory by hierarchical layer (procedural/semantic/episodic).",
+    inputSchema: { type: "object", properties: { layer: { type: "string" }, limit: { type: "integer" } }, required: ["layer"] },
+    handler: ({ layer, limit }) => {
+      const lim = Math.min(limit || 50, 200);
+      const rows = db.prepare("SELECT id, kind, source, actor, topic, importance, occurred_at, substr(text,1,300) preview FROM memory WHERE layer=? ORDER BY importance DESC, occurred_at DESC LIMIT ?").all(layer, lim);
+      return { layer, count: rows.length, rows };
+    },
+  },
+  mem_recall_layered: {
+    description: "FTS recall with layer-bias weighting (default semantic 1.5x, procedural 1.2x, episodic 1.0x).",
+    inputSchema: { type: "object", properties: { query: { type: "string" }, bias: { type: "object" }, limit: { type: "integer" } }, required: ["query"] },
+    handler: ({ query, bias, limit }) => {
+      const q = String(query || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!q) return { error: "query required" };
+      const tokens = q.split(/\s+/).filter(Boolean).map(t => '"' + t + '"').join(" ");
+      const lim = Math.min(limit || 20, 100);
+      const b = bias || { semantic: 1.5, procedural: 1.2, episodic: 1.0 };
+      const rows = db.prepare("SELECT m.id, m.kind, m.layer, m.actor, m.topic, m.importance, m.occurred_at, substr(m.text,1,400) preview, bm25(memory_fts) raw_rank FROM memory_fts JOIN memory m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? ORDER BY raw_rank LIMIT ?").all(tokens, lim * 3);
+      for (const r of rows) { const w = b[r.layer || 'episodic'] || 1.0; r.weighted_rank = (r.raw_rank || 0) / w; }
+      rows.sort((a, b) => a.weighted_rank - b.weighted_rank);
+      return { query: q, count: rows.length, results: rows.slice(0, lim) };
+    },
+  },
+  mem_nudge_check: {
+    description: "Reflection nudge: returns reflect_recommended=true if agent has done N+ actions since last reflect entry.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, threshold: { type: "integer" } }, required: ["agent_name"] },
+    handler: ({ agent_name, threshold }) => {
+      const N = parseInt(threshold || 30, 10);
+      const lastReflect = db.prepare("SELECT MAX(started_at) ts FROM agent_action WHERE agent_name=? AND topic='reflect'").get(agent_name);
+      const since = lastReflect && lastReflect.ts ? lastReflect.ts : '1970-01-01';
+      const actCount = db.prepare("SELECT COUNT(*) c FROM agent_action WHERE agent_name=? AND started_at > ? AND status != 'rollup'").get(agent_name, since).c;
+      return { agent_name, since, actions_since: actCount, threshold: N, reflect_recommended: actCount >= N };
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------

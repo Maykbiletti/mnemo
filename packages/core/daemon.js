@@ -735,7 +735,7 @@ function handleTool(tdb, name, a) {
       tdb.prepare("UPDATE agent_registry SET notify_webhook=?, notify_telegram_chat=? WHERE agent_name=?").run(a.webhook || null, a.telegram_chat ? String(a.telegram_chat) : null, a.agent_name);
       return { agent_name: a.agent_name, webhook: a.webhook || null, telegram_chat: a.telegram_chat || null };
     }
-    case "mem_health": {
+    case "mem_brief_health": {
       const tot = tdb.prepare("SELECT COUNT(*) c FROM agent_brief").get().c;
       const pending = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='pending'").get().c;
       const dispatched = tdb.prepare("SELECT COUNT(*) c FROM agent_brief WHERE status='dispatched'").get().c;
