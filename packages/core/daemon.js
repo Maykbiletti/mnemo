@@ -96,6 +96,13 @@ try {
   if (!rcols.includes("notify_telegram_chat")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_telegram_chat TEXT");
   if (!rcols.includes("peer_endpoint")) db.exec("ALTER TABLE agent_registry ADD COLUMN peer_endpoint TEXT");
   if (!rcols.includes("idle_after_min")) db.exec("ALTER TABLE agent_registry ADD COLUMN idle_after_min INTEGER");
+  // Phase 1: agent_proposal
+  db.exec("CREATE TABLE IF NOT EXISTS agent_proposal (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT NOT NULL, idea TEXT NOT NULL, project TEXT, project_fit TEXT, user_fit TEXT, cost TEXT, score INTEGER, ship_eligible INTEGER DEFAULT 0, status TEXT DEFAULT 'queued', reason TEXT, brief_id INTEGER, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), shipped_at TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_proposal_agent_status ON agent_proposal(agent_name, status)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_proposal_score ON agent_proposal(score DESC)");
+  // Phase 2: project_state_snapshot
+  db.exec("CREATE TABLE IF NOT EXISTS project_state_snapshot (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_snapshot_project_kind ON project_state_snapshot(project, kind, created_at DESC)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -346,6 +353,15 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------- Push hook: fires telegram/webhook on brief insert/reaction ----------
+function scoreProposal(project_fit, user_fit, cost) {
+  const fit = { H: 3, M: 2, L: 1 };
+  const costInverted = { L: 3, M: 2, H: 1 };
+  const pf = fit[project_fit] || 1;
+  const uf = fit[user_fit] || 1;
+  const cs = costInverted[cost] || 1;
+  return pf + uf + cs; // 3..9
+}
+
 function deriveLayer(kind) {
   if (!kind) return 'episodic';
   if (['tool_call','ssh_cmd','web_fetch','skill','skill_run'].includes(kind)) return 'procedural';
@@ -572,6 +588,55 @@ function handleTool(tdb, name, a) {
       }
       rows.sort((a, b) => a.weighted_rank - b.weighted_rank);
       return { query: q, count: rows.length, results: rows.slice(0, limit) };
+    }
+    case "mem_propose": {
+      const fit = ['H','M','L'];
+      if (!a.idea || !a.agent_name) return { error: "idea + agent_name required" };
+      const pf = fit.includes(a.project_fit) ? a.project_fit : 'M';
+      const uf = fit.includes(a.user_fit) ? a.user_fit : 'M';
+      const cs = fit.includes(a.cost) ? a.cost : 'M';
+      const score = scoreProposal(pf, uf, cs);
+      const ship_eligible = (score >= 7 && cs === 'L') ? 1 : 0;
+      let status = 'queued';
+      let reason = null;
+      if (score < 5) { status = 'discarded'; reason = 'score_below_threshold'; }
+      else if (ship_eligible) { status = 'ship_eligible'; }
+      const info = tdb.prepare("INSERT INTO agent_proposal (agent_name, idea, project, project_fit, user_fit, cost, score, ship_eligible, status, reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(a.agent_name, a.idea, a.project || null, pf, uf, cs, score, ship_eligible, status, reason);
+      return { id: info.lastInsertRowid, agent_name: a.agent_name, score, ship_eligible: !!ship_eligible, status, reason };
+    }
+    case "mem_proposals_pending": {
+      const where = ["status IN ('queued','ship_eligible')"];
+      const params = [];
+      if (a.agent_name) { where.push("agent_name=?"); params.push(a.agent_name); }
+      if (a.project) { where.push("project=?"); params.push(a.project); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = tdb.prepare("SELECT id, agent_name, idea, project, project_fit, user_fit, cost, score, ship_eligible, status, created_at FROM agent_proposal WHERE " + where.join(" AND ") + " ORDER BY score DESC, created_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, proposals: rows };
+    }
+    case "mem_proposal_update": {
+      if (!a.id || !a.status) return { error: "id + status required" };
+      tdb.prepare("UPDATE agent_proposal SET status=?, brief_id=COALESCE(?, brief_id), shipped_at=CASE WHEN ?='shipped' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE shipped_at END, reason=COALESCE(?, reason) WHERE id=?").run(a.status, a.brief_id || null, a.status, a.reason || null, a.id);
+      return { id: a.id, status: a.status };
+    }
+    case "mem_project_state_set": {
+      if (!a.project || !a.kind || !a.content) return { error: "project + kind + content required" };
+      const ttl = a.ttl_hours || 6;
+      const expires = new Date(Date.now() + ttl * 3600 * 1000).toISOString();
+      const info = tdb.prepare("INSERT INTO project_state_snapshot (project, kind, content, expires_at) VALUES (?,?,?,?)").run(a.project, a.kind, typeof a.content === 'string' ? a.content : JSON.stringify(a.content), expires);
+      return { id: info.lastInsertRowid, project: a.project, kind: a.kind, expires_at: expires };
+    }
+    case "mem_project_state_get": {
+      if (!a.project) return { error: "project required" };
+      const where = ["project=?"];
+      const params = [a.project];
+      if (a.kind) { where.push("kind=?"); params.push(a.kind); }
+      where.push("(expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))");
+      const rows = tdb.prepare("SELECT id, project, kind, content, created_at, expires_at FROM project_state_snapshot WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT 1").all(...params);
+      if (!rows.length) return { project: a.project, kind: a.kind || null, stale: true, snapshot: null };
+      const r = rows[0];
+      const ageMs = Date.now() - new Date(r.created_at).getTime();
+      const stale = ageMs > 6 * 3600 * 1000;
+      return { project: r.project, kind: r.kind, snapshot: r, age_minutes: Math.round(ageMs / 60000), stale };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
