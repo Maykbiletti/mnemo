@@ -1833,6 +1833,77 @@ async function idleLoopCycle() {
 }
 setInterval(() => { idleLoopCycle().catch(() => {}); }, 60 * 1000);
 
+// ============================================================
+// Hub→Local brief sync — the autonomous core.
+// Every HUB_SYNC_INTERVAL_SEC the daemon pulls briefs from the cross-host
+// hub at HUB_URL for each LOCAL_AGENT and mirrors them into the local
+// agent_brief table. This lets agents on this PC see cross-machine briefs
+// even when no Claude session is open.
+//
+// Disable: MNEMO_HUB_URL="" or MNEMO_HUB_SYNC=off.
+// ============================================================
+const HUB_URL = process.env.MNEMO_HUB_URL ?? "https://listing.blun.ai/mnemo";
+const HUB_SYNC_ENABLED = (process.env.MNEMO_HUB_SYNC || "on").toLowerCase() !== "off";
+const HUB_SYNC_INTERVAL_SEC = parseInt(process.env.MNEMO_HUB_SYNC_INTERVAL_SEC || "300", 10);
+const LOCAL_AGENTS_DAEMON = String(process.env.MNEMO_LOCAL_AGENTS || "angel")
+  .toLowerCase().split(",").map(s => s.trim()).filter(Boolean);
+
+async function hubPullForAgent(agentName) {
+  if (!HUB_URL) return { count: 0 };
+  try {
+    const res = await fetch(`${HUB_URL}/tool/mem_brief_pull`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_name: agentName, limit: 25, peek: false }),
+    });
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`);
+    const j = await res.json();
+    const briefs = (j && j.result && j.result.briefs) || [];
+    let inserted = 0;
+    const ins = db.prepare(
+      "INSERT INTO agent_brief (agent_name, source_agent, content, status, dispatched_at, meta_json) VALUES (?, ?, ?, 'pending', NULL, ?)"
+    );
+    const dedup = db.prepare(
+      "SELECT 1 FROM agent_brief WHERE agent_name=? AND content=? AND created_at > datetime('now','-7 days') LIMIT 1"
+    );
+    for (const b of briefs) {
+      const exists = dedup.get(agentName, b.content);
+      if (exists) continue;
+      const meta = b.meta_json ? (typeof b.meta_json === "string" ? JSON.parse(b.meta_json) : b.meta_json) : {};
+      meta._mirrored_from_hub = true;
+      meta._hub_id = b.id;
+      meta._hub_pulled_at = new Date().toISOString();
+      ins.run(agentName, b.source_agent || null, b.content, JSON.stringify(meta));
+      inserted++;
+    }
+    return { count: briefs.length, inserted };
+  } catch (e) {
+    return { count: 0, error: String(e.message || e) };
+  }
+}
+
+async function hubSyncCycle() {
+  if (!HUB_SYNC_ENABLED || !HUB_URL) return;
+  for (const agent of LOCAL_AGENTS_DAEMON) {
+    try {
+      const r = await hubPullForAgent(agent);
+      if (r.inserted) {
+        console.log(`[hub-sync] ${agent}: pulled ${r.count} from hub, ${r.inserted} new local rows`);
+        try {
+          recordWrite("hub_sync", r.inserted, "alive");
+        } catch {}
+      } else if (r.error) {
+        console.error(`[hub-sync] ${agent}: ${r.error}`);
+      }
+    } catch (e) {
+      console.error(`[hub-sync] ${agent}: ${e.message}`);
+    }
+  }
+}
+setInterval(() => { hubSyncCycle().catch(() => {}); }, HUB_SYNC_INTERVAL_SEC * 1000);
+// Run once shortly after boot so sync starts without waiting a full interval.
+setTimeout(() => { hubSyncCycle().catch(() => {}); }, 8000);
+
 async function dailyDigestCycle() {
   try {
     // Run once between 06:00-06:05 user-tz (UTC+2 default = 04:00-04:05 UTC). Check minute 0-5.
