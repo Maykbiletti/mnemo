@@ -116,6 +116,12 @@ try {
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_status ON shared_task(status, priority)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_project ON shared_task(project_id, status)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_claim ON shared_task(claim_agent, status)");
+  // Phase 6 Sprint 2: watchdog + escalation
+  db.exec("CREATE TABLE IF NOT EXISTS watchdog (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, check_kind TEXT NOT NULL DEFAULT 'http', owner_agent TEXT, threshold_json TEXT, enabled INTEGER DEFAULT 1, last_check_at TEXT, last_status TEXT, consecutive_failures INTEGER DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_watchdog_enabled ON watchdog(enabled)");
+  db.exec("CREATE TABLE IF NOT EXISTS watchdog_incident (id INTEGER PRIMARY KEY AUTOINCREMENT, watchdog_id INTEGER NOT NULL, opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), closed_at TEXT, status TEXT DEFAULT 'open', notes TEXT)");
+  db.exec("CREATE TABLE IF NOT EXISTS escalation (id INTEGER PRIMARY KEY AUTOINCREMENT, source_agent TEXT, kind TEXT, urgency TEXT DEFAULT 'M', summary TEXT, requested_authority TEXT, status TEXT DEFAULT 'open', resolution TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), resolved_at TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_escalation_status ON escalation(status, urgency)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -794,6 +800,76 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare(sql).all(...params);
       return { count: rows.length, tasks: rows };
     }
+    case "mem_watchdog_register": {
+      if (!a.target) return { error: "target required" };
+      const info = tdb.prepare("INSERT INTO watchdog (target, check_kind, owner_agent, threshold_json, enabled) VALUES (?,?,?,?,?)").run(a.target, a.check_kind || 'http', a.owner_agent || null, a.threshold ? JSON.stringify(a.threshold) : null, a.enabled === false ? 0 : 1);
+      return { id: info.lastInsertRowid, target: a.target };
+    }
+    case "mem_watchdog_list": {
+      const rows = tdb.prepare("SELECT id, target, check_kind, owner_agent, enabled, last_check_at, last_status, consecutive_failures FROM watchdog ORDER BY enabled DESC, target").all();
+      return { count: rows.length, watchdogs: rows };
+    }
+    case "mem_watchdog_disable": {
+      if (!a.id) return { error: "id required" };
+      tdb.prepare("UPDATE watchdog SET enabled=0 WHERE id=?").run(a.id);
+      return { ok: true };
+    }
+    case "mem_watchdog_enable": {
+      if (!a.id) return { error: "id required" };
+      tdb.prepare("UPDATE watchdog SET enabled=1 WHERE id=?").run(a.id);
+      return { ok: true };
+    }
+    case "mem_watchdog_incidents": {
+      const where = []; const params = [];
+      if (a.status) { where.push("status=?"); params.push(a.status); }
+      if (a.watchdog_id) { where.push("watchdog_id=?"); params.push(a.watchdog_id); }
+      params.push(Math.min(a.limit || 50, 200));
+      const sql = "SELECT i.id, i.watchdog_id, w.target, i.opened_at, i.closed_at, i.status, i.notes FROM watchdog_incident i LEFT JOIN watchdog w ON w.id=i.watchdog_id" + (where.length ? " WHERE " + where.map(x => "i." + x).join(" AND ") : "") + " ORDER BY i.opened_at DESC LIMIT ?";
+      const rows = tdb.prepare(sql).all(...params);
+      return { count: rows.length, incidents: rows };
+    }
+    case "mem_escalate": {
+      if (!a.kind || !a.summary) return { error: "kind + summary required" };
+      const info = tdb.prepare("INSERT INTO escalation (source_agent, kind, urgency, summary, requested_authority) VALUES (?,?,?,?,?)").run(a.source_agent || null, a.kind, a.urgency || 'M', a.summary, a.requested_authority || 'dieter');
+      const id = info.lastInsertRowid;
+      // Routing logic
+      const route = (() => {
+        if (a.kind === 'blocker' && a.urgency === 'H' && a.requested_authority === 'mayk') return 'telegram_immediate';
+        if (a.kind === 'customer' && a.urgency === 'H') return 'telegram_immediate';
+        if (a.kind === 'decision' && a.requested_authority === 'dieter') return 'brief_to_dieter';
+        if (a.urgency === 'L') return 'digest_only';
+        return 'brief_to_dieter';
+      })();
+      // Action based on routing
+      try {
+        if (route === 'brief_to_dieter') {
+          tdb.prepare("INSERT INTO agent_brief (agent_name, source_agent, content) VALUES (?,?,?)").run('Dieter', a.source_agent || null, "[ESCALATION #" + id + "] " + a.kind + "/" + a.urgency + ": " + a.summary);
+        } else if (route === 'telegram_immediate') {
+          const tokenFile = "/root/.dieter/telegram_bot_token";
+          let token = "";
+          if (fs.existsSync(tokenFile)) token = fs.readFileSync(tokenFile,"utf8").trim();
+          if (token) {
+            const data = JSON.stringify({ chat_id: "1605241602", text: "[ESCALATION " + a.urgency + "] " + a.kind + " from " + (a.source_agent || "?") + ": " + a.summary });
+            const req = require("https").request({ method: "POST", hostname: "api.telegram.org", path: "/bot" + token + "/sendMessage", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } }, r => r.resume());
+            req.on("error", () => {}); req.write(data); req.end();
+          }
+        }
+      } catch (e) {}
+      return { id, route, kind: a.kind, urgency: a.urgency };
+    }
+    case "mem_escalate_resolve": {
+      if (!a.id) return { error: "id required" };
+      tdb.prepare("UPDATE escalation SET status='resolved', resolution=?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.resolution || null, a.id);
+      return { ok: true, id: a.id };
+    }
+    case "mem_escalations_pending": {
+      const where = ["status='open'"]; const params = [];
+      if (a.kind) { where.push("kind=?"); params.push(a.kind); }
+      if (a.urgency) { where.push("urgency=?"); params.push(a.urgency); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = tdb.prepare("SELECT id, source_agent, kind, urgency, summary, requested_authority, created_at FROM escalation WHERE " + where.join(" AND ") + " ORDER BY CASE urgency WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, escalations: rows };
+    }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
       return { count: rows.length, skills: rows };
@@ -1415,6 +1491,44 @@ function runMaintenanceCycle() {
 }
 setTimeout(runMaintenanceCycle, 30 * 1000);
 setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+
+// Phase 6 Sprint 2: watchdog runner — 5 min cycle, http checks
+async function watchdogCycle() {
+  try {
+    const wds = db.prepare("SELECT id, target, check_kind, owner_agent, threshold_json, consecutive_failures FROM watchdog WHERE enabled=1").all();
+    for (const w of wds) {
+      try {
+        if (w.check_kind !== 'http') continue;
+        const url = new URL(w.target);
+        const lib = url.protocol === "https:" ? require("https") : require("http");
+        const ok = await new Promise(resolve => {
+          const req = lib.request({ method: "GET", hostname: url.hostname, port: url.port, path: url.pathname + url.search, timeout: 5000 }, rs => { rs.resume(); resolve(rs.statusCode >= 200 && rs.statusCode < 400); });
+          req.on("error", () => resolve(false));
+          req.on("timeout", () => { req.destroy(); resolve(false); });
+          req.end();
+        });
+        if (ok) {
+          db.prepare("UPDATE watchdog SET last_check_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_status='ok', consecutive_failures=0 WHERE id=?").run(w.id);
+          // Auto-close any open incident
+          const open = db.prepare("SELECT id FROM watchdog_incident WHERE watchdog_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1").get(w.id);
+          if (open) db.prepare("UPDATE watchdog_incident SET status='resolved', closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(open.id);
+        } else {
+          const fails = (w.consecutive_failures || 0) + 1;
+          db.prepare("UPDATE watchdog SET last_check_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_status='fail', consecutive_failures=? WHERE id=?").run(fails, w.id);
+          // Open incident on first fail
+          if (fails === 1) {
+            db.prepare("INSERT INTO watchdog_incident (watchdog_id, notes) VALUES (?,?)").run(w.id, "auto-detected by watchdog cycle");
+            // Drop brief to owner
+            if (w.owner_agent) {
+              db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content) VALUES (?,?,?)").run(w.owner_agent, "mnemo-watchdog", "[WATCHDOG] " + w.target + " is failing. Investigate.");
+            }
+          }
+        }
+      } catch (e) { console.error("[watchdog]", w.target, e.message); }
+    }
+  } catch (e) { console.error("[watchdog]", e.message); }
+}
+setInterval(() => { watchdogCycle().catch(() => {}); }, 5 * 60 * 1000);
 
 // Phase 3+4 BLUN-OS: idle_loop driver + daily digest cron
 async function idleLoopCycle() {
