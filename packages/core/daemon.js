@@ -124,6 +124,15 @@ try {
   db.exec("CREATE TABLE IF NOT EXISTS skill_registry (name TEXT PRIMARY KEY, description TEXT, trigger_phrases TEXT, sandbox TEXT DEFAULT 'none', requires_confirmation INTEGER DEFAULT 0, sensitive_data TEXT, body TEXT, source_path TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE TABLE IF NOT EXISTS skill_invocation (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL, agent_name TEXT, input TEXT, output TEXT, exit_code INTEGER, duration_ms INTEGER, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), finished_at TEXT, status TEXT)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_invoc_skill ON skill_invocation(skill_name, started_at DESC)");
+  // #17 hierarchical layers on memory
+  const mcols = db.prepare("PRAGMA table_info(memory)").all().map(c => c.name);
+  if (!mcols.includes("layer")) {
+    db.exec("ALTER TABLE memory ADD COLUMN layer TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_memory_layer ON memory(layer)");
+    // backfill: derive layer from kind
+    db.exec("UPDATE memory SET layer = CASE WHEN kind IN ('tool_call','ssh_cmd','web_fetch','skill','skill_run') THEN 'procedural' WHEN kind IN ('memory_md','decision','scar','manual','dream') THEN 'semantic' WHEN kind IN ('message','edit') THEN 'episodic' ELSE 'episodic' END WHERE layer IS NULL");
+    console.log("[migrate] memory.layer added + backfilled");
+  }
 } catch (e) { console.error("[migrate]", e.message); }
 
 // Auto-load skills from /root/mnemo/packages/core/skills/*/SKILL.md on startup
@@ -335,6 +344,13 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------- Push hook: fires telegram/webhook on brief insert/reaction ----------
+function deriveLayer(kind) {
+  if (!kind) return 'episodic';
+  if (['tool_call','ssh_cmd','web_fetch','skill','skill_run'].includes(kind)) return 'procedural';
+  if (['memory_md','decision','scar','manual','dream'].includes(kind)) return 'semantic';
+  return 'episodic';
+}
+
 function fireBriefHook(tdb, briefId, eventType, ctx) {
 
   try {
@@ -516,6 +532,28 @@ function handleTool(tdb, name, a) {
       tdb.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
         .run(a.status, new Date().toISOString(), a.outcome || null, a.id);
       return { id: a.id, status: a.status };
+    }
+    case "mem_query_layer": {
+      const layer = a.layer;
+      if (!['procedural','semantic','episodic'].includes(layer)) return { error: "layer must be procedural|semantic|episodic" };
+      const limit = Math.min(a.limit || 50, 200);
+      const rows = tdb.prepare("SELECT id, kind, source, actor, topic, importance, occurred_at, substr(text,1,300) preview FROM memory WHERE layer=? ORDER BY importance DESC, occurred_at DESC LIMIT ?").all(layer, limit);
+      return { layer, count: rows.length, rows };
+    }
+    case "mem_recall_layered": {
+      // FTS search across memory, weight by layer per a.bias (default: semantic 1.5x, procedural 1.2x, episodic 1.0x)
+      const q = String(a.query || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!q) return { error: "query required" };
+      const tokens = q.split(/\s+/).filter(Boolean).map(t => '"' + t + '"').join(" ");
+      const limit = Math.min(a.limit || 20, 100);
+      const bias = a.bias || { semantic: 1.5, procedural: 1.2, episodic: 1.0 };
+      const rows = tdb.prepare("SELECT m.id, m.kind, m.layer, m.actor, m.topic, m.importance, m.occurred_at, substr(m.text,1,400) preview, bm25(memory_fts) raw_rank FROM memory_fts JOIN memory m ON m.id=memory_fts.rowid WHERE memory_fts MATCH ? ORDER BY raw_rank LIMIT ?").all(tokens, limit * 3);
+      for (const r of rows) {
+        const w = bias[r.layer || 'episodic'] || 1.0;
+        r.weighted_rank = (r.raw_rank || 0) / w;
+      }
+      rows.sort((a, b) => a.weighted_rank - b.weighted_rank);
+      return { query: q, count: rows.length, results: rows.slice(0, limit) };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
@@ -1132,6 +1170,24 @@ function runMaintenanceCycle() {
 }
 setTimeout(runMaintenanceCycle, 30 * 1000);
 setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+
+// #16 auto-reflect: every 10 min, check each registered agent, trigger reflect if nudge says so
+async function autoReflectCycle() {
+  try {
+    const agents = db.prepare("SELECT agent_name FROM agent_registry WHERE status='online'").all();
+    for (const ag of agents) {
+      try {
+        const res = handleTool(db, "mem_nudge_check", { agent_name: ag.agent_name, threshold: 50 });
+        if (res && res.reflect_recommended) {
+          const out = handleTool(db, "mem_reflect_now", { agent_name: ag.agent_name });
+          db.prepare("INSERT INTO agent_action (agent_name, action_kind, topic, status, started_at, payload_json) VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?)").run(ag.agent_name, "reflect", "reflect", "ok", JSON.stringify({ auto: true, summary_len: (out && out.summary || "").length }));
+          console.log("[auto-reflect] " + ag.agent_name + " (actions_since=" + res.actions_since + ")");
+        }
+      } catch (e) { /* per-agent best effort */ }
+    }
+  } catch (e) { console.error("[auto-reflect]", e.message); }
+}
+setInterval(() => { autoReflectCycle().catch(() => {}); }, 10 * 60 * 1000);
 
 process.on("SIGTERM", () => { db.close(); process.exit(0); });
 process.on("SIGINT", () => { db.close(); process.exit(0); });
