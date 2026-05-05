@@ -23,6 +23,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const Database = require("better-sqlite3");
 
 const DB_PATH = process.env.MNEMO_DB || path.join(__dirname, "mnemo.db");
@@ -246,6 +247,18 @@ function sanitizeFtsQuery(q) {
   }).join(' ');
 }
 
+function sendJson(req, res, code, obj) {
+  const body = Buffer.from(JSON.stringify(obj));
+  const ae = String((req && req.headers && req.headers["accept-encoding"]) || "");
+  if (body.length > 4096 && /gzip/.test(ae)) {
+    const gz = zlib.gzipSync(body);
+    res.writeHead(code, { "Content-Type": "application/json", "Content-Encoding": "gzip", "Content-Length": gz.length });
+    return res.end(gz);
+  }
+  res.writeHead(code, { "Content-Type": "application/json", "Content-Length": body.length });
+  return res.end(body);
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const tdb = dbForRequest(req);
@@ -311,11 +324,9 @@ const server = http.createServer((req, res) => {
       }
       try {
         const result = handleTool(tdb, tool, args);
-        res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ tool, result }));
+        return sendJson(req, res, 200, { tool, result });
       } catch (e) {
-        res.writeHead(500, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ error: String(e.message), tool }));
+        return sendJson(req, res, 500, { error: String(e.message), tool });
       }
     });
     return;
@@ -559,6 +570,13 @@ function handleTool(tdb, name, a) {
       const sql = "SELECT id, skill_name, agent_name, exit_code, duration_ms, started_at, finished_at, status, substr(input,1,200) AS input_preview, substr(output,1,200) AS output_preview FROM skill_invocation" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY started_at DESC LIMIT ?";
       const rows = tdb.prepare(sql).all(...params);
       return { count: rows.length, invocations: rows };
+    }
+    case "mem_nudge_check": {
+      const N = parseInt(a.threshold || 30, 10);
+      const lastReflect = tdb.prepare("SELECT MAX(started_at) ts FROM agent_action WHERE agent_name=? AND topic='reflect'").get(a.agent_name);
+      const since = lastReflect && lastReflect.ts ? lastReflect.ts : '1970-01-01';
+      const actCount = tdb.prepare("SELECT COUNT(*) c FROM agent_action WHERE agent_name=? AND started_at > ? AND status != 'rollup'").get(a.agent_name, since).c;
+      return { agent_name: a.agent_name, since, actions_since: actCount, threshold: N, reflect_recommended: actCount >= N };
     }
     case "mem_brief_drop_batch": {
       const items = Array.isArray(a.briefs) ? a.briefs : [];
