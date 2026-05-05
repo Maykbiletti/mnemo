@@ -134,6 +134,9 @@ try {
   db.exec("CREATE TABLE IF NOT EXISTS meeting (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, project_id INTEGER, problem_id INTEGER, status TEXT DEFAULT 'open', created_by TEXT, decision_summary TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), closed_at TEXT)");
   db.exec("CREATE TABLE IF NOT EXISTS meeting_turn (id INTEGER PRIMARY KEY AUTOINCREMENT, meeting_id INTEGER NOT NULL, agent_name TEXT NOT NULL, content TEXT, turn_kind TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_meeting_turn ON meeting_turn(meeting_id, created_at)");
+  // Phase 7 #4: codex_consult — programming-specialist queue
+  db.exec("CREATE TABLE IF NOT EXISTS codex_consult (id INTEGER PRIMARY KEY AUTOINCREMENT, requesting_agent TEXT NOT NULL, problem_id INTEGER, question TEXT NOT NULL, context_files TEXT, proposed_solution TEXT, used_in_attempt_id INTEGER, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), answered_at TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_codex_status ON codex_consult(status, created_at DESC)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -947,6 +950,34 @@ function handleTool(tdb, name, a) {
       if (!a.meeting_id) return { error: "meeting_id required" };
       const rows = tdb.prepare("SELECT id, agent_name, content, turn_kind, created_at FROM meeting_turn WHERE meeting_id=? ORDER BY created_at ASC").all(a.meeting_id);
       return { count: rows.length, turns: rows };
+    }
+    case "mem_consult_codex": {
+      if (!a.requesting_agent || !a.question) return { error: "requesting_agent + question required" };
+      const info = tdb.prepare("INSERT INTO codex_consult (requesting_agent, problem_id, question, context_files) VALUES (?,?,?,?)").run(a.requesting_agent, a.problem_id || null, a.question, a.context_files ? JSON.stringify(a.context_files) : null);
+      return { id: info.lastInsertRowid, requesting_agent: a.requesting_agent, status: "pending" };
+    }
+    case "mem_consult_codex_pending": {
+      const lim = Math.min(a.limit || 20, 100);
+      const rows = tdb.prepare("SELECT id, requesting_agent, problem_id, question, context_files, status, created_at FROM codex_consult WHERE status='pending' ORDER BY created_at ASC LIMIT ?").all(lim);
+      for (const r of rows) { if (r.context_files) { try { r.context_files = JSON.parse(r.context_files); } catch (e) {} } }
+      return { count: rows.length, consults: rows };
+    }
+    case "mem_consult_codex_answer": {
+      if (!a.id || !a.proposed_solution) return { error: "id + proposed_solution required" };
+      tdb.prepare("UPDATE codex_consult SET proposed_solution=?, status='answered', answered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.proposed_solution, a.id);
+      return { ok: true, id: a.id, status: "answered" };
+    }
+    case "mem_consult_codex_status": {
+      if (!a.id) return { error: "id required" };
+      const row = tdb.prepare("SELECT id, requesting_agent, problem_id, question, context_files, proposed_solution, used_in_attempt_id, status, created_at, answered_at FROM codex_consult WHERE id=?").get(a.id);
+      if (!row) return { error: "not_found", id: a.id };
+      if (row.context_files) { try { row.context_files = JSON.parse(row.context_files); } catch (e) {} }
+      return row;
+    }
+    case "mem_consult_codex_use": {
+      if (!a.id) return { error: "id required" };
+      tdb.prepare("UPDATE codex_consult SET used_in_attempt_id=?, status='used' WHERE id=?").run(a.attempt_id || null, a.id);
+      return { ok: true, id: a.id, status: "used" };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();

@@ -1980,6 +1980,31 @@ ${args.first_invocation_outcome || "(none)"}
     inputSchema: { type: "object", properties: { meeting_id: { type: "integer" } }, required: ["meeting_id"] },
     handler: ({ meeting_id }) => { const rows = db.prepare("SELECT id, agent_name, content, turn_kind, created_at FROM meeting_turn WHERE meeting_id=? ORDER BY created_at ASC").all(meeting_id); return { count: rows.length, turns: rows }; },
   },
+  mem_consult_codex: {
+    description: "Queue a programming-specialist consult for Codex CLI to answer. Use when stuck on code-problems after 2+ failed attempts. context_files = optional array of {path, snippet?} hints.",
+    inputSchema: { type: "object", properties: { requesting_agent: { type: "string" }, problem_id: { type: "integer" }, question: { type: "string" }, context_files: { type: "array" } }, required: ["requesting_agent","question"] },
+    handler: (a) => { const info = db.prepare("INSERT INTO codex_consult (requesting_agent, problem_id, question, context_files) VALUES (?,?,?,?)").run(a.requesting_agent, a.problem_id || null, a.question, a.context_files ? JSON.stringify(a.context_files) : null); return { id: info.lastInsertRowid, requesting_agent: a.requesting_agent, status: "pending" }; },
+  },
+  mem_consult_codex_pending: {
+    description: "List pending Codex consults (for the codex-operator/cron to pick up and answer).",
+    inputSchema: { type: "object", properties: { limit: { type: "integer" } } },
+    handler: ({ limit }) => { const lim = Math.min(limit || 20, 100); const rows = db.prepare("SELECT id, requesting_agent, problem_id, question, context_files, status, created_at FROM codex_consult WHERE status='pending' ORDER BY created_at ASC LIMIT ?").all(lim); for (const r of rows) { if (r.context_files) { try { r.context_files = JSON.parse(r.context_files); } catch (e) {} } } return { count: rows.length, consults: rows }; },
+  },
+  mem_consult_codex_answer: {
+    description: "Fill a pending consult with Codex's proposed_solution. Marks status=answered, sets answered_at.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, proposed_solution: { type: "string" } }, required: ["id","proposed_solution"] },
+    handler: ({ id, proposed_solution }) => { db.prepare("UPDATE codex_consult SET proposed_solution=?, status='answered', answered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(proposed_solution, id); return { ok: true, id, status: "answered" }; },
+  },
+  mem_consult_codex_status: {
+    description: "Get full status of a Codex consult (question, proposed_solution if answered, lifecycle timestamps).",
+    inputSchema: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+    handler: ({ id }) => { const row = db.prepare("SELECT id, requesting_agent, problem_id, question, context_files, proposed_solution, used_in_attempt_id, status, created_at, answered_at FROM codex_consult WHERE id=?").get(id); if (!row) return { error: "not_found", id }; if (row.context_files) { try { row.context_files = JSON.parse(row.context_files); } catch (e) {} } return row; },
+  },
+  mem_consult_codex_use: {
+    description: "Mark a Codex consult as used in a specific problem-attempt. Closes the loop for skill-outcome learning.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, attempt_id: { type: "integer" } }, required: ["id"] },
+    handler: ({ id, attempt_id }) => { db.prepare("UPDATE codex_consult SET used_in_attempt_id=?, status='used' WHERE id=?").run(attempt_id || null, id); return { ok: true, id, status: "used" }; },
+  },
 };
 
 // ---------------------------------------------------------------------------
