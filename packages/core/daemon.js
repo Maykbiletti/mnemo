@@ -1088,5 +1088,32 @@ function healthSweep() {
 setInterval(healthSweep, 5 * 60 * 1000);
 setInterval(maybeRunDailyReflection, 60 * 1000);
 
+// #9 TTL job + #10 action-log rollup
+const BRIEF_TTL_HOURS = parseInt(process.env.BRIEF_TTL_HOURS || "168", 10);
+const ROLLUP_AFTER_HOURS = parseInt(process.env.ROLLUP_AFTER_HOURS || "24", 10);
+function runMaintenanceCycle() {
+  try {
+    const ttlInfo = db.prepare("UPDATE agent_brief SET status='stale' WHERE status='pending' AND created_at < datetime('now', '-' || ? || ' hours')").run(BRIEF_TTL_HOURS);
+    if (ttlInfo.changes > 0) console.log("[ttl] flipped " + ttlInfo.changes + " briefs to stale");
+  } catch (e) { console.error("[ttl]", e.message); }
+  try {
+    const cutoff = new Date(Date.now() - ROLLUP_AFTER_HOURS * 3600 * 1000).toISOString();
+    const groups = db.prepare("SELECT agent_name, action_kind, topic, COUNT(*) c FROM agent_action WHERE started_at < ? AND topic IN ('brief-poll','heartbeat','poll') AND status != 'rollup' GROUP BY agent_name, action_kind, topic HAVING COUNT(*) > 10").all(cutoff);
+    for (const g of groups) {
+      const ids = db.prepare("SELECT id FROM agent_action WHERE agent_name=? AND action_kind=? AND topic=? AND started_at < ? AND status != 'rollup'").all(g.agent_name, g.action_kind, g.topic, cutoff);
+      const idList = ids.map(r => r.id);
+      const txn = db.transaction(() => {
+        db.prepare("INSERT INTO agent_action (agent_name, action_kind, topic, status, payload_json, started_at) VALUES (?,?,?,?,?, ?)").run(g.agent_name, g.action_kind, g.topic, "rollup", JSON.stringify({ rollup: true, hours: ROLLUP_AFTER_HOURS, count: g.c, original_ids: idList.slice(0,500) }), cutoff);
+        const placeholders = idList.map(() => "?").join(",");
+        if (idList.length) db.prepare("DELETE FROM agent_action WHERE id IN (" + placeholders + ")").run(...idList);
+      });
+      txn();
+      console.log("[rollup] " + g.agent_name + "/" + g.topic + ": " + g.c + " rows -> 1 rollup");
+    }
+  } catch (e) { console.error("[rollup]", e.message); }
+}
+setTimeout(runMaintenanceCycle, 30 * 1000);
+setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+
 process.on("SIGTERM", () => { db.close(); process.exit(0); });
 process.on("SIGINT", () => { db.close(); process.exit(0); });
