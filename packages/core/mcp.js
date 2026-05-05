@@ -31,6 +31,43 @@ const DB_PATH = process.env.MNEMO_DB || path.join(__dirname, "mnemo.db");
 const SERVER_NAME = "mnemo";
 const SERVER_VERSION = "0.2.0";
 
+// ============================================================
+// Cross-host hub routing
+// ============================================================
+// When a brief targets an agent that does NOT live on this PC, the operation
+// must be forwarded to the cross-host hub instead of the local SQLite.
+// LOCAL_AGENTS = comma-separated list of lowercase agent names that live here.
+// Anything else is treated as remote and routed via HTTP to MNEMO_HUB_URL.
+//
+// Default: assume only "angel" is local. Override with env MNEMO_LOCAL_AGENTS.
+// Disable hub routing entirely with MNEMO_HUB_URL="" (empty).
+const HUB_URL = process.env.MNEMO_HUB_URL ?? "https://listing.blun.ai/mnemo";
+// Default: this PC hosts Angel only. Dieter's PC should set MNEMO_LOCAL_AGENTS=dieter.
+const LOCAL_AGENTS = new Set(
+  String(process.env.MNEMO_LOCAL_AGENTS || "angel")
+    .toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+);
+function isRemoteAgent(name) {
+  if (!HUB_URL) return false;
+  if (!name) return false;
+  return !LOCAL_AGENTS.has(String(name).toLowerCase());
+}
+async function callHub(toolName, args) {
+  if (!HUB_URL) throw new Error("hub disabled (MNEMO_HUB_URL empty)");
+  const res = await fetch(`${HUB_URL}/tool/${toolName}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args || {}),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`hub ${toolName} ${res.status}: ${txt.slice(0, 200)}`);
+  }
+  const j = await res.json();
+  // Hub responses are wrapped: {tool, result}. Unwrap.
+  return j && typeof j === "object" && "result" in j ? j.result : j;
+}
+
 const db = new Database(DB_PATH, { readonly: false, fileMustExist: true });
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
@@ -1238,7 +1275,21 @@ ${args.first_invocation_outcome || "(none)"}
       },
       required: ["agent_name", "content"],
     },
-    handler: ({ agent_name, content, source_agent, meta }) => {
+    handler: async ({ agent_name, content, source_agent, meta }) => {
+      // Route to cross-host hub if target lives on another PC.
+      if (isRemoteAgent(agent_name)) {
+        try {
+          return await callHub("mem_brief_drop", { agent_name, content, source_agent, meta });
+        } catch (e) {
+          // Fall through to local insert as a soft fallback so we never lose data.
+          // Tag the meta so the operator knows it didn't reach the hub.
+          const fallback = { ...(meta || {}), _hub_error: String(e.message || e) };
+          const info = db.prepare(
+            "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?, ?, ?, ?)"
+          ).run(agent_name, source_agent || null, content, JSON.stringify(fallback));
+          return { id: info.lastInsertRowid, agent_name, status: "pending", _routed: "local-fallback", _hub_error: String(e.message || e) };
+        }
+      }
       const info = db.prepare(
         "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?, ?, ?, ?)"
       ).run(agent_name, source_agent || null, content, meta ? JSON.stringify(meta) : null);
@@ -1257,16 +1308,33 @@ ${args.first_invocation_outcome || "(none)"}
       },
       required: ["agent_name"],
     },
-    handler: ({ agent_name, limit = 5, peek = false }) => {
-      const rows = db.prepare(
+    handler: async ({ agent_name, limit = 5, peek = false }) => {
+      // For local agents on this PC, merge hub + local results so cross-machine
+      // briefs (other agents dropping on hub) become visible alongside the local queue.
+      const localRows = db.prepare(
         "SELECT id, source_agent, content, created_at, meta_json FROM agent_brief WHERE agent_name=? AND status='pending' ORDER BY created_at ASC LIMIT ?"
       ).all(agent_name, limit);
-      if (!peek && rows.length) {
+      let hubRows = [];
+      if (!isRemoteAgent(agent_name) && HUB_URL) {
+        try {
+          const hubRes = await callHub("mem_brief_pull", { agent_name, limit, peek });
+          hubRows = (hubRes && hubRes.briefs) || [];
+          // Tag hub-sourced rows so caller knows where to mark done.
+          hubRows = hubRows.map((r) => ({ ...r, _src: "hub" }));
+        } catch (e) {
+          // Hub unreachable — fall back to local-only with a tag.
+          hubRows = [];
+        }
+      }
+      if (!peek && localRows.length) {
         const now = new Date().toISOString();
         const upd = db.prepare("UPDATE agent_brief SET status='dispatched', dispatched_at=? WHERE id=?");
-        for (const r of rows) upd.run(now, r.id);
+        for (const r of localRows) upd.run(now, r.id);
       }
-      return { count: rows.length, briefs: rows };
+      const all = [...hubRows, ...localRows.map((r) => ({ ...r, _src: "local" }))]
+        .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+        .slice(0, limit);
+      return { count: all.length, briefs: all };
     },
   },
 
@@ -1298,17 +1366,33 @@ ${args.first_invocation_outcome || "(none)"}
         limit: { type: "integer", default: 20, minimum: 1, maximum: 200 },
       },
     },
-    handler: ({ agent_name, status, limit = 20 }) => {
+    handler: async ({ agent_name, status, limit = 20 }) => {
       const where = ["1=1"]; const params = [];
       if (agent_name) { where.push("agent_name=?"); params.push(agent_name); }
       if (status) { where.push("status=?"); params.push(status); }
       params.push(Math.min(limit, 200));
-      const rows = db.prepare(
+      const localRows = db.prepare(
         `SELECT id, agent_name, source_agent, status, created_at, dispatched_at, done_at,
                 substr(content,1,160) AS preview, outcome
          FROM agent_brief WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`
       ).all(...params);
-      return { count: rows.length, briefs: rows };
+      // For remote-targeted listings, query hub instead/also.
+      let hubRows = [];
+      if (HUB_URL && agent_name && (isRemoteAgent(agent_name) || true)) {
+        // Always merge hub when caller asked about a specific agent_name —
+        // gives consistent visibility regardless of where briefs were dropped.
+        try {
+          const hubRes = await callHub("mem_brief_list", { agent_name, status, limit });
+          hubRows = (hubRes && hubRes.briefs) || [];
+          hubRows = hubRows.map((r) => ({ ...r, _src: "hub" }));
+        } catch (e) {
+          hubRows = [];
+        }
+      }
+      const all = [...hubRows, ...localRows.map((r) => ({ ...r, _src: "local" }))]
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+        .slice(0, limit);
+      return { count: all.length, briefs: all };
     },
   },
 
