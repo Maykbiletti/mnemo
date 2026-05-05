@@ -94,6 +94,8 @@ try {
   const rcols = db.prepare("PRAGMA table_info(agent_registry)").all().map(c => c.name);
   if (!rcols.includes("notify_webhook")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_webhook TEXT");
   if (!rcols.includes("notify_telegram_chat")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_telegram_chat TEXT");
+  if (!rcols.includes("peer_endpoint")) db.exec("ALTER TABLE agent_registry ADD COLUMN peer_endpoint TEXT");
+  if (!rcols.includes("idle_after_min")) db.exec("ALTER TABLE agent_registry ADD COLUMN idle_after_min INTEGER");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -349,6 +351,22 @@ function deriveLayer(kind) {
   if (['tool_call','ssh_cmd','web_fetch','skill','skill_run'].includes(kind)) return 'procedural';
   if (['memory_md','decision','scar','manual','dream'].includes(kind)) return 'semantic';
   return 'episodic';
+}
+
+function tryPeerDeliver(tdb, agentName, payload) {
+  try {
+    const ag = tdb.prepare("SELECT peer_endpoint FROM agent_registry WHERE agent_name=?").get(agentName);
+    if (!ag || !ag.peer_endpoint) return false;
+    const url = new URL(ag.peer_endpoint);
+    const lib = url.protocol === "https:" ? require("https") : require("http");
+    const body = Buffer.from(JSON.stringify(payload));
+    return new Promise(resolve => {
+      const req = lib.request({ method: "POST", hostname: url.hostname, port: url.port, path: url.pathname + url.search, headers: { "Content-Type": "application/json", "Content-Length": body.length }, timeout: 1500 }, rs => { rs.resume(); resolve(rs.statusCode >= 200 && rs.statusCode < 300); });
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.write(body); req.end();
+    });
+  } catch (e) { return false; }
 }
 
 function fireBriefHook(tdb, briefId, eventType, ctx) {
@@ -704,6 +722,12 @@ function handleTool(tdb, name, a) {
       const info = tdb.prepare("INSERT INTO agent_brief_reaction (brief_id, agent_name, kind, payload) VALUES (?,?,?,?)").run(a.brief_id, a.agent_name, a.kind, a.payload ? (typeof a.payload === "string" ? a.payload : JSON.stringify(a.payload)) : null);
       try { fireBriefHook(tdb, a.brief_id, "reaction", { agent_name: a.agent_name, kind: a.kind }); } catch (e) {}
       return { id: info.lastInsertRowid, brief_id: a.brief_id, agent_name: a.agent_name, kind: a.kind };
+    }
+    case "mem_agent_set_peer": {
+      const cur = tdb.prepare("SELECT agent_name FROM agent_registry WHERE agent_name=?").get(a.agent_name);
+      if (!cur) return { error: "agent_not_registered", agent_name: a.agent_name };
+      tdb.prepare("UPDATE agent_registry SET peer_endpoint=?, idle_after_min=? WHERE agent_name=?").run(a.peer_endpoint || null, a.idle_after_min || null, a.agent_name);
+      return { agent_name: a.agent_name, peer_endpoint: a.peer_endpoint || null, idle_after_min: a.idle_after_min || null };
     }
     case "mem_agent_set_notify": {
       const cur = tdb.prepare("SELECT agent_name FROM agent_registry WHERE agent_name=?").get(a.agent_name);
