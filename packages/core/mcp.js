@@ -1645,6 +1645,139 @@ ${args.first_invocation_outcome || "(none)"}
       return { agent_name, since, actions_since: actCount, threshold: N, reflect_recommended: actCount >= N };
     },
   },
+  mem_propose: {
+    description: "Proactive idea emission with 3-filter scoring (project_fit/user_fit/cost, each H/M/L). Score 3-9. score>=7 AND cost=L → ship_eligible (auto-ship gate).",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, idea: { type: "string" }, project: { type: "string" }, project_fit: { type: "string", enum: ["H","M","L"] }, user_fit: { type: "string", enum: ["H","M","L"] }, cost: { type: "string", enum: ["H","M","L"] } }, required: ["agent_name","idea"] },
+    handler: ({ agent_name, idea, project, project_fit, user_fit, cost }) => {
+      const fit = ['H','M','L'];
+      const pf = fit.includes(project_fit) ? project_fit : 'M';
+      const uf = fit.includes(user_fit) ? user_fit : 'M';
+      const cs = fit.includes(cost) ? cost : 'M';
+      const fitMap = { H: 3, M: 2, L: 1 };
+      const costInv = { L: 3, M: 2, H: 1 };
+      const score = (fitMap[pf] || 1) + (fitMap[uf] || 1) + (costInv[cs] || 1);
+      const ship_eligible = (score >= 7 && cs === 'L') ? 1 : 0;
+      let status = 'queued', reason = null;
+      if (score < 5) { status = 'discarded'; reason = 'score_below_threshold'; }
+      else if (ship_eligible) status = 'ship_eligible';
+      const info = db.prepare("INSERT INTO agent_proposal (agent_name, idea, project, project_fit, user_fit, cost, score, ship_eligible, status, reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(agent_name, idea, project || null, pf, uf, cs, score, ship_eligible, status, reason);
+      return { id: info.lastInsertRowid, agent_name, score, ship_eligible: !!ship_eligible, status, reason };
+    },
+  },
+  mem_proposals_pending: {
+    description: "List queued + ship_eligible proposals.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, project: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ agent_name, project, limit }) => {
+      const where = ["status IN ('queued','ship_eligible')"]; const params = [];
+      if (agent_name) { where.push("agent_name=?"); params.push(agent_name); }
+      if (project) { where.push("project=?"); params.push(project); }
+      params.push(Math.min(limit || 50, 200));
+      const rows = db.prepare("SELECT id, agent_name, idea, project, project_fit, user_fit, cost, score, ship_eligible, status, created_at FROM agent_proposal WHERE " + where.join(" AND ") + " ORDER BY score DESC, created_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, proposals: rows };
+    },
+  },
+  mem_proposal_update: {
+    description: "Update proposal status (queued|ship_eligible|shipped|discarded). Optionally link brief_id when shipped.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, status: { type: "string" }, brief_id: { type: "integer" }, reason: { type: "string" } }, required: ["id","status"] },
+    handler: ({ id, status, brief_id, reason }) => {
+      db.prepare("UPDATE agent_proposal SET status=?, brief_id=COALESCE(?, brief_id), shipped_at=CASE WHEN ?='shipped' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE shipped_at END, reason=COALESCE(?, reason) WHERE id=?").run(status, brief_id || null, status, reason || null, id);
+      return { id, status };
+    },
+  },
+  mem_project_state_set: {
+    description: "Snapshot a project context (kind: inflight|stalled|blocked|recent_decisions|known_gaps) with TTL hours (default 6).",
+    inputSchema: { type: "object", properties: { project: { type: "string" }, kind: { type: "string" }, content: {}, ttl_hours: { type: "integer" } }, required: ["project","kind","content"] },
+    handler: ({ project, kind, content, ttl_hours }) => {
+      const ttl = ttl_hours || 6;
+      const expires = new Date(Date.now() + ttl * 3600 * 1000).toISOString();
+      const info = db.prepare("INSERT INTO project_state_snapshot (project, kind, content, expires_at) VALUES (?,?,?,?)").run(project, kind, typeof content === 'string' ? content : JSON.stringify(content), expires);
+      return { id: info.lastInsertRowid, project, kind, expires_at: expires };
+    },
+  },
+  mem_project_state_get: {
+    description: "Latest non-expired project_state snapshot. Returns stale=true if older than 6h.",
+    inputSchema: { type: "object", properties: { project: { type: "string" }, kind: { type: "string" } }, required: ["project"] },
+    handler: ({ project, kind }) => {
+      const where = ["project=?"]; const params = [project];
+      if (kind) { where.push("kind=?"); params.push(kind); }
+      where.push("(expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))");
+      const rows = db.prepare("SELECT id, project, kind, content, created_at, expires_at FROM project_state_snapshot WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT 1").all(...params);
+      if (!rows.length) return { project, kind: kind || null, stale: true, snapshot: null };
+      const r = rows[0];
+      const ageMs = Date.now() - new Date(r.created_at).getTime();
+      return { project: r.project, kind: r.kind, snapshot: r, age_minutes: Math.round(ageMs / 60000), stale: ageMs > 6 * 3600 * 1000 };
+    },
+  },
+  mem_idle_loop_set: {
+    description: "Enable/disable autonomous idle-cycle for an agent + interval in minutes (default 30).",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, enabled: { type: "boolean" }, interval_min: { type: "integer" } }, required: ["agent_name"] },
+    handler: ({ agent_name, enabled, interval_min }) => {
+      const en = enabled ? 1 : 0;
+      const interval = parseInt(interval_min || 30, 10);
+      db.prepare("INSERT INTO agent_idle_config (agent_name, enabled, interval_min, updated_at) VALUES (?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(agent_name) DO UPDATE SET enabled=excluded.enabled, interval_min=excluded.interval_min, updated_at=excluded.updated_at").run(agent_name, en, interval);
+      return { agent_name, enabled: !!en, interval_min: interval };
+    },
+  },
+  mem_idle_loop_status: {
+    description: "List all agents' idle-loop configs and last cycle timestamps.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const rows = db.prepare("SELECT agent_name, enabled, interval_min, last_cycle_at FROM agent_idle_config ORDER BY agent_name").all();
+      return { count: rows.length, agents: rows };
+    },
+  },
+  mem_set_mode: {
+    description: "Set agent mode (active | vacation | maintenance) with optional until-ISO and digest_chat_id for daily Telegram summary.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, mode: { type: "string", enum: ["active","vacation","maintenance"] }, until: { type: "string" }, digest_chat_id: { type: "string" } }, required: ["agent_name","mode"] },
+    handler: ({ agent_name, mode, until, digest_chat_id }) => {
+      db.prepare("INSERT INTO agent_mode (agent_name, mode, until, digest_chat_id, updated_at) VALUES (?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(agent_name) DO UPDATE SET mode=excluded.mode, until=excluded.until, digest_chat_id=COALESCE(excluded.digest_chat_id, agent_mode.digest_chat_id), updated_at=excluded.updated_at").run(agent_name, mode, until || null, digest_chat_id ? String(digest_chat_id) : null);
+      return { agent_name, mode, until: until || null };
+    },
+  },
+  mem_get_mode: {
+    description: "Get agent mode + auto-resets to active when until expires.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" } }, required: ["agent_name"] },
+    handler: ({ agent_name }) => {
+      const row = db.prepare("SELECT agent_name, mode, until, digest_chat_id, last_digest_at, updated_at FROM agent_mode WHERE agent_name=?").get(agent_name);
+      if (!row) return { agent_name, mode: 'active', until: null };
+      if (row.until && new Date(row.until) < new Date()) {
+        db.prepare("UPDATE agent_mode SET mode='active', until=NULL WHERE agent_name=?").run(agent_name);
+        return { agent_name, mode: 'active', until: null, expired_from: row.mode };
+      }
+      return row;
+    },
+  },
+  mem_skill_outcome_record: {
+    description: "Log post-execution outcome for a skill (reaction: done|ack|blocker|skipped, optional metric).",
+    inputSchema: { type: "object", properties: { skill_name: { type: "string" }, reaction: { type: "string" }, proposal_id: { type: "integer" }, brief_id: { type: "integer" }, metric: { type: "object" } }, required: ["skill_name","reaction"] },
+    handler: ({ skill_name, reaction, proposal_id, brief_id, metric }) => {
+      const info = db.prepare("INSERT INTO skill_outcome (skill_name, proposal_id, brief_id, reaction, metric_json) VALUES (?,?,?,?,?)").run(skill_name, proposal_id || null, brief_id || null, reaction, metric ? JSON.stringify(metric) : null);
+      return { id: info.lastInsertRowid, skill_name, reaction };
+    },
+  },
+  mem_skill_outcome_stats: {
+    description: "Per-skill outcome breakdown + success_rate (done+ack)/total. Used to weight future propose-cycles.",
+    inputSchema: { type: "object", properties: { skill_name: { type: "string" }, since: { type: "string" } } },
+    handler: ({ skill_name, since }) => {
+      const where = []; const params = [];
+      if (skill_name) { where.push("skill_name=?"); params.push(skill_name); }
+      if (since) { where.push("recorded_at >= ?"); params.push(since); }
+      const sql = "SELECT skill_name, reaction, COUNT(*) c FROM skill_outcome" + (where.length ? " WHERE " + where.join(" AND ") : "") + " GROUP BY skill_name, reaction ORDER BY skill_name, reaction";
+      const rows = db.prepare(sql).all(...params);
+      const bySkill = {};
+      for (const r of rows) {
+        if (!bySkill[r.skill_name]) bySkill[r.skill_name] = { skill_name: r.skill_name, reactions: {}, total: 0, success_rate: 0 };
+        bySkill[r.skill_name].reactions[r.reaction] = r.c;
+        bySkill[r.skill_name].total += r.c;
+      }
+      for (const k of Object.keys(bySkill)) {
+        const obj = bySkill[k];
+        const ok = (obj.reactions["done"] || 0) + (obj.reactions["ack"] || 0);
+        obj.success_rate = obj.total > 0 ? Math.round(1000 * ok / obj.total) / 1000 : 0;
+      }
+      return { count: Object.keys(bySkill).length, skills: Object.values(bySkill) };
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
