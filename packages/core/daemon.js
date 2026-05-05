@@ -95,6 +95,31 @@ try {
   if (!rcols.includes("notify_telegram_chat")) db.exec("ALTER TABLE agent_registry ADD COLUMN notify_telegram_chat TEXT");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
+  // FTS5 virtual table for cross-source search (briefs + actions + memory)
+  db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS mnemo_search_fts USING fts5(scope, ref_id UNINDEXED, agent_name, summary, content, tokenize='porter unicode61')");
+  // Backfill briefs into FTS if empty
+  try {
+    const fts_count = db.prepare("SELECT COUNT(*) c FROM mnemo_search_fts").get().c;
+    if (fts_count === 0) {
+      const briefs = db.prepare("SELECT id, agent_name, source_agent, content FROM agent_brief").all();
+      const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('brief', ?, ?, ?, ?)");
+      const t = db.transaction(rows => { for (const r of rows) ins.run(String(r.id), r.agent_name || '', r.source_agent || '', (r.content || '').slice(0, 8000)); });
+      t(briefs);
+      console.log("[migrate] FTS5 backfilled with " + briefs.length + " briefs");
+    }
+  } catch (e) { console.error("[migrate-fts-backfill]", e.message); }
+  // Brief templates
+  db.exec("CREATE TABLE IF NOT EXISTS brief_template (name TEXT PRIMARY KEY, body_template TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  // Seed default templates if empty
+  try {
+    if (db.prepare("SELECT COUNT(*) c FROM brief_template").get().c === 0) {
+      const seed = db.prepare("INSERT INTO brief_template (name, body_template, description) VALUES (?,?,?)");
+      seed.run("patch-delta", "# Brief PATCH-DELTA — {{file}}\n\n{{diffs}}\n\n## Test-Hinweis\n{{test_hint}}\n", "diff-style file patch with test hint");
+      seed.run("file-drop", "# Brief — {{title}}\n\n=== FILE: {{path}} ===\n{{content}}\n=== END FILE ===\n", "single file drop wrapper");
+      seed.run("status-update", "# {{topic}} — {{date}}\n\nStatus: {{status}}\n\n{{notes}}\n", "lightweight status report");
+      seed.run("question", "# Frage an {{recipient}}\n\n{{question}}\n\nKontext: {{context}}\n", "structured question");
+    }
+  } catch (e) { console.error("[migrate-template-seed]", e.message); }
 } catch (e) { console.error("[migrate]", e.message); }
 db.pragma("synchronous = NORMAL");
 
@@ -288,6 +313,13 @@ function fireBriefHook(tdb, briefId, eventType, ctx) {
   } catch (e) { /* hook never throws */ }
 }
 
+function ftsIndex(tdb, scope, refId, agentName, summary, content) {
+  try {
+    tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES (?,?,?,?,?)")
+       .run(scope, String(refId), agentName || '', (summary || '').slice(0, 200), (content || '').slice(0, 8000));
+  } catch (e) { /* silent */ }
+}
+
 // ---------- Connect / Brief tool dispatch (HTTP-callable subset) ----------
 function handleTool(tdb, name, a) {
   switch (name) {
@@ -363,6 +395,7 @@ function handleTool(tdb, name, a) {
                              a.meta ? JSON.stringify(a.meta) : null);
         ids.push(info.lastInsertRowid);
         try { fireBriefHook(tdb, info.lastInsertRowid, "channel_post", { agent_name: s.agent_name, channel: a.channel, source: a.source_agent || null }); } catch (e) {}
+        try { ftsIndex(tdb, "brief", info.lastInsertRowid, s.agent_name, a.source_agent || "", a.content); } catch (e) {}
       }
       return { channel: a.channel, fanout: subs.length, brief_ids: ids };
     }
@@ -383,6 +416,7 @@ function handleTool(tdb, name, a) {
         try { tdb.prepare("UPDATE agent_brief SET superseded_by_id=?, status=CASE WHEN status='pending' THEN 'superseded' ELSE status END WHERE id=?").run(newId, a.supersedes); } catch (e) {}
       }
       try { fireBriefHook(tdb, newId, "drop", { agent_name: a.agent_name }); } catch (e) {}
+      try { ftsIndex(tdb, "brief", newId, a.agent_name, a.source_agent || "", a.content); } catch (e) {}
       return { id: newId, agent_name: a.agent_name, status: "pending", supersedes: a.supersedes || null };
     }
     case "mem_brief_pull": {
@@ -401,6 +435,83 @@ function handleTool(tdb, name, a) {
       tdb.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=? WHERE id=?")
         .run(a.status, new Date().toISOString(), a.outcome || null, a.id);
       return { id: a.id, status: a.status };
+    }
+    case "mem_brief_drop_batch": {
+      const items = Array.isArray(a.briefs) ? a.briefs : [];
+      if (!items.length) return { error: "briefs array required and non-empty" };
+      const ins = tdb.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)");
+      const txn = tdb.transaction(rows => {
+        const out = [];
+        for (const r of rows) {
+          const info = ins.run(r.agent_name, r.source_agent || a.source_agent || null, r.content, r.meta ? JSON.stringify(r.meta) : null, r.parent_id || null, r.supersedes || null);
+          out.push({ id: info.lastInsertRowid, agent_name: r.agent_name });
+        }
+        return out;
+      });
+      const inserted = txn(items);
+      // Fire hooks + FTS outside transaction (best effort)
+      for (const r of inserted) {
+        try { fireBriefHook(tdb, r.id, "drop_batch", { agent_name: r.agent_name }); } catch (e) {}
+        const src = items.find(x => x.agent_name === r.agent_name) || items[0];
+        try { ftsIndex(tdb, "brief", r.id, r.agent_name, src.source_agent || "", src.content); } catch (e) {}
+      }
+      return { count: inserted.length, ids: inserted.map(x => x.id), inserted };
+    }
+    case "mem_brief_drop_multi": {
+      const targets = Array.isArray(a.agent_names) ? a.agent_names : [];
+      if (!targets.length || !a.content) return { error: "agent_names array + content required" };
+      const ins = tdb.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)");
+      const ids = [];
+      const txn = tdb.transaction(names => {
+        for (const n of names) {
+          const info = ins.run(n, a.source_agent || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.parent_id || null, a.supersedes || null);
+          ids.push({ id: info.lastInsertRowid, agent_name: n });
+        }
+      });
+      txn(targets);
+      for (const r of ids) {
+        try { fireBriefHook(tdb, r.id, "drop_multi", { agent_name: r.agent_name }); } catch (e) {}
+        try { ftsIndex(tdb, "brief", r.id, r.agent_name, a.source_agent || "", a.content); } catch (e) {}
+      }
+      return { fanout: ids.length, brief_ids: ids.map(x => x.id), inserted: ids };
+    }
+    case "mem_brief_drop_from_template": {
+      const tpl = tdb.prepare("SELECT body_template FROM brief_template WHERE name=?").get(a.template);
+      if (!tpl) return { error: "template_not_found", template: a.template };
+      let body = tpl.body_template;
+      const vars = a.vars || {};
+      for (const k of Object.keys(vars)) {
+        const re = new RegExp("\\{\\{\\s*" + k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\}\\}", "g");
+        body = body.replace(re, String(vars[k] == null ? "" : vars[k]));
+      }
+      const info = tdb.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)").run(a.agent_name, a.source_agent || null, body, a.meta ? JSON.stringify(a.meta) : null, a.parent_id || null, a.supersedes || null);
+      const newId = info.lastInsertRowid;
+      try { fireBriefHook(tdb, newId, "drop", { agent_name: a.agent_name, template: a.template }); } catch (e) {}
+      try { ftsIndex(tdb, "brief", newId, a.agent_name, a.source_agent || "", body); } catch (e) {}
+      return { id: newId, agent_name: a.agent_name, template: a.template };
+    }
+    case "mem_brief_template_list": {
+      const rows = tdb.prepare("SELECT name, description, length(body_template) AS body_len FROM brief_template ORDER BY name").all();
+      return { count: rows.length, templates: rows };
+    }
+    case "mem_brief_template_upsert": {
+      tdb.prepare("INSERT INTO brief_template (name, body_template, description) VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET body_template=excluded.body_template, description=excluded.description").run(a.name, a.body_template, a.description || null);
+      return { name: a.name, status: "ok" };
+    }
+    case "mem_search": {
+      const scopes = Array.isArray(a.scope) && a.scope.length ? a.scope : ["brief"];
+      const limit = Math.min(a.limit || 20, 100);
+      // Sanitize FTS5 query: strip operators except basic terms, allow phrase quoting
+      const raw = String(a.query || "").replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+      if (!raw) return { error: "query required" };
+      const q = raw.split(/\s+/).filter(Boolean).map(t => '"' + t + '"').join(" ");
+      const placeholders = scopes.map(() => "?").join(",");
+      const rows = tdb.prepare(
+        "SELECT scope, ref_id, agent_name, summary, snippet(mnemo_search_fts, 4, '<b>', '</b>', '...', 24) AS snippet, rank " +
+        "FROM mnemo_search_fts WHERE scope IN (" + placeholders + ") AND mnemo_search_fts MATCH ? " +
+        "ORDER BY rank LIMIT ?"
+      ).all(...scopes, q, limit);
+      return { count: rows.length, query: q, scopes, results: rows };
     }
     case "mem_brief_status": {
       const row = tdb.prepare("SELECT id, agent_name, source_agent, channel, status, created_at, dispatched_at, done_at, outcome, parent_id, supersedes_id, superseded_by_id, length(content) AS content_len FROM agent_brief WHERE id=?").get(a.id);
