@@ -107,6 +107,8 @@ try {
   db.exec("CREATE TABLE IF NOT EXISTS agent_idle_config (agent_name TEXT PRIMARY KEY, enabled INTEGER DEFAULT 0, interval_min INTEGER DEFAULT 30, last_cycle_at TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   // Phase 4: agent_mode (vacation gate)
   db.exec("CREATE TABLE IF NOT EXISTS agent_mode (agent_name TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'active', until TEXT, digest_chat_id TEXT, last_digest_at TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE TABLE IF NOT EXISTS skill_outcome (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL, proposal_id INTEGER, brief_id INTEGER, reaction TEXT, metric_json TEXT, recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_outcome_skill ON skill_outcome(skill_name, recorded_at DESC)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -669,6 +671,30 @@ function handleTool(tdb, name, a) {
         return { agent_name: a.agent_name, mode: 'active', until: null, expired_from: row.mode };
       }
       return row;
+    }
+    case "mem_skill_outcome_record": {
+      if (!a.skill_name || !a.reaction) return { error: "skill_name + reaction required" };
+      const info = tdb.prepare("INSERT INTO skill_outcome (skill_name, proposal_id, brief_id, reaction, metric_json) VALUES (?,?,?,?,?)").run(a.skill_name, a.proposal_id || null, a.brief_id || null, a.reaction, a.metric ? JSON.stringify(a.metric) : null);
+      return { id: info.lastInsertRowid, skill_name: a.skill_name, reaction: a.reaction };
+    }
+    case "mem_skill_outcome_stats": {
+      const where = []; const params = [];
+      if (a.skill_name) { where.push("skill_name=?"); params.push(a.skill_name); }
+      if (a.since) { where.push("recorded_at >= ?"); params.push(a.since); }
+      const sql = "SELECT skill_name, reaction, COUNT(*) c FROM skill_outcome" + (where.length ? " WHERE " + where.join(" AND ") : "") + " GROUP BY skill_name, reaction ORDER BY skill_name, reaction";
+      const rows = tdb.prepare(sql).all(...params);
+      const bySkill = {};
+      for (const r of rows) {
+        if (!bySkill[r.skill_name]) bySkill[r.skill_name] = { skill_name: r.skill_name, reactions: {}, total: 0, success_rate: 0 };
+        bySkill[r.skill_name].reactions[r.reaction] = r.c;
+        bySkill[r.skill_name].total += r.c;
+      }
+      for (const k of Object.keys(bySkill)) {
+        const obj = bySkill[k];
+        const ok = (obj.reactions["done"] || 0) + (obj.reactions["ack"] || 0);
+        obj.success_rate = obj.total > 0 ? Math.round(1000 * ok / obj.total) / 1000 : 0;
+      }
+      return { count: Object.keys(bySkill).length, skills: Object.values(bySkill) };
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
