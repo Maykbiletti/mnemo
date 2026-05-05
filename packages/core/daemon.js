@@ -124,6 +124,16 @@ try {
   db.exec("CREATE INDEX IF NOT EXISTS idx_escalation_status ON escalation(status, urgency)");
   // Phase 6 Sprint 3: rename active→autonomous (idempotent)
   try { db.exec("UPDATE agent_mode SET mode = 'autonomous' WHERE mode = 'active'"); } catch (e) {}
+  // Phase 7: open_problem + problem_attempt + peer_consult + meeting
+  db.exec("CREATE TABLE IF NOT EXISTS open_problem (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, project_id INTEGER, status TEXT DEFAULT 'open', severity TEXT DEFAULT 'M', owner_agent TEXT, opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), solved_at TEXT, resolution TEXT)");
+  db.exec("CREATE TABLE IF NOT EXISTS problem_attempt (id INTEGER PRIMARY KEY AUTOINCREMENT, problem_id INTEGER NOT NULL, agent_name TEXT NOT NULL, approach TEXT, outcome TEXT, failure_reason TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_problem_status ON open_problem(status, severity)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_attempt_problem ON problem_attempt(problem_id, created_at DESC)");
+  db.exec("CREATE TABLE IF NOT EXISTS peer_consult (id INTEGER PRIMARY KEY AUTOINCREMENT, source_agent TEXT NOT NULL, target_agent TEXT NOT NULL, question TEXT NOT NULL, context TEXT, response TEXT, status TEXT DEFAULT 'open', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), answered_at TEXT)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_consult_target ON peer_consult(target_agent, status)");
+  db.exec("CREATE TABLE IF NOT EXISTS meeting (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, project_id INTEGER, problem_id INTEGER, status TEXT DEFAULT 'open', created_by TEXT, decision_summary TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), closed_at TEXT)");
+  db.exec("CREATE TABLE IF NOT EXISTS meeting_turn (id INTEGER PRIMARY KEY AUTOINCREMENT, meeting_id INTEGER NOT NULL, agent_name TEXT NOT NULL, content TEXT, turn_kind TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_meeting_turn ON meeting_turn(meeting_id, created_at)");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -872,6 +882,72 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT id, source_agent, kind, urgency, summary, requested_authority, created_at FROM escalation WHERE " + where.join(" AND ") + " ORDER BY CASE urgency WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at DESC LIMIT ?").all(...params);
       return { count: rows.length, escalations: rows };
     }
+    case "mem_problem_create": {
+      if (!a.title) return { error: "title required" };
+      const info = tdb.prepare("INSERT INTO open_problem (title, project_id, severity, owner_agent) VALUES (?,?,?,?)").run(a.title, a.project_id || null, a.severity || 'M', a.owner_agent || null);
+      return { id: info.lastInsertRowid, title: a.title, status: "open" };
+    }
+    case "mem_problem_attempt": {
+      if (!a.problem_id || !a.agent_name) return { error: "problem_id + agent_name required" };
+      const info = tdb.prepare("INSERT INTO problem_attempt (problem_id, agent_name, approach, outcome, failure_reason) VALUES (?,?,?,?,?)").run(a.problem_id, a.agent_name, a.approach || null, a.outcome || null, a.failure_reason || null);
+      return { id: info.lastInsertRowid, problem_id: a.problem_id };
+    }
+    case "mem_problem_attempts": {
+      if (!a.problem_id) return { error: "problem_id required" };
+      const rows = tdb.prepare("SELECT id, agent_name, approach, outcome, failure_reason, created_at FROM problem_attempt WHERE problem_id=? ORDER BY created_at DESC").all(a.problem_id);
+      return { count: rows.length, attempts: rows };
+    }
+    case "mem_problem_close": {
+      if (!a.id) return { error: "id required" };
+      tdb.prepare("UPDATE open_problem SET status='closed', solved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), resolution=? WHERE id=?").run(a.resolution || null, a.id);
+      return { ok: true, id: a.id };
+    }
+    case "mem_problems_open": {
+      const where = ["status='open'"]; const params = [];
+      if (a.owner_agent) { where.push("owner_agent=?"); params.push(a.owner_agent); }
+      if (a.project_id) { where.push("project_id=?"); params.push(a.project_id); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = tdb.prepare("SELECT id, title, project_id, severity, owner_agent, opened_at FROM open_problem WHERE " + where.join(" AND ") + " ORDER BY CASE severity WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, opened_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, problems: rows };
+    }
+    case "mem_consult_peer": {
+      if (!a.source_agent || !a.target_agent || !a.question) return { error: "source_agent + target_agent + question required" };
+      const info = tdb.prepare("INSERT INTO peer_consult (source_agent, target_agent, question, context) VALUES (?,?,?,?)").run(a.source_agent, a.target_agent, a.question, a.context || null);
+      try { fireBriefHook(tdb, info.lastInsertRowid, "consult_request", { agent_name: a.target_agent, source: a.source_agent }); } catch (e) {}
+      return { id: info.lastInsertRowid, target_agent: a.target_agent };
+    }
+    case "mem_consults_inbox": {
+      if (!a.agent_name) return { error: "agent_name required" };
+      const rows = tdb.prepare("SELECT id, source_agent, question, context, status, created_at FROM peer_consult WHERE target_agent=? AND status='open' ORDER BY created_at DESC LIMIT ?").all(a.agent_name, Math.min(a.limit || 20, 100));
+      return { count: rows.length, consults: rows };
+    }
+    case "mem_consult_answer": {
+      if (!a.id || !a.response) return { error: "id + response required" };
+      tdb.prepare("UPDATE peer_consult SET response=?, status='answered', answered_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.response, a.id);
+      return { ok: true, id: a.id };
+    }
+    case "mem_meeting_open": {
+      if (!a.topic) return { error: "topic required" };
+      const info = tdb.prepare("INSERT INTO meeting (topic, project_id, problem_id, created_by) VALUES (?,?,?,?)").run(a.topic, a.project_id || null, a.problem_id || null, a.created_by || null);
+      return { id: info.lastInsertRowid, topic: a.topic, status: "open" };
+    }
+    case "mem_meeting_post": {
+      if (!a.meeting_id || !a.agent_name || !a.content) return { error: "meeting_id + agent_name + content required" };
+      const validKinds = ['propose','agree','disagree','question','synthesis'];
+      const kind = validKinds.includes(a.turn_kind) ? a.turn_kind : 'propose';
+      const info = tdb.prepare("INSERT INTO meeting_turn (meeting_id, agent_name, content, turn_kind) VALUES (?,?,?,?)").run(a.meeting_id, a.agent_name, a.content, kind);
+      return { id: info.lastInsertRowid, meeting_id: a.meeting_id, turn_kind: kind };
+    }
+    case "mem_meeting_close": {
+      if (!a.meeting_id) return { error: "meeting_id required" };
+      tdb.prepare("UPDATE meeting SET status='closed', decision_summary=?, closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.decision_summary || null, a.meeting_id);
+      return { ok: true, meeting_id: a.meeting_id };
+    }
+    case "mem_meeting_turns": {
+      if (!a.meeting_id) return { error: "meeting_id required" };
+      const rows = tdb.prepare("SELECT id, agent_name, content, turn_kind, created_at FROM meeting_turn WHERE meeting_id=? ORDER BY created_at ASC").all(a.meeting_id);
+      return { count: rows.length, turns: rows };
+    }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
       return { count: rows.length, skills: rows };
@@ -1493,6 +1569,23 @@ function runMaintenanceCycle() {
 }
 setTimeout(runMaintenanceCycle, 30 * 1000);
 setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+
+// Phase 7 Sprint 0: anti-loop detector — every 30 min scan repeat failures
+async function antiLoopCycle() {
+  try {
+    const groups = db.prepare("SELECT agent_name, action_kind, target, COUNT(*) c FROM agent_action WHERE status='error' AND started_at > datetime('now','-1 hour') GROUP BY agent_name, action_kind, target HAVING COUNT(*) >= 3").all();
+    for (const g of groups) {
+      const title = g.agent_name + " repeated failure: " + g.action_kind + (g.target ? " on " + g.target : "");
+      const exists = db.prepare("SELECT id FROM open_problem WHERE title=? AND status='open'").get(title);
+      if (exists) continue;
+      const info = db.prepare("INSERT INTO open_problem (title, severity, owner_agent) VALUES (?,?,?)").run(title, 'M', g.agent_name);
+      console.log("[anti-loop] auto-created problem #" + info.lastInsertRowid + " for " + g.agent_name);
+      // Brief to agent + Dieter
+      db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content) VALUES (?,?,?)").run(g.agent_name, "mnemo-anti-loop", "[ANTI-LOOP] " + title + " (" + g.c + " errors in last hour). Pause repeating, investigate or escalate via mem_consult_peer / mem_consult_codex / mem_meeting_open.");
+    }
+  } catch (e) { console.error("[anti-loop]", e.message); }
+}
+setInterval(() => { antiLoopCycle().catch(() => {}); }, 30 * 60 * 1000);
 
 // Phase 6 Sprint 2: watchdog runner — 5 min cycle, http checks
 async function watchdogCycle() {
