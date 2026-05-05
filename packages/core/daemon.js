@@ -103,6 +103,10 @@ try {
   // Phase 2: project_state_snapshot
   db.exec("CREATE TABLE IF NOT EXISTS project_state_snapshot (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_snapshot_project_kind ON project_state_snapshot(project, kind, created_at DESC)");
+  // Phase 3: idle_loop config
+  db.exec("CREATE TABLE IF NOT EXISTS agent_idle_config (agent_name TEXT PRIMARY KEY, enabled INTEGER DEFAULT 0, interval_min INTEGER DEFAULT 30, last_cycle_at TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+  // Phase 4: agent_mode (vacation gate)
+  db.exec("CREATE TABLE IF NOT EXISTS agent_mode (agent_name TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'active', until TEXT, digest_chat_id TEXT, last_digest_at TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE TABLE IF NOT EXISTS agent_brief_reaction (id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER NOT NULL, agent_name TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   db.exec("CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id)");
   // FTS5 virtual table for cross-source search (briefs + actions + memory)
@@ -637,6 +641,34 @@ function handleTool(tdb, name, a) {
       const ageMs = Date.now() - new Date(r.created_at).getTime();
       const stale = ageMs > 6 * 3600 * 1000;
       return { project: r.project, kind: r.kind, snapshot: r, age_minutes: Math.round(ageMs / 60000), stale };
+    }
+    case "mem_idle_loop_set": {
+      if (!a.agent_name) return { error: "agent_name required" };
+      const enabled = a.enabled ? 1 : 0;
+      const interval = parseInt(a.interval_min || 30, 10);
+      tdb.prepare("INSERT INTO agent_idle_config (agent_name, enabled, interval_min, updated_at) VALUES (?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(agent_name) DO UPDATE SET enabled=excluded.enabled, interval_min=excluded.interval_min, updated_at=excluded.updated_at").run(a.agent_name, enabled, interval);
+      return { agent_name: a.agent_name, enabled: !!enabled, interval_min: interval };
+    }
+    case "mem_idle_loop_status": {
+      const rows = tdb.prepare("SELECT agent_name, enabled, interval_min, last_cycle_at FROM agent_idle_config ORDER BY agent_name").all();
+      return { count: rows.length, agents: rows };
+    }
+    case "mem_set_mode": {
+      if (!a.agent_name || !a.mode) return { error: "agent_name + mode required" };
+      const validModes = ['active','vacation','maintenance'];
+      if (!validModes.includes(a.mode)) return { error: "mode must be active|vacation|maintenance" };
+      tdb.prepare("INSERT INTO agent_mode (agent_name, mode, until, digest_chat_id, updated_at) VALUES (?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(agent_name) DO UPDATE SET mode=excluded.mode, until=excluded.until, digest_chat_id=COALESCE(excluded.digest_chat_id, agent_mode.digest_chat_id), updated_at=excluded.updated_at").run(a.agent_name, a.mode, a.until || null, a.digest_chat_id ? String(a.digest_chat_id) : null);
+      return { agent_name: a.agent_name, mode: a.mode, until: a.until || null };
+    }
+    case "mem_get_mode": {
+      const row = tdb.prepare("SELECT agent_name, mode, until, digest_chat_id, last_digest_at, updated_at FROM agent_mode WHERE agent_name=?").get(a.agent_name);
+      if (!row) return { agent_name: a.agent_name, mode: 'active', until: null };
+      // Check expiry
+      if (row.until && new Date(row.until) < new Date()) {
+        tdb.prepare("UPDATE agent_mode SET mode='active', until=NULL WHERE agent_name=?").run(a.agent_name);
+        return { agent_name: a.agent_name, mode: 'active', until: null, expired_from: row.mode };
+      }
+      return row;
     }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
@@ -1259,6 +1291,63 @@ function runMaintenanceCycle() {
 }
 setTimeout(runMaintenanceCycle, 30 * 1000);
 setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+
+// Phase 3+4 BLUN-OS: idle_loop driver + daily digest cron
+async function idleLoopCycle() {
+  try {
+    const cfg = db.prepare("SELECT agent_name, interval_min, last_cycle_at FROM agent_idle_config WHERE enabled=1").all();
+    const now = Date.now();
+    for (const c of cfg) {
+      try {
+        const lastMs = c.last_cycle_at ? new Date(c.last_cycle_at).getTime() : 0;
+        if (now - lastMs < c.interval_min * 60 * 1000) continue;
+        // Mode-gate
+        const mode = handleTool(db, "mem_get_mode", { agent_name: c.agent_name });
+        if (mode.mode === 'maintenance') continue;
+        // Mark cycle
+        db.prepare("UPDATE agent_idle_config SET last_cycle_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE agent_name=?").run(c.agent_name);
+        // Drop a brief to the agent itself with idle_cycle marker — agent picks up + acts
+        const briefId = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)").run(c.agent_name, "mnemo-idle-loop", "[IDLE-CYCLE] Pull project_state, generate proposals via mem_propose, ship if ship_eligible. Mode: " + mode.mode + ".", JSON.stringify({ idle_cycle: true, mode: mode.mode })).lastInsertRowid;
+        db.prepare("INSERT INTO agent_action (agent_name, action_kind, topic, status, payload_json, started_at) VALUES (?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))").run(c.agent_name, "idle_loop_cycle", "idle_loop", "fired", JSON.stringify({ brief_id: briefId, mode: mode.mode }));
+        console.log("[idle-loop] " + c.agent_name + " cycle fired (mode=" + mode.mode + ")");
+      } catch (e) { console.error("[idle-loop]", c.agent_name, e.message); }
+    }
+  } catch (e) { console.error("[idle-loop]", e.message); }
+}
+setInterval(() => { idleLoopCycle().catch(() => {}); }, 60 * 1000);
+
+async function dailyDigestCycle() {
+  try {
+    // Run once between 06:00-06:05 user-tz (UTC+2 default = 04:00-04:05 UTC). Check minute 0-5.
+    const now = new Date();
+    const utcHour = now.getUTCHours();
+    const utcMin = now.getUTCMinutes();
+    if (utcHour !== 4 || utcMin > 5) return;
+    const modes = db.prepare("SELECT agent_name, mode, digest_chat_id, last_digest_at FROM agent_mode WHERE digest_chat_id IS NOT NULL").all();
+    const tokenFile = process.env.TELEGRAM_BOT_TOKEN_FILE || "/root/.dieter/telegram_bot_token";
+    let token = process.env.TELEGRAM_BOT_TOKEN || "";
+    if (!token && fs.existsSync(tokenFile)) token = fs.readFileSync(tokenFile,"utf8").trim();
+    if (!token) return;
+    const today = now.toISOString().slice(0,10);
+    for (const m of modes) {
+      if (m.last_digest_at && m.last_digest_at.slice(0,10) === today) continue;
+      const shipped = db.prepare("SELECT COUNT(*) c FROM agent_proposal WHERE agent_name=? AND status='shipped' AND shipped_at > datetime('now','-24 hours')").get(m.agent_name).c;
+      const queued = db.prepare("SELECT COUNT(*) c FROM agent_proposal WHERE agent_name=? AND status='queued'").get(m.agent_name).c;
+      const blocked = db.prepare("SELECT COUNT(*) c FROM agent_brief WHERE agent_name=? AND status IN ('pending','dispatched') AND id IN (SELECT brief_id FROM agent_brief_reaction WHERE kind='blocker')").get(m.agent_name).c;
+      const decisions = db.prepare("SELECT idea FROM agent_proposal WHERE agent_name=? AND status='shipped' AND shipped_at > datetime('now','-24 hours') ORDER BY score DESC LIMIT 5").all(m.agent_name).map(r => "  - " + r.idea).join("\n");
+      const text = "[mnemo digest 24h] " + m.agent_name + " (mode=" + m.mode + ")\n\nshipped: " + shipped + "\nqueued: " + queued + "\nblocked: " + blocked + (decisions ? "\n\nrecent ships:\n" + decisions : "");
+      try {
+        const data = JSON.stringify({ chat_id: m.digest_chat_id, text });
+        const req = require("https").request({ method: "POST", hostname: "api.telegram.org", path: "/bot" + token + "/sendMessage", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } }, r => r.resume());
+        req.on("error", () => {});
+        req.write(data); req.end();
+        db.prepare("UPDATE agent_mode SET last_digest_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE agent_name=?").run(m.agent_name);
+        console.log("[digest] sent to " + m.agent_name);
+      } catch (e) { console.error("[digest-send]", e.message); }
+    }
+  } catch (e) { console.error("[digest]", e.message); }
+}
+setInterval(() => { dailyDigestCycle().catch(() => {}); }, 60 * 1000);
 
 // #16 auto-reflect: every 10 min, check each registered agent, trigger reflect if nudge says so
 async function autoReflectCycle() {
