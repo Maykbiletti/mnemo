@@ -2606,6 +2606,27 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: rows.length, projects: rows };
     },
   },
+  mem_lens_view: {
+    description: "Project-Lens: return a structured JSON bundle scoped to ONE project — registry row, agent_project state, owner agent_status, recent decisions (scope=project), active work_claims (project=), recent briefs mentioning the project, recent file_edits in that project tree. Use when a UI surface or agent wants 'all the live state for X' in one call instead of N. Different from mem_project_doc_render: this returns parsed JSON for programmatic use; the renderer returns Markdown for display.",
+    inputSchema: { type: "object", properties: { project: { type: "string" }, limit: { type: "integer" } }, required: ["project"] },
+    handler: ({ project, limit }) => {
+      const lim = Math.min(limit || 10, 50);
+      try { db.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const registry = db.prepare("SELECT * FROM project_registry WHERE name=?").get(project);
+      if (registry) {
+        for (const k of ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"]) {
+          if (registry[k]) try { registry[k] = JSON.parse(registry[k]); } catch {}
+        }
+      }
+      const apr = (() => { try { return db.prepare("SELECT name, owner_agent, goal_text, status, current_milestone, blocker FROM agent_project WHERE name=?").get(project); } catch { return null; } })();
+      const decisions = (() => { try { return db.prepare("SELECT id, title, decided_by, decided_at, summary FROM decision_log WHERE scope=? ORDER BY decided_at DESC LIMIT ?").all(project, lim); } catch { return []; } })();
+      const claims = (() => { try { return db.prepare("SELECT id, file_path, agent_name, summary, claimed_at, expires_at FROM work_claim WHERE project=? AND status='active' ORDER BY claimed_at DESC").all(project); } catch { return []; } })();
+      const briefs = (() => { try { return db.prepare("SELECT id, agent_name, source_agent, substr(content,1,200) AS snippet, created_at, status FROM agent_brief WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?").all('%' + project + '%', lim); } catch { return []; } })();
+      const file_edits = (() => { try { return db.prepare("SELECT file_path, last_edit_agent, last_edit_at FROM file_ownership WHERE last_edit_at >= datetime('now','-7 day') AND (file_path LIKE ? OR project=?) ORDER BY last_edit_at DESC LIMIT ?").all('%' + project.toLowerCase().replace(/\s+/g, '-') + '%', project, lim); } catch { return []; } })();
+      const status = (() => { try { return apr ? db.prepare("SELECT agent_name, current_task, last_heartbeat_at FROM agent_status_live WHERE agent_name=?").get(apr.owner_agent || '') : null; } catch { return null; } })();
+      return { project, registry, current: apr, owner_status: status, decisions: { count: decisions.length, items: decisions }, active_claims: { count: claims.length, items: claims }, recent_briefs: { count: briefs.length, items: briefs }, recent_file_edits: { count: file_edits.length, items: file_edits } };
+    },
+  },
   mem_project_doc_render: {
     description: "Auto-render a Markdown Project-Doc for one project — pulls operations from project_registry, current state from agent_project, active work-claims, recent decisions + briefs mentioning the project, and (optionally) the legal section from facts/blun.json. Returns { doc: string }. Use to keep a per-project AGENTS-style file in sync without hand-editing — caller writes the returned string to e.g. docs/projects/<name>.md.",
     inputSchema: { type: "object", properties: { name: { type: "string" }, include_legal: { type: "boolean" } }, required: ["name"] },

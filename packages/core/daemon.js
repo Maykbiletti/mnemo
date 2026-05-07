@@ -1417,6 +1417,24 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
       return { count: rows.length, projects: rows };
     }
+    case "mem_lens_view": {
+      if (!a.project) return { error: "project required" };
+      const lim = Math.min(a.limit || 10, 50);
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const registry = tdb.prepare("SELECT * FROM project_registry WHERE name=?").get(a.project);
+      if (registry) {
+        for (const k of ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"]) {
+          if (registry[k]) try { registry[k] = JSON.parse(registry[k]); } catch {}
+        }
+      }
+      const apr = (() => { try { return tdb.prepare("SELECT name, owner_agent, goal_text, status, current_milestone, blocker FROM agent_project WHERE name=?").get(a.project); } catch { return null; } })();
+      const decisions = (() => { try { return tdb.prepare("SELECT id, title, decided_by, decided_at, summary FROM decision_log WHERE scope=? ORDER BY decided_at DESC LIMIT ?").all(a.project, lim); } catch { return []; } })();
+      const claims = (() => { try { return tdb.prepare("SELECT id, file_path, agent_name, summary, claimed_at, expires_at FROM work_claim WHERE project=? AND status='active' ORDER BY claimed_at DESC").all(a.project); } catch { return []; } })();
+      const briefs = (() => { try { return tdb.prepare("SELECT id, agent_name, source_agent, substr(content,1,200) AS snippet, created_at, status FROM agent_brief WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?").all('%' + a.project + '%', lim); } catch { return []; } })();
+      const file_edits = (() => { try { return tdb.prepare("SELECT file_path, last_edit_agent, last_edit_at FROM file_ownership WHERE last_edit_at >= datetime('now','-7 day') AND (file_path LIKE ? OR project=?) ORDER BY last_edit_at DESC LIMIT ?").all('%' + a.project.toLowerCase().replace(/\s+/g, '-') + '%', a.project, lim); } catch { return []; } })();
+      const status = (() => { try { return apr ? tdb.prepare("SELECT agent_name, current_task, last_heartbeat_at FROM agent_status_live WHERE agent_name=?").get(apr.owner_agent || '') : null; } catch { return null; } })();
+      return { project: a.project, registry, current: apr, owner_status: status, decisions: { count: decisions.length, items: decisions }, active_claims: { count: claims.length, items: claims }, recent_briefs: { count: briefs.length, items: briefs }, recent_file_edits: { count: file_edits.length, items: file_edits } };
+    }
     case "mem_project_doc_render": {
       if (!a.name) return { error: "name required" };
       try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
