@@ -1625,7 +1625,7 @@ ${args.first_invocation_outcome || "(none)"}
   },
   mem_brief_drop_batch: {
     description: "Atomic multi-insert: array of briefs in single call.",
-    inputSchema: { type: "object", properties: { briefs: { type: "array" }, source_agent: { type: "string" } }, required: ["briefs"] },
+    inputSchema: { type: "object", properties: { briefs: { type: "array", items: { type: "object", properties: { agent_name: { type: "string" }, source_agent: { type: "string" }, content: { type: "string" }, meta: { type: "object" }, parent_id: { type: "integer" }, supersedes: { type: "integer" } }, required: ["agent_name","content"] } }, source_agent: { type: "string" } }, required: ["briefs"] },
     handler: ({ briefs, source_agent }) => {
       const items = Array.isArray(briefs) ? briefs : [];
       if (!items.length) return { error: "briefs array required" };
@@ -2164,6 +2164,80 @@ ${args.first_invocation_outcome || "(none)"}
       const lim = Math.min(a.limit || 200, 1000);
       const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at ASC LIMIT ?").all(String(a.start), String(a.end), lim);
       return { count: rows.length, start: a.start, end: a.end, transcripts: rows };
+    },
+  },
+  mem_company_fact_get: {
+    description: "Get authoritative company facts (team, products, brand, legal, etc). Pass scope (default 'blun') and optional topic (e.g. 'team', 'legal', 'products', 'pricing', 'investors', 'infra', 'comms') and optional key for a sub-field. ALWAYS query this BEFORE any external comm/code that mentions team members, prices, legal entity, or product specs. Source-of-truth lives in packages/core/facts/<scope>.json.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, topic: { type: "string" }, key: { type: "string" } } },
+    handler: ({ scope, topic, key }) => {
+      const sc = String(scope || "blun").toLowerCase();
+      const factsPath = path.join(__dirname, "facts", sc + ".json");
+      if (!fs.existsSync(factsPath)) return { error: "no facts file for scope: " + sc, hint: "create packages/core/facts/" + sc + ".json" };
+      let data;
+      try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); }
+      catch (e) { return { error: "facts json parse error: " + e.message }; }
+      if (!topic) return { scope: sc, _meta: data._meta, topics: Object.keys(data).filter(k => k !== "_meta") };
+      const node = data[topic];
+      if (node === undefined) return { error: "unknown topic: " + topic, available: Object.keys(data).filter(k => k !== "_meta") };
+      if (!key) return { scope: sc, topic, value: node };
+      if (Array.isArray(node)) {
+        const matches = node.filter(it => it && (it.name === key || it.sub_brand === key || it.alias === key));
+        return { scope: sc, topic, key, matches };
+      }
+      if (typeof node === "object") return { scope: sc, topic, key, value: node[key] };
+      return { scope: sc, topic, key, value: node };
+    },
+  },
+  mem_company_fact_set: {
+    description: "Update a company fact. Writes through to packages/core/facts/<scope>.json with auto-backup. Use sparingly — only for canonical changes (new team member, price change, legal entity update). Logs the change to memory layer 'semantic'.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, topic: { type: "string" }, value: {}, actor: { type: "string" } }, required: ["topic","value"] },
+    handler: ({ scope, topic, value, actor }) => {
+      const sc = String(scope || "blun").toLowerCase();
+      const factsDir = path.join(__dirname, "facts");
+      try { fs.mkdirSync(factsDir, { recursive: true }); } catch {}
+      const factsPath = path.join(factsDir, sc + ".json");
+      let data = {};
+      if (fs.existsSync(factsPath)) {
+        try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); }
+        catch (e) { return { error: "existing facts parse error: " + e.message }; }
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        try { fs.copyFileSync(factsPath, factsPath + ".bak-" + ts); } catch {}
+      }
+      data._meta = data._meta || { scope: sc };
+      data._meta.updated = new Date().toISOString().slice(0, 10);
+      data._meta.last_actor = actor || "unknown";
+      data[topic] = value;
+      const tmp = factsPath + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, factsPath);
+      try {
+        db.prepare("INSERT INTO memory (kind, source, actor, topic, importance, layer, text) VALUES ('company_fact_set', 'mnemo:fact-set', ?, ?, 0.9, 'semantic', ?)").run(actor || "system", topic, "scope=" + sc + " topic=" + topic + " value=" + JSON.stringify(value).slice(0, 500));
+      } catch {}
+      return { ok: true, scope: sc, topic, updated: data._meta.updated };
+    },
+  },
+  mem_pre_action_check: {
+    description: "Pre-action gate. Call BEFORE writing external comms (pitch/email/website/PR/code-with-team-mentions). Pass action_type and the topics the action touches (e.g. ['team','pricing','legal']). Returns required_facts + status='ok' if all canonical facts are loadable, status='block' if any fact is missing — DO NOT proceed if blocked. Logs the check for audit. Mayk-Direktive 2026-05-07: kein Schnellschuss ohne Memory-Query.",
+    inputSchema: { type: "object", properties: { action_type: { type: "string" }, scope: { type: "string" }, topics: { type: "array", items: { type: "string" } }, agent_name: { type: "string" }, summary: { type: "string" } }, required: ["action_type","topics"] },
+    handler: ({ action_type, scope, topics, agent_name, summary }) => {
+      const sc = String(scope || "blun").toLowerCase();
+      const factsPath = path.join(__dirname, "facts", sc + ".json");
+      const checked = [];
+      const missing = [];
+      let data = null;
+      if (fs.existsSync(factsPath)) {
+        try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); } catch {}
+      }
+      if (!data) return { status: "block", reason: "no facts file for scope " + sc, action_type, topics };
+      for (const t of topics) {
+        if (data[t] !== undefined) checked.push({ topic: t, ok: true, preview: Array.isArray(data[t]) ? `${data[t].length} entries` : (typeof data[t] === "object" ? Object.keys(data[t]).join(", ") : String(data[t]).slice(0, 80)) });
+        else missing.push(t);
+      }
+      const status = missing.length === 0 ? "ok" : "block";
+      try {
+        db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'pre_action_check', ?, ?, ?, 'pre_action_check')").run(agent_name || "unknown", action_type, status, JSON.stringify({ topics, missing, summary, scope: sc }));
+      } catch {}
+      return { status, action_type, scope: sc, agent_name: agent_name || null, checked, missing, facts: status === "ok" ? topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
     },
   },
   mem_transcript_recent: {

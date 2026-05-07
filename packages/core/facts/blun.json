@@ -1,0 +1,74 @@
+{
+  "_meta": {
+    "scope": "BLUN",
+    "owner": "mayk@blun.ai",
+    "updated": "2026-05-07",
+    "purpose": "Authoritative company facts. Query before any external comm/code that mentions team, products, money, legal, infra. mem_pre_action_check gate-blocks if missing."
+  },
+  "legal": {
+    "entity_type": "Einzelunternehmer",
+    "founder": "Mayk Biletti",
+    "address": "Sportplatzgasse 32b, 2443 Leithaprodersdorf, AT",
+    "country": "AT",
+    "is_gmbh": false,
+    "do_not_use": ["BLUN GmbH"]
+  },
+  "brand": {
+    "name": "BLUN",
+    "casing": "UPPERCASE in headlines/body/slogans, lowercase only in URLs/code",
+    "slogan": "Get it done. With BLUN.",
+    "slogan_v1_archived": "done with BLUN."
+  },
+  "team": [
+    {"name": "Mayk Biletti", "role": "Founder / CEO", "status": "active"},
+    {"name": "Florin Merca", "role": "Team", "status": "active"},
+    {"name": "Fredrik Möller", "role": "Head of Marketing / Investor Network", "status": "active"},
+    {"name": "Markus", "role": "Team / Sales-Leads", "status": "active"},
+    {"name": "Dominik Ossada", "role": "Legal (lawyer, friend)", "status": "active", "alias": "Dommi"},
+    {"name": "Volkan", "role": "Team", "status": "active"},
+    {"name": "Anita", "role": "Team", "status": "active"},
+    {"name": "Felix Tiedemann", "role": "Team / Bot-context", "status": "active"},
+    {"name": "Richard", "role": "Team / Inner circle", "status": "active"},
+    {"name": "Renée", "role": "Team / Inner circle", "status": "active"},
+    {"name": "Dieter", "role": "AI CTO (permanent mode)", "status": "active", "kind": "agent", "alias": "Didi"},
+    {"name": "Angel", "role": "AI Frontend / Pitch", "status": "active", "kind": "agent"},
+    {"name": "Frida", "role": "AI Listings / Postgres", "status": "active", "kind": "agent"},
+    {"name": "Otto", "role": "AI Backend / FDB", "status": "active", "kind": "agent"},
+    {"name": "Alfred", "role": "AI Auth / Master-Token / Audit", "status": "onboarding", "kind": "agent"},
+    {"name": "Sonni", "role": "AI Customer-Support (FDB-first)", "status": "onboarding", "kind": "agent"}
+  ],
+  "investors": [
+    {"name": "Hadar Cars", "fund": "Fairpoint Capital", "status": "first-meeting-2026-05-06-Stockholm", "kind": "investor"},
+    {"name": "Wachtmeister-circle (Richard intro)", "status": "10M-EUR-signal", "kind": "investor-prospect"}
+  ],
+  "products": [
+    {"sub_brand": "Listings", "url": "https://listing.blun.ai", "stand": "157.2M+ businesses, 133 countries, 60+ languages, target 1B"},
+    {"sub_brand": "Mailing (Send)", "url": "https://send.blun.ai", "stand": "live"},
+    {"sub_brand": "Shopping (Shop)", "url": "https://shop.blun.ai", "stand": "live, 1Place admin pending"},
+    {"sub_brand": "Code", "url": "https://blun.ai/code", "stand": "Phase 2, Codex-owned"},
+    {"sub_brand": "Wizard", "url": "https://blun.ai/dashboard/websites/new", "stand": "Dieter-owned"},
+    {"sub_brand": "Reach", "stand": "planned", "owner": "angel"},
+    {"sub_brand": "Funds", "stand": "planned", "owner": "angel"},
+    {"sub_brand": "Books (formerly Taskora)", "url": "https://taskora.at", "stand": "rename pending"}
+  ],
+  "pricing": {
+    "all_access": {"price_eur_month": 500, "name": "BLUN One", "scope": "all portals + AI"},
+    "single_listings_pro": {"price_eur_month": 19}
+  },
+  "infra": {
+    "hosting": "Hetzner only (no Google/AWS lock-in)",
+    "model_brand": "King / Queen / Prince / Imagine / Voice / Video — never expose Claude/GPT/Kimi/Haiku externally",
+    "ai_origin_externally": "KI aus Österreich",
+    "memory_layer": "Mnemo (INTERNAL — never mention in public pitch)"
+  },
+  "comms": {
+    "language_default": "de",
+    "tone": "direkt, menschlich, kein KI-Sprech in Group-Chat -1003927574737",
+    "no_emojis_in": ["app UI", "websites", "code", "pitch", "customer comms"],
+    "no_time_estimates": true,
+    "telegram_only_replies_to_mayk": true
+  },
+  "legal_contacts": {
+    "lawyer": {"name": "Dominik Ossada", "alias": "Dommi", "scope": "DE/AT contracts, term sheets, IP"}
+  }
+}
