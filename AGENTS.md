@@ -43,6 +43,18 @@ At the start of any non-trivial task, run this in order:
 - **`mem_add(kind, text, importance)`** for explicit memories you want to be sure stick: decisions, ratings, preferences. Set `importance: 7` or higher for things that should be embedded with high priority.
 - **`mem_link(from_id, to_id, kind)`** if this task references / corrects / resolves a previous memory row.
 - **`mem_recall_ids(query)`** when scanning a wide candidate set — returns just `[id, kind, score, snippet]` so you can filter cheap, then `mem_get(ids)` for the rows you actually want. Use this instead of `mem_recall` when token budget matters.
+
+### The 3-layer search pattern (use this; do not pull full rows by default)
+
+When you need to find prior work, do not jump to `mem_recall` — that returns full memory rows and burns tokens fast. Use the layered approach:
+
+1. **Identify** — `mem_recall_ids(query)` returns `[id, kind, score, snippet]` only. ~50–100 tokens for a typical 10-result page. You skim the snippets and decide which IDs are actually relevant.
+2. **Locate in time / context** — `mem_timeline` or `mem_neighbors(id)` if you need temporal or relational context around the candidates without yet pulling their bodies.
+3. **Fetch full** — `mem_get(ids)` for only the rows you actually need. ~500–1,000 tokens per row.
+
+Across a session this typically saves 5–10× the tokens vs. `mem_recall`-everything-and-skim. The same shape is a hard pattern in claude-mem (search → timeline → get_observations); we adopted it under our existing tool names.
+
+When something is project-scoped, prefer `mem_lens_view(project)` — one call, structured bundle, no per-tool fan-out.
 - **`mem_neighbors(id, depth)`** to walk the typed-edge graph outward from a known memory — "what does this scar resolve", "what corrects this decision", "the cluster around this belief". Pairs with `mem_link` (write) and `mem_recall_ids` (find seeds).
 
 ## End of day
