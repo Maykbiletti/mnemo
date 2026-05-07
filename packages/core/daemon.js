@@ -1417,6 +1417,94 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
       return { count: rows.length, projects: rows };
     }
+    case "mem_project_doc_render": {
+      if (!a.name) return { error: "name required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const reg = tdb.prepare("SELECT * FROM project_registry WHERE name=?").get(a.name);
+      const apr = (() => { try { return tdb.prepare("SELECT name, owner_agent, goal_text, status, current_milestone, blocker, last_active_at FROM agent_project WHERE name=?").get(a.name); } catch { return null; } })();
+      let factsTeam = null, factsLegal = null;
+      try {
+        const factsPath = path.join(__dirname, "facts", "blun.json");
+        if (fs.existsSync(factsPath)) {
+          const f = JSON.parse(fs.readFileSync(factsPath, "utf8"));
+          factsTeam = f.team; factsLegal = f.legal;
+        }
+      } catch {}
+      const recentDecisions = (() => { try { return tdb.prepare("SELECT title, decided_by, decided_at, summary FROM decision_log WHERE scope=? ORDER BY decided_at DESC LIMIT 10").all(a.name); } catch { return []; } })();
+      const recentBriefs = (() => { try { return tdb.prepare("SELECT id, agent_name, source_agent, substr(content,1,140) AS content, created_at FROM agent_brief WHERE content LIKE ? ORDER BY created_at DESC LIMIT 8").all('%' + a.name + '%'); } catch { return []; } })();
+      const claims = (() => { try { return tdb.prepare("SELECT file_path, agent_name, summary, expires_at FROM work_claim WHERE project=? AND status='active' ORDER BY claimed_at DESC").all(a.name); } catch { return []; } })();
+      const pad = (s, n) => String(s == null ? "" : s).padEnd(n);
+      const lines = [];
+      lines.push(`# ${a.name} — Project-Doc`);
+      lines.push("");
+      lines.push("> Auto-rendered by mem_project_doc_render. Source-of-truth lives in mnemo (project_registry + facts/blun.json + recent decisions). Edit facts not this file.");
+      lines.push("");
+      if (reg) {
+        lines.push("## Operations");
+        if (reg.domain) lines.push(`- **Domain:** ${reg.domain}`);
+        if (reg.live_url) lines.push(`- **Live:** ${reg.live_url} (status: ${reg.live_status || 'unknown'})`);
+        if (reg.staging_url) lines.push(`- **Staging:** ${reg.staging_url}`);
+        if (reg.repo) lines.push(`- **Repo:** ${reg.repo}`);
+        if (reg.server) lines.push(`- **Server:** ${reg.server}`);
+        if (reg.pm2_processes) try { const arr = JSON.parse(reg.pm2_processes); if (arr.length) lines.push(`- **PM2:** ${arr.join(", ")}`); } catch {}
+        if (reg.nginx_files) try { const arr = JSON.parse(reg.nginx_files); if (arr.length) lines.push(`- **Nginx:** ${arr.join(", ")}`); } catch {}
+        if (reg.admin_url) lines.push(`- **Admin:** ${reg.admin_url}`);
+        if (reg.auth_system) lines.push(`- **Auth:** ${reg.auth_system}`);
+        if (reg.stripe_account) lines.push(`- **Stripe:** ${reg.stripe_account}`);
+        if (reg.vat_status) lines.push(`- **VAT:** ${reg.vat_status}${reg.vat_id ? " (" + reg.vat_id + ")" : ""}`);
+        if (reg.langs) try { const arr = JSON.parse(reg.langs); if (arr.length) lines.push(`- **Langs:** ${arr.join(", ")}`); } catch {}
+        if (reg.last_deploy_at) lines.push(`- **Last deploy:** ${reg.last_deploy_at}`);
+      } else {
+        lines.push("## Operations");
+        lines.push("_No project_registry row yet. Create via mem_project_registry_upsert._");
+      }
+      lines.push("");
+      if (apr) {
+        lines.push("## Current state");
+        if (apr.owner_agent) lines.push(`- **Owner:** ${apr.owner_agent}`);
+        if (apr.goal_text) lines.push(`- **Goal:** ${apr.goal_text}`);
+        if (apr.current_milestone) lines.push(`- **Milestone:** ${apr.current_milestone}`);
+        if (apr.blocker) lines.push(`- **Blocker:** ${apr.blocker}`);
+        if (apr.status) lines.push(`- **Status:** ${apr.status}`);
+        lines.push("");
+      }
+      if (reg && reg.health_checklist) {
+        try {
+          const c = JSON.parse(reg.health_checklist);
+          const keys = Object.keys(c);
+          if (keys.length) {
+            lines.push("## Health gates");
+            for (const k of keys) lines.push(`- ${pad(k, 18)} ${c[k]}`);
+            lines.push("");
+          }
+        } catch {}
+      }
+      if (claims.length) {
+        lines.push("## Active work-claims");
+        for (const c of claims) lines.push(`- \`${c.file_path}\` — ${c.agent_name}${c.summary ? ` (${c.summary})` : ""} until ${c.expires_at}`);
+        lines.push("");
+      }
+      if (recentDecisions.length) {
+        lines.push("## Recent decisions");
+        for (const d of recentDecisions) lines.push(`- ${d.decided_at?.slice(0,10) || ""} **${d.title}** by ${d.decided_by || "?"}${d.summary ? " — " + String(d.summary).slice(0,160) : ""}`);
+        lines.push("");
+      }
+      if (recentBriefs.length) {
+        lines.push("## Recent briefs mentioning this project");
+        for (const b of recentBriefs) lines.push(`- #${b.id} ${b.created_at?.slice(0,10) || ""} ${b.source_agent || "?"} → ${b.agent_name}: ${(b.content || '').replace(/\s+/g,' ').slice(0,140)}`);
+        lines.push("");
+      }
+      if (factsLegal && (a.include_legal !== false)) {
+        lines.push("## Legal (from facts/blun.json)");
+        lines.push(`- Entity: ${factsLegal.entity_type || ""} — ${factsLegal.founder || ""}`);
+        if (factsLegal.address) lines.push(`- Address: ${factsLegal.address}`);
+        if (factsLegal.do_not_use) lines.push(`- Forbidden: ${(factsLegal.do_not_use || []).join(", ")}`);
+        lines.push("");
+      }
+      lines.push("---");
+      lines.push(`Rendered ${new Date().toISOString()} from mnemo project_registry + facts.`);
+      return { project: a.name, doc: lines.join("\n"), bytes: lines.join("\n").length };
+    }
     case "mem_project_live_check": {
       if (!a.name) return { error: "name required" };
       try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
