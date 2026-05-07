@@ -2606,6 +2606,33 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: rows.length, projects: rows };
     },
   },
+  mem_focus_set: {
+    description: "Set the agent's current focus (e.g. code | ops | pitch | support | chill | default). The focus narrows what auto-inject pulls into the next session. Slice rules live in facts/blun.json focus_modes — facts can be edited via mem_company_fact_set without code change.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, focus: { type: "string" }, reason: { type: "string" } }, required: ["agent_name","focus"] },
+    handler: ({ agent_name, focus, reason }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS agent_focus (agent_name TEXT PRIMARY KEY, focus TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), reason TEXT)"); } catch {}
+      db.prepare("INSERT INTO agent_focus (agent_name, focus, reason) VALUES (?,?,?) ON CONFLICT(agent_name) DO UPDATE SET focus=excluded.focus, reason=excluded.reason, set_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')").run(agent_name, focus, reason || null);
+      return { ok: true, agent_name, focus };
+    },
+  },
+  mem_focus_get: {
+    description: "Read the agent's current focus + the matching slice config from facts/blun.json focus_modes. Use at SessionStart so auto-inject knows which subset of context to pre-load.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" } }, required: ["agent_name"] },
+    handler: ({ agent_name }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS agent_focus (agent_name TEXT PRIMARY KEY, focus TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), reason TEXT)"); } catch {}
+      const row = db.prepare("SELECT focus, set_at, reason FROM agent_focus WHERE agent_name=?").get(agent_name);
+      const focus = row ? row.focus : "default";
+      let slice = null;
+      try {
+        const factsPath = path.join(__dirname, "facts", "blun.json");
+        if (fs.existsSync(factsPath)) {
+          const f = JSON.parse(fs.readFileSync(factsPath, "utf8"));
+          slice = (f.focus_modes && (f.focus_modes[focus] || f.focus_modes.default)) || null;
+        }
+      } catch {}
+      return { agent_name, focus, set_at: row ? row.set_at : null, reason: row ? row.reason : null, slice };
+    },
+  },
   mem_lens_view: {
     description: "Project-Lens: return a structured JSON bundle scoped to ONE project — registry row, agent_project state, owner agent_status, recent decisions (scope=project), active work_claims (project=), recent briefs mentioning the project, recent file_edits in that project tree. Use when a UI surface or agent wants 'all the live state for X' in one call instead of N. Different from mem_project_doc_render: this returns parsed JSON for programmatic use; the renderer returns Markdown for display.",
     inputSchema: { type: "object", properties: { project: { type: "string" }, limit: { type: "integer" } }, required: ["project"] },

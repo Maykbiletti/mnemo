@@ -59,5 +59,41 @@
     "language_default": "en",
     "tone": "direct, human, no AI-speak",
     "no_emojis_in": ["app UI", "websites", "code", "pitch", "customer comms"]
+  },
+  "focus_modes": {
+    "_purpose": "Per-focus slice rules consumed by mem_focus_get + the SessionStart auto-inject hook. The focus narrows what gets pre-loaded so the context window stays cheap when the agent is doing one specific kind of work.",
+    "default": {
+      "label": "Default — full firm-OS context",
+      "load": ["session_brief", "today_view", "pending_briefs", "open_promises"],
+      "tone": "direct, human"
+    },
+    "code": {
+      "label": "Code — building/refactoring",
+      "load": ["pending_briefs", "active_claims", "recent_decisions"],
+      "tone": "terse, technical",
+      "skip": ["wishes", "investor_facts"]
+    },
+    "ops": {
+      "label": "Ops — deploys + incidents",
+      "load": ["project_registry_summary", "open_promises", "watchdog_incidents", "today_view"],
+      "tone": "calm, checklist-driven"
+    },
+    "pitch": {
+      "label": "Pitch — investor-facing comm",
+      "load": ["legal", "brand", "team", "pricing", "products"],
+      "tone": "polished",
+      "gates": ["pre_action_check"]
+    },
+    "support": {
+      "label": "Support — customer reply",
+      "load": ["recent_briefs", "open_promises"],
+      "tone": "warm, formal-by-default",
+      "gates": ["permission_batch"]
+    },
+    "chill": {
+      "label": "Chill — light Mayk DM, no heavy lift",
+      "load": ["today_view"],
+      "tone": "casual"
+    }
   }
 }

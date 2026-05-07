@@ -1417,6 +1417,28 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
       return { count: rows.length, projects: rows };
     }
+    case "mem_focus_set": {
+      if (!a.agent_name || !a.focus) return { error: "agent_name + focus required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS agent_focus (agent_name TEXT PRIMARY KEY, focus TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), reason TEXT)"); } catch {}
+      tdb.prepare("INSERT INTO agent_focus (agent_name, focus, reason) VALUES (?,?,?) ON CONFLICT(agent_name) DO UPDATE SET focus=excluded.focus, reason=excluded.reason, set_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')").run(a.agent_name, a.focus, a.reason || null);
+      return { ok: true, agent_name: a.agent_name, focus: a.focus };
+    }
+    case "mem_focus_get": {
+      if (!a.agent_name) return { error: "agent_name required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS agent_focus (agent_name TEXT PRIMARY KEY, focus TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), reason TEXT)"); } catch {}
+      const row = tdb.prepare("SELECT focus, set_at, reason FROM agent_focus WHERE agent_name=?").get(a.agent_name);
+      const focus = row ? row.focus : "default";
+      // Resolve focus_modes section from facts/blun.json so caller gets the slice config inline.
+      let slice = null;
+      try {
+        const factsPath = path.join(__dirname, "facts", "blun.json");
+        if (fs.existsSync(factsPath)) {
+          const f = JSON.parse(fs.readFileSync(factsPath, "utf8"));
+          slice = (f.focus_modes && (f.focus_modes[focus] || f.focus_modes.default)) || null;
+        }
+      } catch {}
+      return { agent_name: a.agent_name, focus, set_at: row ? row.set_at : null, reason: row ? row.reason : null, slice };
+    }
     case "mem_lens_view": {
       if (!a.project) return { error: "project required" };
       const lim = Math.min(a.limit || 10, 50);
