@@ -1,0 +1,150 @@
+    case "mem_entity_upsert": {
+      if (!a.kind || !a.name) return { error: "kind + name required" };
+      const sc = a.scope || "blun";
+      const st = a.status || "active";
+      const meta_json = a.meta ? JSON.stringify(a.meta) : null;
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS entity (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'blun', owner_agent TEXT, status TEXT NOT NULL DEFAULT 'active', parent_id INTEGER, url TEXT, meta_json TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(kind, name, scope)); CREATE INDEX IF NOT EXISTS idx_entity_kind_status ON entity(kind, status); CREATE INDEX IF NOT EXISTS idx_entity_owner ON entity(owner_agent);`); } catch {}
+      const existing = tdb.prepare("SELECT id FROM entity WHERE kind=? AND name=? AND scope=?").get(a.kind, a.name, sc);
+      if (existing) {
+        tdb.prepare("UPDATE entity SET owner_agent=COALESCE(?, owner_agent), status=?, parent_id=COALESCE(?, parent_id), url=COALESCE(?, url), meta_json=COALESCE(?, meta_json), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(a.owner_agent || null, st, a.parent_id || null, a.url || null, meta_json, existing.id);
+        return { id: existing.id, kind: a.kind, name: a.name, scope: sc, action: "updated" };
+      }
+      const info = tdb.prepare("INSERT INTO entity (kind, name, scope, owner_agent, status, parent_id, url, meta_json) VALUES (?,?,?,?,?,?,?,?)").run(a.kind, a.name, sc, a.owner_agent || null, st, a.parent_id || null, a.url || null, meta_json);
+      return { id: info.lastInsertRowid, kind: a.kind, name: a.name, scope: sc, action: "created" };
+    }
+    case "mem_entity_get": {
+      let row;
+      if (a.id) row = tdb.prepare("SELECT * FROM entity WHERE id=?").get(a.id);
+      else if (a.kind && a.name) row = tdb.prepare("SELECT * FROM entity WHERE kind=? AND name=? AND scope=?").get(a.kind, a.name, a.scope || "blun");
+      else return { error: "id OR (kind+name) required" };
+      if (!row) return { error: "not found" };
+      if (row.meta_json) try { row.meta = JSON.parse(row.meta_json); } catch {}
+      return row;
+    }
+    case "mem_entity_list": {
+      const where = []; const params = [];
+      if (a.kind) { where.push("kind=?"); params.push(a.kind); }
+      if (a.owner_agent) { where.push("owner_agent=?"); params.push(a.owner_agent); }
+      if (a.status) { where.push("status=?"); params.push(a.status); }
+      if (a.scope) { where.push("scope=?"); params.push(a.scope); }
+      const w = where.length ? "WHERE " + where.join(" AND ") : "";
+      const lim = Math.min(a.limit || 100, 500);
+      const off = a.offset || 0;
+      const rows = tdb.prepare(`SELECT id, kind, name, scope, owner_agent, status, url, updated_at FROM entity ${w} ORDER BY updated_at DESC LIMIT ? OFFSET ?`).all(...params, lim, off);
+      return { count: rows.length, entities: rows };
+    }
+    case "mem_entity_link": {
+      if (!a.from_id || !a.to_id || !a.rel) return { error: "from_id + to_id + rel required" };
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS entity_link (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, rel TEXT NOT NULL, meta_json TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(from_id, to_id, rel));`); } catch {}
+      const info = tdb.prepare("INSERT OR IGNORE INTO entity_link (from_id, to_id, rel, meta_json) VALUES (?,?,?,?)").run(a.from_id, a.to_id, a.rel, a.meta ? JSON.stringify(a.meta) : null);
+      return { id: info.lastInsertRowid || null, from_id: a.from_id, to_id: a.to_id, rel: a.rel, action: info.changes ? "created" : "exists" };
+    }
+    case "mem_file_owner_set": {
+      if (!a.file_path) return { error: "file_path required" };
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS file_ownership (file_path TEXT PRIMARY KEY, host TEXT, primary_agent TEXT, secondary_agents TEXT, last_edit_agent TEXT, last_edit_at TEXT, last_commit_sha TEXT, project_entity_id INTEGER, meta_json TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));`); } catch {}
+      const now = new Date().toISOString();
+      const existing = tdb.prepare("SELECT * FROM file_ownership WHERE file_path=?").get(a.file_path);
+      let secondary = existing && existing.secondary_agents ? JSON.parse(existing.secondary_agents) : [];
+      if (a.add_secondary && !secondary.includes(a.add_secondary) && a.add_secondary !== (a.primary_agent || (existing && existing.primary_agent))) secondary.push(a.add_secondary);
+      if (existing) {
+        tdb.prepare("UPDATE file_ownership SET host=COALESCE(?, host), primary_agent=COALESCE(?, primary_agent), secondary_agents=?, last_edit_agent=COALESCE(?, last_edit_agent), last_edit_at=?, last_commit_sha=COALESCE(?, last_commit_sha), project_entity_id=COALESCE(?, project_entity_id), updated_at=? WHERE file_path=?").run(a.host || null, a.primary_agent || null, JSON.stringify(secondary), a.last_edit_agent || null, now, a.last_commit_sha || null, a.project_entity_id || null, now, a.file_path);
+        return { file_path: a.file_path, action: "updated" };
+      }
+      tdb.prepare("INSERT INTO file_ownership (file_path, host, primary_agent, secondary_agents, last_edit_agent, last_edit_at, last_commit_sha, project_entity_id) VALUES (?,?,?,?,?,?,?,?)").run(a.file_path, a.host || null, a.primary_agent || null, JSON.stringify(secondary), a.last_edit_agent || null, now, a.last_commit_sha || null, a.project_entity_id || null);
+      return { file_path: a.file_path, action: "created" };
+    }
+    case "mem_file_owner_get": {
+      if (a.file_path) {
+        const row = tdb.prepare("SELECT * FROM file_ownership WHERE file_path=?").get(a.file_path);
+        if (!row) return { error: "not found", file_path: a.file_path };
+        if (row.secondary_agents) try { row.secondary_agents = JSON.parse(row.secondary_agents); } catch {}
+        return row;
+      }
+      if (a.primary_agent) {
+        const rows = tdb.prepare("SELECT file_path, host, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE primary_agent=? ORDER BY last_edit_at DESC LIMIT ?").all(a.primary_agent, Math.min(a.limit || 100, 500));
+        return { count: rows.length, files: rows };
+      }
+      return { error: "file_path OR primary_agent required" };
+    }
+    case "mem_wish_capture": {
+      if (!a.captured_text) return { error: "captured_text required" };
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS wish_buffer (id INTEGER PRIMARY KEY AUTOINCREMENT, source_channel TEXT, source_chat_id TEXT, source_message_id TEXT, captured_text TEXT NOT NULL, captured_by_agent TEXT, captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), classification TEXT, status TEXT NOT NULL DEFAULT 'pending', reviewed_by TEXT, reviewed_at TEXT, decision_id INTEGER, meta_json TEXT); CREATE INDEX IF NOT EXISTS idx_wish_status ON wish_buffer(status, captured_at);`); } catch {}
+      const info = tdb.prepare("INSERT INTO wish_buffer (source_channel, source_chat_id, source_message_id, captured_text, captured_by_agent, classification, meta_json) VALUES (?,?,?,?,?,?,?)").run(a.source_channel || null, a.source_chat_id || null, a.source_message_id || null, a.captured_text, a.captured_by_agent || null, a.classification || "wish", a.meta ? JSON.stringify(a.meta) : null);
+      return { id: info.lastInsertRowid, classification: a.classification || "wish", status: "pending" };
+    }
+    case "mem_wish_list": {
+      const where = []; const params = [];
+      where.push("status=?"); params.push(a.status || "pending");
+      if (a.classification) { where.push("classification=?"); params.push(a.classification); }
+      if (a.since) { where.push("captured_at >= ?"); params.push(a.since); }
+      const lim = Math.min(a.limit || 100, 500);
+      const rows = tdb.prepare(`SELECT id, captured_text, classification, captured_by_agent, captured_at, status, source_channel FROM wish_buffer WHERE ${where.join(" AND ")} ORDER BY captured_at DESC LIMIT ?`).all(...params, lim);
+      return { count: rows.length, wishes: rows };
+    }
+    case "mem_wish_review": {
+      if (!a.id || !a.status) return { error: "id + status required" };
+      const info = tdb.prepare("UPDATE wish_buffer SET status=?, reviewed_by=?, reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), decision_id=COALESCE(?, decision_id) WHERE id=?").run(a.status, a.reviewed_by || null, a.decision_id || null, a.id);
+      return { id: a.id, status: a.status, updated: info.changes };
+    }
+    case "mem_decision_log": {
+      if (!a.title || !a.decided_by) return { error: "title + decided_by required" };
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS decision_log (id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL DEFAULT 'blun', title TEXT NOT NULL, body TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), agents_involved TEXT, files_affected TEXT, entities_affected TEXT, parent_decision_id INTEGER, status TEXT NOT NULL DEFAULT 'active', superseded_by INTEGER, meta_json TEXT); CREATE INDEX IF NOT EXISTS idx_decision_decided_at ON decision_log(decided_at);`); } catch {}
+      const info = tdb.prepare("INSERT INTO decision_log (scope, title, body, decided_by, agents_involved, files_affected, entities_affected, parent_decision_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?)").run(a.scope || "blun", a.title, a.body || null, a.decided_by, a.agents_involved ? JSON.stringify(a.agents_involved) : null, a.files_affected ? JSON.stringify(a.files_affected) : null, a.entities_affected ? JSON.stringify(a.entities_affected) : null, a.parent_decision_id || null, a.meta ? JSON.stringify(a.meta) : null);
+      return { id: info.lastInsertRowid, title: a.title, decided_by: a.decided_by, status: "active" };
+    }
+    case "mem_decision_get": {
+      if (a.id) {
+        const row = tdb.prepare("SELECT * FROM decision_log WHERE id=?").get(a.id);
+        if (!row) return { error: "not found" };
+        for (const k of ["agents_involved", "files_affected", "entities_affected", "meta_json"]) {
+          if (row[k]) try { row[k] = JSON.parse(row[k]); } catch {}
+        }
+        return row;
+      }
+      const where = []; const params = [];
+      if (a.scope) { where.push("scope=?"); params.push(a.scope); }
+      if (a.decided_by) { where.push("decided_by=?"); params.push(a.decided_by); }
+      if (a.status) { where.push("status=?"); params.push(a.status); }
+      if (a.since) { where.push("decided_at >= ?"); params.push(a.since); }
+      const w = where.length ? "WHERE " + where.join(" AND ") : "";
+      const lim = Math.min(a.limit || 50, 500);
+      const rows = tdb.prepare(`SELECT id, scope, title, decided_by, decided_at, status FROM decision_log ${w} ORDER BY decided_at DESC LIMIT ?`).all(...params, lim);
+      return { count: rows.length, decisions: rows };
+    }
+    case "mem_agent_status_set": {
+      if (!a.agent_name) return { error: "agent_name required" };
+      try { tdb.exec(`CREATE TABLE IF NOT EXISTS agent_status_live (agent_name TEXT PRIMARY KEY, current_task TEXT, current_brief_id INTEGER, blocked_on TEXT, dnd_until TEXT, last_heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), host TEXT, pid INTEGER, meta_json TEXT);`); } catch {}
+      const now = new Date().toISOString();
+      const existing = tdb.prepare("SELECT agent_name FROM agent_status_live WHERE agent_name=?").get(a.agent_name);
+      if (existing) {
+        tdb.prepare("UPDATE agent_status_live SET current_task=?, current_brief_id=COALESCE(?, current_brief_id), blocked_on=?, dnd_until=COALESCE(?, dnd_until), host=COALESCE(?, host), pid=COALESCE(?, pid), meta_json=COALESCE(?, meta_json), last_heartbeat_at=? WHERE agent_name=?").run(a.current_task === undefined ? null : a.current_task, a.current_brief_id || null, a.blocked_on || null, a.dnd_until || null, a.host || null, a.pid || null, a.meta ? JSON.stringify(a.meta) : null, now, a.agent_name);
+        return { agent_name: a.agent_name, action: "updated", last_heartbeat_at: now };
+      }
+      tdb.prepare("INSERT INTO agent_status_live (agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta_json, last_heartbeat_at) VALUES (?,?,?,?,?,?,?,?,?)").run(a.agent_name, a.current_task || null, a.current_brief_id || null, a.blocked_on || null, a.dnd_until || null, a.host || null, a.pid || null, a.meta ? JSON.stringify(a.meta) : null, now);
+      return { agent_name: a.agent_name, action: "created", last_heartbeat_at: now };
+    }
+    case "mem_agent_status_get": {
+      if (a.agent_name) {
+        const row = tdb.prepare("SELECT * FROM agent_status_live WHERE agent_name=?").get(a.agent_name);
+        if (!row) return { error: "not found", agent_name: a.agent_name };
+        const now = Date.now();
+        row.dnd_active = row.dnd_until ? Date.parse(row.dnd_until) > now : false;
+        return row;
+      }
+      const rows = tdb.prepare("SELECT * FROM agent_status_live ORDER BY last_heartbeat_at DESC").all();
+      const now = Date.now();
+      for (const r of rows) r.dnd_active = r.dnd_until ? Date.parse(r.dnd_until) > now : false;
+      return { count: rows.length, agents: rows };
+    }
+    case "mem_today_view": {
+      const d = a.date || new Date().toISOString().slice(0, 10);
+      const start = d + "T00:00:00.000Z";
+      const end = d + "T23:59:59.999Z";
+      const aname = a.agent_name || null;
+      const actions = tdb.prepare(`SELECT id, agent_name, action_kind, target, status, started_at FROM agent_action WHERE started_at BETWEEN ? AND ? ${aname ? "AND agent_name=?" : ""} ORDER BY started_at DESC LIMIT 200`).all(start, end, ...(aname ? [aname] : []));
+      const briefs = tdb.prepare(`SELECT id, agent_name, source_agent, status, created_at FROM agent_brief WHERE created_at BETWEEN ? AND ? ${aname ? "AND (agent_name=? OR source_agent=?)" : ""} ORDER BY created_at DESC LIMIT 100`).all(start, end, ...(aname ? [aname, aname] : []));
+      let decisions = []; try { decisions = tdb.prepare("SELECT id, title, decided_by, decided_at, scope, status FROM decision_log WHERE decided_at BETWEEN ? AND ? ORDER BY decided_at DESC LIMIT 50").all(start, end); } catch {}
+      let file_edits = []; try { file_edits = tdb.prepare(`SELECT file_path, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE last_edit_at BETWEEN ? AND ? ${aname ? "AND last_edit_agent=?" : ""} ORDER BY last_edit_at DESC LIMIT 200`).all(start, end, ...(aname ? [aname] : [])); } catch {}
+      let wishes = []; try { wishes = tdb.prepare("SELECT id, captured_text, classification, captured_by_agent, status FROM wish_buffer WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at DESC LIMIT 50").all(start, end); } catch {}
+      return { date: d, agent_name: aname, actions: { count: actions.length, items: actions }, briefs: { count: briefs.length, items: briefs }, decisions: { count: decisions.length, items: decisions }, file_edits: { count: file_edits.length, items: file_edits }, wishes: { count: wishes.length, items: wishes } };
+    }
