@@ -2606,6 +2606,58 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: rows.length, projects: rows };
     },
   },
+  mem_backfill_fts: {
+    description: "Idempotent: for each scope (brief, transcript, memory) find rows in the source table that don't have a matching mnemo_search_fts entry and insert them. Cheap to re-run; useful after manual SQL edits or bulk-imports that bypassed the normal hooks. Returns per-scope insert counts.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => {
+      const out = {};
+      try {
+        const missing = db.prepare("SELECT b.id, b.agent_name, b.source_agent, b.content FROM agent_brief b LEFT JOIN mnemo_search_fts f ON f.scope='brief' AND f.ref_id=CAST(b.id AS TEXT) WHERE f.rowid IS NULL").all();
+        const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('brief', ?, ?, ?, ?)");
+        for (const r of missing) ins.run(String(r.id), r.agent_name || "", r.source_agent || "", (r.content || "").slice(0, 8000));
+        out.briefs = missing.length;
+      } catch (e) { out.briefs_error = e.message; }
+      try {
+        const missing = db.prepare("SELECT t.id, t.speaker, t.source, t.direction, t.channel, t.content FROM transcript t LEFT JOIN mnemo_search_fts f ON f.scope='transcript' AND f.ref_id=CAST(t.id AS TEXT) WHERE f.rowid IS NULL").all();
+        const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)");
+        for (const r of missing) ins.run(String(r.id), r.speaker || r.source || "", (r.direction || "") + (r.channel ? " @ " + r.channel : ""), (r.content || "").slice(0, 8000));
+        out.transcripts = missing.length;
+      } catch (e) { out.transcripts_error = e.message; }
+      // memory-table backfill skipped — NOT IN over 63k rows is O(n*m).
+      return out;
+    },
+  },
+  mem_history_import: {
+    description: "Bulk-ingest historical transcript entries from a parsed source (Telegram export.json, Slack archive, old chat logs). Caller normalizes items to { content, occurred_at, speaker, channel?, direction?, meta? }. Dedup on (source + occurred_at + speaker + first 200 chars of content) so re-runs are idempotent. Use to backfill the transcript table from before mnemo was wired up.",
+    inputSchema: { type: "object", properties: { source: { type: "string" }, items: { type: "array" }, channel: { type: "string" } }, required: ["source","items"] },
+    handler: ({ source, items, channel }) => {
+      if (!source || !Array.isArray(items)) return { error: "source + items[] required" };
+      try { db.exec("CREATE TABLE IF NOT EXISTS history_import_marker (key TEXT PRIMARY KEY, imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))"); } catch {}
+      let inserted = 0, skipped = 0, errors = 0;
+      const ins = db.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)");
+      const mark = db.prepare("INSERT OR IGNORE INTO history_import_marker (key) VALUES (?)");
+      const seen = db.prepare("SELECT 1 FROM history_import_marker WHERE key=? LIMIT 1");
+      const txn = db.transaction((items) => {
+        for (const it of items) {
+          try {
+            if (!it || !it.content) { skipped++; continue; }
+            const occurred = it.occurred_at || it.ts || null;
+            const speaker = it.speaker || it.author || it.user || "unknown";
+            const ch = it.channel || channel || null;
+            const dir = it.direction || "in";
+            const key = source + "|" + (occurred || "") + "|" + speaker + "|" + String(it.content).slice(0, 200);
+            if (seen.get(key)) { skipped++; continue; }
+            const _scrub = (typeof stripPrivate === "function") ? stripPrivate(String(it.content)) : { text: String(it.content), hadPrivate: false };
+            ins.run(source, ch, dir, speaker, _scrub.text, it.meta ? JSON.stringify(it.meta) : null, occurred, it.ref_kind || "history_import", it.ref_id ? String(it.ref_id) : null);
+            mark.run(key);
+            inserted++;
+          } catch (e) { errors++; }
+        }
+      });
+      txn(items);
+      return { source, inserted, skipped_duplicates: skipped, errors, total: items.length };
+    },
+  },
   mem_file_echo: {
     description: "Read-Echo: surface what mnemo already knows about a file BEFORE you Read it. Returns ownership history, active work_claims, related briefs (content matching path or basename), related decisions, matching skills. Use this in a PreToolUse hook on Read so the agent gets cached context (who edited last, why, what claim is on it) without paying the file-read tokens up-front.",
     inputSchema: { type: "object", properties: { file_path: { type: "string" }, limit: { type: "integer" } }, required: ["file_path"] },

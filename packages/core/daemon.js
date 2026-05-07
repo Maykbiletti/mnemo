@@ -180,6 +180,23 @@ try {
       if (tranRows.length) console.log("[migrate] FTS5 backfilled with " + tranRows.length + " transcripts");
     }
   } catch (e) { console.error("[migrate-transcript-fts-backfill]", e.message); }
+  // Phase-3 #4 Auto-Backfill: incremental FTS catch-up. Runs on every daemon
+  // start, idempotent. Catches rows inserted via raw SQL or imports that
+  // bypassed the normal hooks.
+  try {
+    const briefMissing = db.prepare("SELECT b.id, b.agent_name, b.source_agent, b.content FROM agent_brief b LEFT JOIN mnemo_search_fts f ON f.scope='brief' AND f.ref_id=CAST(b.id AS TEXT) WHERE f.rowid IS NULL").all();
+    if (briefMissing.length) {
+      const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('brief', ?, ?, ?, ?)");
+      for (const r of briefMissing) ins.run(String(r.id), r.agent_name || "", r.source_agent || "", (r.content || "").slice(0, 8000));
+      console.log("[migrate] auto-backfill brought " + briefMissing.length + " briefs into FTS");
+    }
+    const transcriptMissing = db.prepare("SELECT t.id, t.speaker, t.source, t.direction, t.channel, t.content FROM transcript t LEFT JOIN mnemo_search_fts f ON f.scope='transcript' AND f.ref_id=CAST(t.id AS TEXT) WHERE f.rowid IS NULL").all();
+    if (transcriptMissing.length) {
+      const ins = db.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)");
+      for (const r of transcriptMissing) ins.run(String(r.id), r.speaker || r.source || "", (r.direction || "") + (r.channel ? " @ " + r.channel : ""), (r.content || "").slice(0, 8000));
+      console.log("[migrate] auto-backfill brought " + transcriptMissing.length + " transcripts into FTS");
+    }
+  } catch (e) { console.error("[migrate-auto-backfill]", e.message); }
   // Brief templates
   db.exec("CREATE TABLE IF NOT EXISTS brief_template (name TEXT PRIMARY KEY, body_template TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
   // Seed default templates if empty
@@ -1631,6 +1648,58 @@ function handleTool(tdb, name, a) {
       params.push(Math.min(a.limit || 50, 200));
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
       return { count: rows.length, projects: rows };
+    }
+    case "mem_backfill_fts": {
+      // Idempotent: for each scope, find source rows that don't have a matching
+      // mnemo_search_fts entry and insert them. Cheap to re-run; the daemon
+      // also runs this at startup. Returns counts per scope.
+      const out = {};
+      try {
+        const missing = tdb.prepare("SELECT b.id, b.agent_name, b.source_agent, b.content FROM agent_brief b LEFT JOIN mnemo_search_fts f ON f.scope='brief' AND f.ref_id=CAST(b.id AS TEXT) WHERE f.rowid IS NULL").all();
+        const ins = tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('brief', ?, ?, ?, ?)");
+        for (const r of missing) ins.run(String(r.id), r.agent_name || "", r.source_agent || "", (r.content || "").slice(0, 8000));
+        out.briefs = missing.length;
+      } catch (e) { out.briefs_error = e.message; }
+      try {
+        const missing = tdb.prepare("SELECT t.id, t.speaker, t.source, t.direction, t.channel, t.content FROM transcript t LEFT JOIN mnemo_search_fts f ON f.scope='transcript' AND f.ref_id=CAST(t.id AS TEXT) WHERE f.rowid IS NULL").all();
+        const ins = tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)");
+        for (const r of missing) ins.run(String(r.id), r.speaker || r.source || "", (r.direction || "") + (r.channel ? " @ " + r.channel : ""), (r.content || "").slice(0, 8000));
+        out.transcripts = missing.length;
+      } catch (e) { out.transcripts_error = e.message; }
+      // memory-table backfill skipped here — NOT IN over 63k rows is O(n*m).
+      // If needed, use LEFT JOIN with paginated batches; left as future work.
+      return out;
+    }
+    case "mem_history_import": {
+      // Bulk-ingest historical transcript entries (Telegram exports, Slack
+      // exports, old chat logs) into the transcript table. Caller is
+      // responsible for parsing the source format into normalized items.
+      // Dedup on (source + occurred_at + speaker + first 200 chars of content).
+      if (!a.source || !Array.isArray(a.items)) return { error: "source + items[] required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS history_import_marker (key TEXT PRIMARY KEY, imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))"); } catch {}
+      let inserted = 0, skipped = 0, errors = 0;
+      const ins = tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)");
+      const mark = tdb.prepare("INSERT OR IGNORE INTO history_import_marker (key) VALUES (?)");
+      const seen = tdb.prepare("SELECT 1 FROM history_import_marker WHERE key=? LIMIT 1");
+      const txn = tdb.transaction((items) => {
+        for (const it of items) {
+          try {
+            if (!it || !it.content) { skipped++; continue; }
+            const occurred = it.occurred_at || it.ts || null;
+            const speaker = it.speaker || it.author || it.user || "unknown";
+            const ch = it.channel || a.channel || null;
+            const dir = it.direction || "in";
+            const key = a.source + "|" + (occurred || "") + "|" + speaker + "|" + String(it.content).slice(0, 200);
+            if (seen.get(key)) { skipped++; continue; }
+            const _scrub = stripPrivate(String(it.content));
+            ins.run(a.source, ch, dir, speaker, _scrub.text, it.meta ? JSON.stringify(it.meta) : null, occurred, it.ref_kind || "history_import", it.ref_id ? String(it.ref_id) : null);
+            mark.run(key);
+            inserted++;
+          } catch (e) { errors++; }
+        }
+      });
+      txn(a.items);
+      return { source: a.source, inserted, skipped_duplicates: skipped, errors, total: a.items.length };
     }
     case "mem_file_echo": {
       if (!a.file_path) return { error: "file_path required" };
