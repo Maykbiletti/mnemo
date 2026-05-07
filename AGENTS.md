@@ -102,3 +102,50 @@ day_end:
 ```
 
 Mnemo is here so you can be a real assistant across sessions, not a goldfish in each one. Use it.
+
+---
+
+## firm_os Phase 1 (added 2026-05-07)
+
+On top of the recall/skill layer, Mnemo now hosts a structured **firm-OS** layer so a multi-agent team can share a single source of truth about who owns what, what files belong to which project, and what wishes the user has dropped that aren't tasks yet.
+
+### Three rules
+
+1. **Before external action** (cold-email, pitch deploy, public copy, footer/legal text), call `mem_pre_action_check` and resolve canonical facts via `mem_company_fact_get` against `packages/core/facts/blun.json`. Don't pull team/legal/pricing from your own memory or general training.
+2. **After every file edit** (Edit / Write / MultiEdit), the harness PostToolUse hook calls `mem_file_owner_set` so file → owning agent + project + entity is tracked. If you bypass the hook (server-side patches over SSH), call `mem_file_owner_set` manually.
+3. **Wishes ≠ tasks.** When the owner drops a non-imperative comment ("wäre cool wenn…"), the prompt-capture hook lands it in `wish_buffer`. Don't auto-execute. Surface during planning via `mem_wish_list`.
+
+### Tool cheat-sheet
+
+| Tool | Use for |
+|------|---------|
+| `mem_entity_upsert` / `mem_entity_get` / `mem_entity_list` | People, projects, products, sub-brands, external orgs |
+| `mem_entity_link` | Typed edges between entities (works_on, reports_to, owns, depends_on) |
+| `mem_file_owner_set` / `mem_file_owner_get` | File ↔ owning agent + project mapping |
+| `mem_wish_capture` / `mem_wish_list` / `mem_wish_review` | Drop-in/triage for owner's casual remarks |
+| `mem_decision_log` / `mem_decision_get` | Autonomous decisions worth surfacing later |
+| `mem_agent_status_set` / `mem_agent_status_get` | Live presence — what each agent is doing right now |
+| `mem_today_view` | Roll-up of today's decisions + open wishes + agent statuses |
+| `mem_company_fact_get` | Canonical company facts (team, legal, brand, pricing, infra) |
+| `mem_pre_action_check` | Gate before publishing external content |
+
+All tools are exposed twice: locally via the MCP plugin (in-process SQLite) and over the Hub (`https://listing.blun.ai/mnemo/tool/<name>`). Sub-agents on remote PCs use the Hub. Local Claude on Mayk's PC uses MCP. **Don't drop agent briefs into the local plugin — Alfred et al. read the Hub.**
+
+### Where things live
+
+- `packages/core/mcp.js` — MCP server, primary tool implementations
+- `packages/core/daemon.js` — Hub HTTP daemon, mirror tool implementations
+- `packages/core/facts/blun.json` — canonical company facts (committed; PR-reviewed)
+- `MEMORY.md` — index pointing to memory files, never holds memory itself
+
+### Agents
+
+| Agent | Role | Owns |
+|-------|------|------|
+| Dieter | CTO, deploy + merge | `packages/core/*`, prod servers, settings.json hooks |
+| Angel | UI / front-of-house | dashboard pages, mission-control, listing.blun.ai SSR |
+| Otto | Backend Codex | listing-company API, scrapers, FDB ingest |
+| Frida | Frontend Codex | listing-company SPA, sub-portal pages |
+| Alfred | Mailing/coordination | send.blun.ai, postal, brief-fanout |
+
+Don't write to a file owned by another agent without coordinating via Hub channel-post or a brief.

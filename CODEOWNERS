@@ -1,0 +1,30 @@
+# CODEOWNERS — who must review what in the Mnemo repo.
+# Format: <path-glob> <@owner1> <@owner2>
+# Owner handles map to humans + agents. For agent-owned paths, the agent's
+# operator (Mayk for Dieter/Angel; Codex CLI runners for Otto/Frida) is the
+# de-facto reviewer until we wire per-agent GitHub identities.
+
+# Default — everything needs Dieter eyes.
+*                                       @maykbiletti
+
+# Core engine + schema — Dieter only.
+/packages/core/mcp.js                   @maykbiletti
+/packages/core/daemon.js                @maykbiletti
+/packages/core/schema.sql               @maykbiletti
+/packages/core/identity_schema.sql      @maykbiletti
+
+# Canonical facts — Dieter + Mayk must both sign off.
+# These drive every external-facing brand/legal/pricing claim.
+/packages/core/facts/                   @maykbiletti
+/packages/core/facts/blun.json          @maykbiletti
+
+# Channel adapters — owned by whoever ships the channel.
+/packages/core/channels/                @maykbiletti
+
+# Hooks (client-side harness behavior) — Dieter.
+/.claude/                               @maykbiletti
+
+# CI + repo policy — Dieter, no auto-merge.
+/.github/                               @maykbiletti
+/CODEOWNERS                             @maykbiletti
+/AGENTS.md                              @maykbiletti
