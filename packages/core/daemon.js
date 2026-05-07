@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Mnemo Daemon — always-on PM2 service that:
- *   1. Polls Telegram Bot API directly (independent of Claude Code hooks)
+ *   1. Polls Telegram Bot API directly (independent of editor hooks)
  *   2. Exposes HTTP /ingest endpoint so any agent on any server can POST events
  *   3. Runs daily reflection cycle at 23:00 local
  *   4. Health-check every 5 min — updates writer_health table
@@ -415,27 +415,127 @@ const server = http.createServer((req, res) => {
     }
   }
   if (req.method === "POST" && url.pathname === "/memory-tool") {
-    // Anthropic memory_20250818 adapter — accepts the same input shape as the
-    // built-in client memory tool and exposes a virtual /memories/ filesystem
-    // backed by mnemo. Read-only for now; write commands return a guarded
-    // error so callers know to fall through to mem_add / mem_brief_drop / etc.
+    // Mnemo Memory Frontdoor: a small virtual /memories filesystem mapped onto
+    // the same Firm-OS tables used by the MCP/HTTP tools. It is intentionally
+    // not a second memory store; reads render Mnemo state, writes call Mnemo
+    // tools so every change stays auditable and queryable.
     let body = "";
     req.on("data", c => body += c);
     req.on("end", () => {
       let a = {};
       try { a = body ? JSON.parse(body) : {}; } catch { a = {}; }
-      const cmd = a.command || "view";
+      const cmd = String(a.command || "view").toLowerCase();
       const p = String(a.path || a.old_path || "/memories").replace(/\/+$/, "") || "/memories";
-      const ok = (text) => sendJson(req, res, 200, { content: text });
+      const agent = a.agent || a.agent_name || "dieter";
+      const ok = (text, meta) => sendJson(req, res, 200, Object.assign({ content: text }, meta || {}));
+      const okJson = (obj) => sendJson(req, res, 200, obj);
       const err = (msg) => sendJson(req, res, 200, { error: msg });
+      const parseContent = () => {
+        if (a.content !== undefined) {
+          if (typeof a.content === "object" && a.content !== null) return a.content;
+          const raw = String(a.content || "").trim();
+          if (!raw) return {};
+          try { return JSON.parse(raw); } catch {}
+          const out = { body: raw };
+          for (const line of raw.split(/\r?\n/)) {
+            const m = line.match(/^\s*([A-Za-z0-9_.-]+)\s*:\s*(.+?)\s*$/);
+            if (m) out[m[1]] = m[2];
+          }
+          return out;
+        }
+        return {};
+      };
+      const projectNameFrom = (match) => decodeURIComponent(match[1]).replace(/_/g, " ");
+      const renderJson = (obj) => "```json\n" + JSON.stringify(obj || {}, null, 2) + "\n```";
       if (!p.startsWith("/memories")) return err("path must start with /memories");
-      if (cmd !== "view") return err("memory adapter is read-only — use mnemo MCP tools (mem_add, mem_brief_drop, mem_company_fact_set) for writes");
       try {
+        if (["create", "update", "write", "append"].includes(cmd)) {
+          const content = parseContent();
+          if (p === "/memories/focus.md") {
+            const focus = content.focus || content.mode || String(content.body || "").trim();
+            if (!focus) return err("focus required");
+            return okJson(handleTool(tdb, "mem_focus_set", { agent_name: content.agent_name || agent, focus, reason: content.reason || null }));
+          }
+          const regMatch = p.match(/^\/memories\/projects\/(.+)\/registry\.md$/);
+          if (regMatch) {
+            const name = projectNameFrom(regMatch);
+            return okJson(handleTool(tdb, "mem_project_registry_upsert", Object.assign({}, content, { name, updated_by: content.updated_by || agent })));
+          }
+          const liveMatch = p.match(/^\/memories\/projects\/(.+)\/live-check\.md$/);
+          if (liveMatch) {
+            const name = projectNameFrom(liveMatch);
+            const checklist = content.health_checklist || content.checklist || content;
+            const up = handleTool(tdb, "mem_project_registry_upsert", { name, health_checklist: checklist, updated_by: agent });
+            const check = handleTool(tdb, "mem_project_live_check", { name, agent_name: agent, required_gates: content.required_gates });
+            return okJson({ ok: !up.error, project: name, update: up, live_check: check });
+          }
+          const decisionMatch = p.match(/^\/memories\/projects\/(.+)\/decisions\.md$/);
+          if (decisionMatch) {
+            const project = projectNameFrom(decisionMatch);
+            const body = content.body || "";
+            const title = content.title || String(body).split(/\r?\n/).find(Boolean) || "Project decision";
+            return okJson(handleTool(tdb, "mem_decision_log", {
+              title,
+              body,
+              decided_by: content.decided_by || agent,
+              scope: content.scope || project,
+              agents_involved: content.agents_involved,
+              files_affected: content.files_affected,
+              meta: Object.assign({}, content.meta || {}, { source: "memory-frontdoor" })
+            }));
+          }
+          const statusMatch = p.match(/^\/memories\/agents\/(.+)\/status\.md$/);
+          if (statusMatch) {
+            const target = projectNameFrom(statusMatch);
+            return okJson(handleTool(tdb, "mem_agent_status_set", Object.assign({}, content, { agent_name: target })));
+          }
+          const handoffMatch = p.match(/^\/memories\/agents\/(.+)\/handoff\.md$/);
+          if (handoffMatch) {
+            const sourceAgent = projectNameFrom(handoffMatch);
+            const handoff = content.body || JSON.stringify(content, null, 2);
+            const log = handleTool(tdb, "mem_transcript_log", {
+              source: "memory-frontdoor",
+              channel: "handoff",
+              direction: "outbound",
+              speaker: sourceAgent,
+              content: handoff,
+              ref_kind: "agent_handoff",
+              meta: { path: p }
+            });
+            return okJson({ ok: !log.error, handoff_id: log.id, agent_name: sourceAgent });
+          }
+          return err("write path not mapped: " + p);
+        }
+        if (["delete", "remove"].includes(cmd)) {
+          return err("delete is protected; mark items superseded/released through the mapped Mnemo tools");
+        }
+        if (cmd !== "view" && cmd !== "read" && cmd !== "list") return err("unknown command: " + cmd);
         if (p === "/memories" || p === "/memories/") {
-          const lines = ["/memories", "  today.md", "  inbox.md", "  identity.md", "  focus.md", "  promises.md", "  decisions/today.md", "  projects/"];
+          const lines = [
+            "/memories",
+            "  today.md",
+            "  inbox.md",
+            "  identity.md",
+            "  focus.md",
+            "  promises.md",
+            "  company/",
+            "    brand.md",
+            "    legal.md",
+            "    pricing.md",
+            "  decisions/",
+            "    today.md",
+            "  agents/",
+            "    <agent>/status.md",
+            "    <agent>/handoff.md",
+            "  projects/",
+            "    <project>/registry.md",
+            "    <project>/live-check.md",
+            "    <project>/decisions.md",
+            "    <project>/files.md"
+          ];
           try {
             const projs = tdb.prepare("SELECT name FROM project_registry ORDER BY name").all();
-            for (const r of projs) lines.push("  projects/" + r.name.replace(/\s+/g,'_') + ".md");
+            for (const r of projs) lines.push("  projects/" + r.name.replace(/\s+/g,'_') + "/");
           } catch {}
           return ok(lines.join("\n"));
         }
@@ -454,8 +554,13 @@ const server = http.createServer((req, res) => {
           return ok(JSON.stringify(r.identity || {}, null, 2));
         }
         if (p === "/memories/focus.md") {
-          const r = handleTool(tdb, "mem_focus_get", { agent_name: a.agent || "dieter" });
+          const r = handleTool(tdb, "mem_focus_get", { agent_name: agent });
           return ok(`# Focus\n\nCurrent: ${r.focus}\nSet at: ${r.set_at || 'never'}\nReason: ${r.reason || '-'}\n\n## Slice\n${JSON.stringify(r.slice, null, 2)}`);
+        }
+        if (p === "/memories/company/brand.md" || p === "/memories/company/legal.md" || p === "/memories/company/pricing.md") {
+          const topic = p.split("/").pop().replace(".md", "");
+          const r = handleTool(tdb, "mem_company_fact_get", { scope: a.scope || "blun", topic });
+          return ok(`# ${topic}\n\n` + renderJson(r.value || r));
         }
         if (p === "/memories/promises.md") {
           const r = handleTool(tdb, "mem_promise_open", { limit: 30 });
@@ -465,18 +570,61 @@ const server = http.createServer((req, res) => {
         if (p === "/memories/decisions/today.md") {
           const t = handleTool(tdb, "mem_today_view", {});
           const items = t.decisions?.items || [];
-          return ok("# Decisions today\n\n" + items.map(d => `- ${d.title} — ${d.decided_by} @ ${d.decided_at}`).join("\n"));
+          return ok("# Decisions today\n\n" + items.map(d => `- ${d.title} - ${d.decided_by} @ ${d.decided_at}`).join("\n"));
         }
-        const projMatch = p.match(/^\/memories\/projects\/(.+)\.md$/);
+        const projectRoot = p.match(/^\/memories\/projects\/([^/]+)$/);
+        if (projectRoot) {
+          const name = projectNameFrom(projectRoot);
+          return ok([`/memories/projects/${projectRoot[1]}`, "  registry.md", "  live-check.md", "  decisions.md", "  files.md", "  doc.md"].join("\n"), { project: name });
+        }
+        const regView = p.match(/^\/memories\/projects\/(.+)\/registry\.md$/);
+        if (regView) {
+          const name = projectNameFrom(regView);
+          const r = handleTool(tdb, "mem_project_registry_get", { name });
+          if (r.error) return err(r.error);
+          return ok(`# ${name} registry\n\n` + renderJson(r));
+        }
+        const liveView = p.match(/^\/memories\/projects\/(.+)\/live-check\.md$/);
+        if (liveView) {
+          const name = projectNameFrom(liveView);
+          const r = handleTool(tdb, "mem_project_live_check", { name, agent_name: agent, required_gates: a.required_gates });
+          return ok(`# ${name} live-check\n\nStatus: ${r.status}\n\n` + renderJson(r));
+        }
+        const decisionsView = p.match(/^\/memories\/projects\/(.+)\/decisions\.md$/);
+        if (decisionsView) {
+          const name = projectNameFrom(decisionsView);
+          const r = handleTool(tdb, "mem_decision_get", { scope: name, limit: a.limit || 30 });
+          return ok(`# ${name} decisions\n\n` + ((r.decisions || []).map(d => `- #${d.id} ${d.title} (${d.decided_by}, ${d.decided_at})`).join("\n") || "No decisions."));
+        }
+        const filesView = p.match(/^\/memories\/projects\/(.+)\/files\.md$/);
+        if (filesView) {
+          const name = projectNameFrom(filesView);
+          const lens = handleTool(tdb, "mem_lens_view", { project: name, limit: a.limit || 20 });
+          return ok(`# ${name} files\n\n## Active claims\n` + ((lens.active_claims?.items || []).map(c => `- #${c.id} ${c.file_path} - ${c.agent_name}: ${c.summary || ""}`).join("\n") || "None.") + "\n\n## Recent edits\n" + ((lens.recent_file_edits?.items || []).map(f => `- ${f.file_path} - ${f.last_edit_agent || "?"} @ ${f.last_edit_at || "?"}`).join("\n") || "None."));
+        }
+        const projectDoc = p.match(/^\/memories\/projects\/(.+)\/doc\.md$/);
+        if (projectDoc) {
+          const name = projectNameFrom(projectDoc);
+          const r = handleTool(tdb, "mem_project_doc_render", { name, include_legal: a.include_legal });
+          if (r.error) return err(r.error);
+          return ok(r.doc);
+        }
+        const statusView = p.match(/^\/memories\/agents\/(.+)\/status\.md$/);
+        if (statusView) {
+          const target = projectNameFrom(statusView);
+          const r = handleTool(tdb, "mem_agent_status_get", { agent_name: target });
+          return ok(`# ${target} status\n\n` + renderJson(r));
+        }
+        const projMatch = p.match(/^\/memories\/projects\/([^/]+)\.md$/);
         if (projMatch) {
-          const name = projMatch[1].replace(/_/g, ' ');
+          const name = projectNameFrom(projMatch);
           const r = handleTool(tdb, "mem_project_doc_render", { name });
           if (r.error) return err(r.error);
           return ok(r.doc);
         }
         return err("path not mapped: " + p);
       } catch (e) {
-        return err("adapter error: " + e.message);
+        return err("memory frontdoor error: " + e.message);
       }
     });
     return;
@@ -2406,7 +2554,7 @@ setInterval(() => { idleLoopCycle().catch(() => {}); }, 60 * 1000);
 // Every HUB_SYNC_INTERVAL_SEC the daemon pulls briefs from the cross-host
 // hub at HUB_URL for each LOCAL_AGENT and mirrors them into the local
 // agent_brief table. This lets agents on this PC see cross-machine briefs
-// even when no Claude session is open.
+// even when no local agent session is open.
 //
 // Disable: MNEMO_HUB_URL="" or MNEMO_HUB_SYNC=off.
 // ============================================================

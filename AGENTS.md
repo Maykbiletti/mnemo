@@ -1,6 +1,6 @@
 # AGENTS.md — Orientation for AI agents installing Mnemo
 
-> If you are an AI agent (Claude Code, Cursor, Cline, GPT-based, etc.) and your owner just installed Mnemo for you to use, **read this first**. It tells you what Mnemo is, how to use it, and what to do at the start of every new conversation so you stop forgetting things between sessions.
+> If you are an AI agent and your owner just installed Mnemo for you to use, **read this first**. It tells you what Mnemo is, how to use it, and what to do at the start of every new conversation so you stop forgetting things between sessions.
 
 ## What Mnemo is for you
 
@@ -52,7 +52,7 @@ When you need to find prior work, do not jump to `mem_recall` — that returns f
 2. **Locate in time / context** — `mem_timeline` or `mem_neighbors(id)` if you need temporal or relational context around the candidates without yet pulling their bodies.
 3. **Fetch full** — `mem_get(ids)` for only the rows you actually need. ~500–1,000 tokens per row.
 
-Across a session this typically saves 5–10× the tokens vs. `mem_recall`-everything-and-skim. The same shape is a hard pattern in claude-mem (search → timeline → get_observations); we adopted it under our existing tool names.
+Across a session this typically saves 5–10× the tokens vs. `mem_recall`-everything-and-skim. The rule is simple: search small, inspect context, then fetch only the rows you need.
 
 When something is project-scoped, prefer `mem_lens_view(project)` — one call, structured bundle, no per-tool fan-out.
 - **`mem_neighbors(id, depth)`** to walk the typed-edge graph outward from a known memory — "what does this scar resolve", "what corrects this decision", "the cluster around this belief". Pairs with `mem_link` (write) and `mem_recall_ids` (find seeds).
@@ -141,7 +141,34 @@ On top of the recall/skill layer, Mnemo now hosts a structured **firm-OS** layer
 | `mem_company_fact_get` | Canonical company facts (team, legal, brand, pricing, infra) |
 | `mem_pre_action_check` | Gate before publishing external content |
 
-All tools are exposed twice: locally via the MCP plugin (in-process SQLite) and over the Hub (`https://listing.blun.ai/mnemo/tool/<name>`). Sub-agents on remote PCs use the Hub. Local Claude on Mayk's PC uses MCP. **Don't drop agent briefs into the local plugin — Alfred et al. read the Hub.**
+All tools are exposed twice: locally via the MCP plugin (in-process SQLite) and over the Hub (`https://listing.blun.ai/mnemo/tool/<name>`). Sub-agents on remote PCs use the Hub. Local agents on Mayk's PC use MCP. **Don't drop agent briefs into the local plugin — Alfred et al. read the Hub.**
+
+### Memory Frontdoor
+
+The Hub also exposes a neutral virtual memory filesystem at `/memory-tool`. It is not a second memory store; it maps reads and writes back to Mnemo/Firm-OS tables.
+
+Useful read paths:
+
+- `/memories/today.md`
+- `/memories/inbox.md`
+- `/memories/focus.md`
+- `/memories/company/brand.md`
+- `/memories/company/legal.md`
+- `/memories/company/pricing.md`
+- `/memories/projects/<project>/registry.md`
+- `/memories/projects/<project>/live-check.md`
+- `/memories/projects/<project>/decisions.md`
+- `/memories/projects/<project>/files.md`
+- `/memories/agents/<agent>/status.md`
+
+Writable mapped paths:
+
+- `/memories/focus.md` -> `mem_focus_set`
+- `/memories/projects/<project>/registry.md` -> `mem_project_registry_upsert`
+- `/memories/projects/<project>/live-check.md` -> updates `health_checklist`, then runs `mem_project_live_check`
+- `/memories/projects/<project>/decisions.md` -> `mem_decision_log`
+- `/memories/agents/<agent>/status.md` -> `mem_agent_status_set`
+- `/memories/agents/<agent>/handoff.md` -> durable handoff transcript
 
 ### Where things live
 
