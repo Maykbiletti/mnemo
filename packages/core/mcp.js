@@ -182,6 +182,121 @@ try {
 } catch (e) { console.error("[mnemo-mcp] agent_brief migration failed:", e.message); }
 
 
+// ===========================================================================
+// firm_os Phase 1 — Mnemo as a structured-firm coordination layer
+// Added 2026-05-07. Goal: every move/file/page/decision/wish tracked, every
+// agent's status visible, no silent context loss across PCs and Codex lanes.
+// All idempotent; safe to re-run on existing DBs.
+// ===========================================================================
+db.exec(`
+-- generic registry of structured entities the firm cares about.
+-- kind: 'employee' | 'agent' | 'project' | 'page' | 'function' | 'skill' | 'tool' | 'customer' | 'investor' | 'vendor' | 'server' | 'domain'
+CREATE TABLE IF NOT EXISTS entity (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind            TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  scope           TEXT NOT NULL DEFAULT 'blun',
+  owner_agent     TEXT,
+  status          TEXT NOT NULL DEFAULT 'active',
+  parent_id       INTEGER REFERENCES entity(id) ON DELETE SET NULL,
+  url             TEXT,
+  meta_json       TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(kind, name, scope)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_kind_status ON entity(kind, status);
+CREATE INDEX IF NOT EXISTS idx_entity_owner ON entity(owner_agent);
+CREATE INDEX IF NOT EXISTS idx_entity_scope ON entity(scope);
+
+-- typed cross-links between entities (e.g. function uses skill, page belongs to project, customer at company).
+CREATE TABLE IF NOT EXISTS entity_link (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_id         INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+  to_id           INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+  rel             TEXT NOT NULL,
+  meta_json       TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(from_id, to_id, rel)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_link_from ON entity_link(from_id, rel);
+CREATE INDEX IF NOT EXISTS idx_entity_link_to ON entity_link(to_id, rel);
+
+-- file ownership: every tracked file gets a primary agent + history of editors.
+-- prevents "wer hat den Header gebaut" being a guess.
+CREATE TABLE IF NOT EXISTS file_ownership (
+  file_path           TEXT PRIMARY KEY,
+  host                TEXT,
+  primary_agent       TEXT,
+  secondary_agents    TEXT,
+  last_edit_agent     TEXT,
+  last_edit_at        TEXT,
+  last_commit_sha     TEXT,
+  project_entity_id   INTEGER REFERENCES entity(id) ON DELETE SET NULL,
+  meta_json           TEXT,
+  updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_file_ownership_primary ON file_ownership(primary_agent);
+CREATE INDEX IF NOT EXISTS idx_file_ownership_lastedit ON file_ownership(last_edit_at);
+
+-- mayk-wish-buffer: every casual "ich hätte gern X" gets captured here, NOT auto-built.
+-- agents review weekly, mayk approves/rejects/files-as-roadmap.
+CREATE TABLE IF NOT EXISTS wish_buffer (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_channel      TEXT,
+  source_chat_id      TEXT,
+  source_message_id   TEXT,
+  captured_text       TEXT NOT NULL,
+  captured_by_agent   TEXT,
+  captured_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  classification      TEXT,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  reviewed_by         TEXT,
+  reviewed_at         TEXT,
+  decision_id         INTEGER,
+  meta_json           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wish_status ON wish_buffer(status, captured_at);
+CREATE INDEX IF NOT EXISTS idx_wish_classification ON wish_buffer(classification);
+
+-- decision_log: every binding decision (mayk-direktive, architectural, legal) with file impact.
+-- replaces the loose "memory" entries we use today for decisions.
+CREATE TABLE IF NOT EXISTS decision_log (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope               TEXT NOT NULL DEFAULT 'blun',
+  title               TEXT NOT NULL,
+  body                TEXT,
+  decided_by          TEXT NOT NULL,
+  decided_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  agents_involved     TEXT,
+  files_affected      TEXT,
+  entities_affected   TEXT,
+  parent_decision_id  INTEGER REFERENCES decision_log(id) ON DELETE SET NULL,
+  status              TEXT NOT NULL DEFAULT 'active',
+  superseded_by       INTEGER REFERENCES decision_log(id) ON DELETE SET NULL,
+  meta_json           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decision_decided_at ON decision_log(decided_at);
+CREATE INDEX IF NOT EXISTS idx_decision_status ON decision_log(status);
+CREATE INDEX IF NOT EXISTS idx_decision_decided_by ON decision_log(decided_by);
+
+-- live agent status: what each agent is doing right now, plus DND flag.
+-- used by routers to decide who can take a new task and who's busy.
+CREATE TABLE IF NOT EXISTS agent_status_live (
+  agent_name          TEXT PRIMARY KEY,
+  current_task        TEXT,
+  current_brief_id    INTEGER REFERENCES agent_brief(id) ON DELETE SET NULL,
+  blocked_on          TEXT,
+  dnd_until           TEXT,
+  last_heartbeat_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  host                TEXT,
+  pid                 INTEGER,
+  meta_json           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_status_dnd ON agent_status_live(dnd_until);
+`);
+
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -2164,6 +2279,206 @@ ${args.first_invocation_outcome || "(none)"}
       const lim = Math.min(a.limit || 200, 1000);
       const rows = db.prepare("SELECT id, source, channel, direction, speaker, content, occurred_at, ref_kind, ref_id FROM transcript WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at ASC LIMIT ?").all(String(a.start), String(a.end), lim);
       return { count: rows.length, start: a.start, end: a.end, transcripts: rows };
+    },
+  },
+  // ===== firm_os Phase 1 tools =====
+  mem_entity_upsert: {
+    description: "Upsert a structured entity (employee/agent/project/page/function/skill/tool/customer/investor/vendor/server/domain). Returns id. Use this whenever you discover or create something the firm should know about — pages built, functions added, customers signed up.",
+    inputSchema: { type: "object", properties: { kind: { type: "string" }, name: { type: "string" }, scope: { type: "string" }, owner_agent: { type: "string" }, status: { type: "string" }, parent_id: { type: "integer" }, url: { type: "string" }, meta: { type: "object" } }, required: ["kind", "name"] },
+    handler: ({ kind, name, scope, owner_agent, status, parent_id, url, meta }) => {
+      const sc = scope || "blun";
+      const st = status || "active";
+      const meta_json = meta ? JSON.stringify(meta) : null;
+      const existing = db.prepare("SELECT id FROM entity WHERE kind=? AND name=? AND scope=?").get(kind, name, sc);
+      if (existing) {
+        db.prepare("UPDATE entity SET owner_agent=COALESCE(?, owner_agent), status=?, parent_id=COALESCE(?, parent_id), url=COALESCE(?, url), meta_json=COALESCE(?, meta_json), updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(owner_agent || null, st, parent_id || null, url || null, meta_json, existing.id);
+        return { id: existing.id, kind, name, scope: sc, action: "updated" };
+      }
+      const info = db.prepare("INSERT INTO entity (kind, name, scope, owner_agent, status, parent_id, url, meta_json) VALUES (?,?,?,?,?,?,?,?)").run(kind, name, sc, owner_agent || null, st, parent_id || null, url || null, meta_json);
+      return { id: info.lastInsertRowid, kind, name, scope: sc, action: "created" };
+    },
+  },
+  mem_entity_get: {
+    description: "Get entity by id, or by (kind+name[+scope]).",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, kind: { type: "string" }, name: { type: "string" }, scope: { type: "string" } } },
+    handler: ({ id, kind, name, scope }) => {
+      let row;
+      if (id) row = db.prepare("SELECT * FROM entity WHERE id=?").get(id);
+      else if (kind && name) row = db.prepare("SELECT * FROM entity WHERE kind=? AND name=? AND scope=?").get(kind, name, scope || "blun");
+      else return { error: "id OR (kind+name) required" };
+      if (!row) return { error: "not found" };
+      if (row.meta_json) try { row.meta = JSON.parse(row.meta_json); } catch {}
+      return row;
+    },
+  },
+  mem_entity_list: {
+    description: "List entities filtered by kind/owner/status. Pagination via limit/offset.",
+    inputSchema: { type: "object", properties: { kind: { type: "string" }, owner_agent: { type: "string" }, status: { type: "string" }, scope: { type: "string" }, limit: { type: "integer" }, offset: { type: "integer" } } },
+    handler: ({ kind, owner_agent, status, scope, limit, offset }) => {
+      const where = []; const params = [];
+      if (kind) { where.push("kind=?"); params.push(kind); }
+      if (owner_agent) { where.push("owner_agent=?"); params.push(owner_agent); }
+      if (status) { where.push("status=?"); params.push(status); }
+      if (scope) { where.push("scope=?"); params.push(scope); }
+      const w = where.length ? "WHERE " + where.join(" AND ") : "";
+      const lim = Math.min(limit || 100, 500);
+      const off = offset || 0;
+      const rows = db.prepare(`SELECT id, kind, name, scope, owner_agent, status, url, updated_at FROM entity ${w} ORDER BY updated_at DESC LIMIT ? OFFSET ?`).all(...params, lim, off);
+      return { count: rows.length, entities: rows };
+    },
+  },
+  mem_entity_link: {
+    description: "Create a typed link between two entities (rel: 'belongs_to' | 'depends_on' | 'uses_skill' | 'owns' | 'lives_at' | etc).",
+    inputSchema: { type: "object", properties: { from_id: { type: "integer" }, to_id: { type: "integer" }, rel: { type: "string" }, meta: { type: "object" } }, required: ["from_id", "to_id", "rel"] },
+    handler: ({ from_id, to_id, rel, meta }) => {
+      try {
+        const info = db.prepare("INSERT OR IGNORE INTO entity_link (from_id, to_id, rel, meta_json) VALUES (?,?,?,?)").run(from_id, to_id, rel, meta ? JSON.stringify(meta) : null);
+        return { id: info.lastInsertRowid || null, from_id, to_id, rel, action: info.changes ? "created" : "exists" };
+      } catch (e) { return { error: e.message }; }
+    },
+  },
+  mem_file_owner_set: {
+    description: "Record file ownership and last-editor. Call this from git post-commit hooks or manual edit logs. file_path is canonical (absolute on the host or repo-relative).",
+    inputSchema: { type: "object", properties: { file_path: { type: "string" }, host: { type: "string" }, primary_agent: { type: "string" }, last_edit_agent: { type: "string" }, last_commit_sha: { type: "string" }, project_entity_id: { type: "integer" }, add_secondary: { type: "string" } }, required: ["file_path"] },
+    handler: ({ file_path, host, primary_agent, last_edit_agent, last_commit_sha, project_entity_id, add_secondary }) => {
+      const now = new Date().toISOString();
+      const existing = db.prepare("SELECT * FROM file_ownership WHERE file_path=?").get(file_path);
+      let secondary = existing && existing.secondary_agents ? JSON.parse(existing.secondary_agents) : [];
+      if (add_secondary && !secondary.includes(add_secondary) && add_secondary !== (primary_agent || (existing && existing.primary_agent))) {
+        secondary.push(add_secondary);
+      }
+      if (existing) {
+        db.prepare("UPDATE file_ownership SET host=COALESCE(?, host), primary_agent=COALESCE(?, primary_agent), secondary_agents=?, last_edit_agent=COALESCE(?, last_edit_agent), last_edit_at=?, last_commit_sha=COALESCE(?, last_commit_sha), project_entity_id=COALESCE(?, project_entity_id), updated_at=? WHERE file_path=?").run(host || null, primary_agent || null, JSON.stringify(secondary), last_edit_agent || null, now, last_commit_sha || null, project_entity_id || null, now, file_path);
+        return { file_path, action: "updated" };
+      }
+      db.prepare("INSERT INTO file_ownership (file_path, host, primary_agent, secondary_agents, last_edit_agent, last_edit_at, last_commit_sha, project_entity_id) VALUES (?,?,?,?,?,?,?,?)").run(file_path, host || null, primary_agent || null, JSON.stringify(secondary), last_edit_agent || null, now, last_commit_sha || null, project_entity_id || null);
+      return { file_path, action: "created" };
+    },
+  },
+  mem_file_owner_get: {
+    description: "Get file ownership info by path, or list files owned by an agent.",
+    inputSchema: { type: "object", properties: { file_path: { type: "string" }, primary_agent: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ file_path, primary_agent, limit }) => {
+      if (file_path) {
+        const row = db.prepare("SELECT * FROM file_ownership WHERE file_path=?").get(file_path);
+        if (!row) return { error: "not found", file_path };
+        if (row.secondary_agents) try { row.secondary_agents = JSON.parse(row.secondary_agents); } catch {}
+        return row;
+      }
+      if (primary_agent) {
+        const rows = db.prepare("SELECT file_path, host, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE primary_agent=? ORDER BY last_edit_at DESC LIMIT ?").all(primary_agent, Math.min(limit || 100, 500));
+        return { count: rows.length, files: rows };
+      }
+      return { error: "file_path OR primary_agent required" };
+    },
+  },
+  mem_wish_capture: {
+    description: "Capture a Mayk-wish (or any non-explicit-task signal) into the wish_buffer instead of auto-building it. Default classification 'wish'. Status starts as 'pending' until reviewed.",
+    inputSchema: { type: "object", properties: { captured_text: { type: "string" }, source_channel: { type: "string" }, source_chat_id: { type: "string" }, source_message_id: { type: "string" }, captured_by_agent: { type: "string" }, classification: { type: "string", enum: ["wish", "idea", "feedback", "complaint", "question"] }, meta: { type: "object" } }, required: ["captured_text"] },
+    handler: ({ captured_text, source_channel, source_chat_id, source_message_id, captured_by_agent, classification, meta }) => {
+      const info = db.prepare("INSERT INTO wish_buffer (source_channel, source_chat_id, source_message_id, captured_text, captured_by_agent, classification, meta_json) VALUES (?,?,?,?,?,?,?)").run(source_channel || null, source_chat_id || null, source_message_id || null, captured_text, captured_by_agent || null, classification || "wish", meta ? JSON.stringify(meta) : null);
+      return { id: info.lastInsertRowid, classification: classification || "wish", status: "pending" };
+    },
+  },
+  mem_wish_list: {
+    description: "List wishes by status. Default returns pending.",
+    inputSchema: { type: "object", properties: { status: { type: "string" }, classification: { type: "string" }, since: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ status, classification, since, limit }) => {
+      const where = []; const params = [];
+      where.push("status=?"); params.push(status || "pending");
+      if (classification) { where.push("classification=?"); params.push(classification); }
+      if (since) { where.push("captured_at >= ?"); params.push(since); }
+      const lim = Math.min(limit || 100, 500);
+      const rows = db.prepare(`SELECT id, captured_text, classification, captured_by_agent, captured_at, status, source_channel FROM wish_buffer WHERE ${where.join(" AND ")} ORDER BY captured_at DESC LIMIT ?`).all(...params, lim);
+      return { count: rows.length, wishes: rows };
+    },
+  },
+  mem_wish_review: {
+    description: "Review/decide a wish: status in (approved, rejected, roadmap, idea, deferred). Optional decision_id links to a decision_log entry.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, status: { type: "string", enum: ["approved", "rejected", "roadmap", "idea", "deferred"] }, reviewed_by: { type: "string" }, decision_id: { type: "integer" } }, required: ["id", "status"] },
+    handler: ({ id, status, reviewed_by, decision_id }) => {
+      const info = db.prepare("UPDATE wish_buffer SET status=?, reviewed_by=?, reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), decision_id=COALESCE(?, decision_id) WHERE id=?").run(status, reviewed_by || null, decision_id || null, id);
+      return { id, status, updated: info.changes };
+    },
+  },
+  mem_decision_log: {
+    description: "Record a binding decision with linked files/agents/entities. Use for Mayk-direktiven, architectural calls, legal positions. body is markdown.",
+    inputSchema: { type: "object", properties: { title: { type: "string" }, body: { type: "string" }, decided_by: { type: "string" }, scope: { type: "string" }, agents_involved: { type: "array", items: { type: "string" } }, files_affected: { type: "array", items: { type: "string" } }, entities_affected: { type: "array", items: { type: "integer" } }, parent_decision_id: { type: "integer" }, meta: { type: "object" } }, required: ["title", "decided_by"] },
+    handler: ({ title, body, decided_by, scope, agents_involved, files_affected, entities_affected, parent_decision_id, meta }) => {
+      const info = db.prepare("INSERT INTO decision_log (scope, title, body, decided_by, agents_involved, files_affected, entities_affected, parent_decision_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?)").run(scope || "blun", title, body || null, decided_by, agents_involved ? JSON.stringify(agents_involved) : null, files_affected ? JSON.stringify(files_affected) : null, entities_affected ? JSON.stringify(entities_affected) : null, parent_decision_id || null, meta ? JSON.stringify(meta) : null);
+      return { id: info.lastInsertRowid, title, decided_by, status: "active" };
+    },
+  },
+  mem_decision_get: {
+    description: "Get a decision by id, or list recent decisions filtered by scope/decided_by.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, scope: { type: "string" }, decided_by: { type: "string" }, status: { type: "string" }, since: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ id, scope, decided_by, status, since, limit }) => {
+      if (id) {
+        const row = db.prepare("SELECT * FROM decision_log WHERE id=?").get(id);
+        if (!row) return { error: "not found" };
+        for (const k of ["agents_involved", "files_affected", "entities_affected", "meta_json"]) {
+          if (row[k]) try { row[k] = JSON.parse(row[k]); } catch {}
+        }
+        return row;
+      }
+      const where = []; const params = [];
+      if (scope) { where.push("scope=?"); params.push(scope); }
+      if (decided_by) { where.push("decided_by=?"); params.push(decided_by); }
+      if (status) { where.push("status=?"); params.push(status); }
+      if (since) { where.push("decided_at >= ?"); params.push(since); }
+      const w = where.length ? "WHERE " + where.join(" AND ") : "";
+      const lim = Math.min(limit || 50, 500);
+      const rows = db.prepare(`SELECT id, scope, title, decided_by, decided_at, status FROM decision_log ${w} ORDER BY decided_at DESC LIMIT ?`).all(...params, lim);
+      return { count: rows.length, decisions: rows };
+    },
+  },
+  mem_agent_status_set: {
+    description: "Update an agent's live status: current task, blocked-on reason, host/pid, optional DND-until ISO timestamp. Send heartbeat by calling with no other fields.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" }, current_task: { type: "string" }, current_brief_id: { type: "integer" }, blocked_on: { type: "string" }, dnd_until: { type: "string" }, host: { type: "string" }, pid: { type: "integer" }, meta: { type: "object" } }, required: ["agent_name"] },
+    handler: ({ agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta }) => {
+      const now = new Date().toISOString();
+      const existing = db.prepare("SELECT agent_name FROM agent_status_live WHERE agent_name=?").get(agent_name);
+      if (existing) {
+        db.prepare("UPDATE agent_status_live SET current_task=COALESCE(?, current_task), current_brief_id=COALESCE(?, current_brief_id), blocked_on=?, dnd_until=COALESCE(?, dnd_until), host=COALESCE(?, host), pid=COALESCE(?, pid), meta_json=COALESCE(?, meta_json), last_heartbeat_at=? WHERE agent_name=?").run(current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, meta ? JSON.stringify(meta) : null, now, agent_name);
+        return { agent_name, action: "updated", last_heartbeat_at: now };
+      }
+      db.prepare("INSERT INTO agent_status_live (agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta_json, last_heartbeat_at) VALUES (?,?,?,?,?,?,?,?,?)").run(agent_name, current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, meta ? JSON.stringify(meta) : null, now);
+      return { agent_name, action: "created", last_heartbeat_at: now };
+    },
+  },
+  mem_agent_status_get: {
+    description: "Get one agent's status, or list all agents with their live state. Useful before routing a brief: skip agents in DND or blocked.",
+    inputSchema: { type: "object", properties: { agent_name: { type: "string" } } },
+    handler: ({ agent_name }) => {
+      if (agent_name) {
+        const row = db.prepare("SELECT * FROM agent_status_live WHERE agent_name=?").get(agent_name);
+        if (!row) return { error: "not found", agent_name };
+        const now = Date.now();
+        row.dnd_active = row.dnd_until ? Date.parse(row.dnd_until) > now : false;
+        return row;
+      }
+      const rows = db.prepare("SELECT * FROM agent_status_live ORDER BY last_heartbeat_at DESC").all();
+      const now = Date.now();
+      for (const r of rows) r.dnd_active = r.dnd_until ? Date.parse(r.dnd_until) > now : false;
+      return { count: rows.length, agents: rows };
+    },
+  },
+  mem_today_view: {
+    description: "Quick 'what happened today' view across actions, briefs, decisions, file edits, wishes. Single call returns everything Mayk-or-an-Agent needs to scan a day.",
+    inputSchema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD; defaults to today (UTC)." }, agent_name: { type: "string" } } },
+    handler: ({ date, agent_name }) => {
+      const d = date || new Date().toISOString().slice(0, 10);
+      const start = d + "T00:00:00.000Z";
+      const end = d + "T23:59:59.999Z";
+      const params = [start, end];
+      const agentClause = agent_name ? " AND agent_name=?" : "";
+      if (agent_name) params.push(agent_name);
+      const actions = db.prepare(`SELECT id, agent_name, action_kind, target, status, started_at FROM agent_action WHERE started_at BETWEEN ? AND ? ${agentClause} ORDER BY started_at DESC LIMIT 200`).all(...params);
+      const briefs = db.prepare(`SELECT id, agent_name, source_agent, status, created_at FROM agent_brief WHERE created_at BETWEEN ? AND ? ${agent_name ? "AND (agent_name=? OR source_agent=?)" : ""} ORDER BY created_at DESC LIMIT 100`).all(start, end, ...(agent_name ? [agent_name, agent_name] : []));
+      const decisions = db.prepare("SELECT id, title, decided_by, decided_at, scope, status FROM decision_log WHERE decided_at BETWEEN ? AND ? ORDER BY decided_at DESC LIMIT 50").all(start, end);
+      const file_edits = db.prepare(`SELECT file_path, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE last_edit_at BETWEEN ? AND ? ${agent_name ? "AND last_edit_agent=?" : ""} ORDER BY last_edit_at DESC LIMIT 200`).all(start, end, ...(agent_name ? [agent_name] : []));
+      const wishes = db.prepare("SELECT id, captured_text, classification, captured_by_agent, status FROM wish_buffer WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at DESC LIMIT 50").all(start, end);
+      return { date: d, agent_name: agent_name || null, actions: { count: actions.length, items: actions }, briefs: { count: briefs.length, items: briefs }, decisions: { count: decisions.length, items: decisions }, file_edits: { count: file_edits.length, items: file_edits }, wishes: { count: wishes.length, items: wishes } };
     },
   },
   mem_company_fact_get: {
