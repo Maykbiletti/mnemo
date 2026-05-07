@@ -414,6 +414,73 @@ const server = http.createServer((req, res) => {
       res.writeHead(500); return res.end(JSON.stringify({ error: String(e.message) }));
     }
   }
+  if (req.method === "POST" && url.pathname === "/memory-tool") {
+    // Anthropic memory_20250818 adapter — accepts the same input shape as the
+    // built-in client memory tool and exposes a virtual /memories/ filesystem
+    // backed by mnemo. Read-only for now; write commands return a guarded
+    // error so callers know to fall through to mem_add / mem_brief_drop / etc.
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      let a = {};
+      try { a = body ? JSON.parse(body) : {}; } catch { a = {}; }
+      const cmd = a.command || "view";
+      const p = String(a.path || a.old_path || "/memories").replace(/\/+$/, "") || "/memories";
+      const ok = (text) => sendJson(req, res, 200, { content: text });
+      const err = (msg) => sendJson(req, res, 200, { error: msg });
+      if (!p.startsWith("/memories")) return err("path must start with /memories");
+      if (cmd !== "view") return err("memory adapter is read-only — use mnemo MCP tools (mem_add, mem_brief_drop, mem_company_fact_set) for writes");
+      try {
+        if (p === "/memories" || p === "/memories/") {
+          const lines = ["/memories", "  today.md", "  inbox.md", "  identity.md", "  focus.md", "  promises.md", "  decisions/today.md", "  projects/"];
+          try {
+            const projs = tdb.prepare("SELECT name FROM project_registry ORDER BY name").all();
+            for (const r of projs) lines.push("  projects/" + r.name.replace(/\s+/g,'_') + ".md");
+          } catch {}
+          return ok(lines.join("\n"));
+        }
+        if (p === "/memories/today.md") {
+          const t = handleTool(tdb, "mem_today_view", {});
+          return ok(`# Today (${t.date})\n\nactions: ${t.actions?.count} | briefs: ${t.briefs?.count} | decisions: ${t.decisions?.count} | wishes: ${t.wishes?.count} | file_edits: ${t.file_edits?.count}\n\n## Recent decisions\n` + (t.decisions?.items||[]).map(d=>`- ${d.title} (${d.decided_by})`).join("\n"));
+        }
+        if (p === "/memories/inbox.md") {
+          const r = handleTool(tdb, "mem_brief_pull", { agent_name: a.agent || "dieter", peek: true, limit: 10 });
+          const briefs = r.briefs || [];
+          if (!briefs.length) return ok("Inbox empty.");
+          return ok(briefs.map(b => `## #${b.id} from ${b.source_agent || '?'}\n${(b.content||'').slice(0, 500)}`).join("\n\n"));
+        }
+        if (p === "/memories/identity.md") {
+          const r = handleTool(tdb, "mem_session_brief", { token_budget: 250 });
+          return ok(JSON.stringify(r.identity || {}, null, 2));
+        }
+        if (p === "/memories/focus.md") {
+          const r = handleTool(tdb, "mem_focus_get", { agent_name: a.agent || "dieter" });
+          return ok(`# Focus\n\nCurrent: ${r.focus}\nSet at: ${r.set_at || 'never'}\nReason: ${r.reason || '-'}\n\n## Slice\n${JSON.stringify(r.slice, null, 2)}`);
+        }
+        if (p === "/memories/promises.md") {
+          const r = handleTool(tdb, "mem_promise_open", { limit: 30 });
+          const items = r.promises || [];
+          return ok("# Open promises\n\n" + items.map(x => `- ${x.text}`).join("\n"));
+        }
+        if (p === "/memories/decisions/today.md") {
+          const t = handleTool(tdb, "mem_today_view", {});
+          const items = t.decisions?.items || [];
+          return ok("# Decisions today\n\n" + items.map(d => `- ${d.title} — ${d.decided_by} @ ${d.decided_at}`).join("\n"));
+        }
+        const projMatch = p.match(/^\/memories\/projects\/(.+)\.md$/);
+        if (projMatch) {
+          const name = projMatch[1].replace(/_/g, ' ');
+          const r = handleTool(tdb, "mem_project_doc_render", { name });
+          if (r.error) return err(r.error);
+          return ok(r.doc);
+        }
+        return err("path not mapped: " + p);
+      } catch (e) {
+        return err("adapter error: " + e.message);
+      }
+    });
+    return;
+  }
   if (req.method === "POST" && url.pathname.startsWith("/tool/")) {
     const tool = url.pathname.slice("/tool/".length);
     let body = "";
