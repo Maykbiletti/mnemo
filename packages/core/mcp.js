@@ -2606,6 +2606,20 @@ ${args.first_invocation_outcome || "(none)"}
       return { count: rows.length, projects: rows };
     },
   },
+  mem_file_echo: {
+    description: "Read-Echo: surface what mnemo already knows about a file BEFORE you Read it. Returns ownership history, active work_claims, related briefs (content matching path or basename), related decisions, matching skills. Use this in a PreToolUse hook on Read so the agent gets cached context (who edited last, why, what claim is on it) without paying the file-read tokens up-front.",
+    inputSchema: { type: "object", properties: { file_path: { type: "string" }, limit: { type: "integer" } }, required: ["file_path"] },
+    handler: ({ file_path, limit }) => {
+      const lim = Math.min(limit || 5, 20);
+      const basename = file_path.split(/[\\/]/).pop() || file_path;
+      const ownership = (() => { try { return db.prepare("SELECT file_path, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE file_path=? OR file_path LIKE ? ORDER BY last_edit_at DESC LIMIT ?").all(file_path, '%' + basename, lim); } catch { return []; } })();
+      const claims = (() => { try { return db.prepare("SELECT id, agent_name, summary, expires_at FROM work_claim WHERE (file_path=? OR file_path LIKE ?) AND status='active' ORDER BY claimed_at DESC LIMIT ?").all(file_path, '%' + basename, lim); } catch { return []; } })();
+      const briefs = (() => { try { return db.prepare("SELECT id, agent_name, source_agent, substr(content,1,180) AS snippet, created_at FROM agent_brief WHERE content LIKE ? OR content LIKE ? ORDER BY created_at DESC LIMIT ?").all('%' + file_path + '%', '%' + basename + '%', lim); } catch { return []; } })();
+      const decisions = (() => { try { return db.prepare("SELECT title, decided_by, decided_at, summary FROM decision_log WHERE summary LIKE ? OR title LIKE ? ORDER BY decided_at DESC LIMIT ?").all('%' + basename + '%', '%' + basename + '%', lim); } catch { return []; } })();
+      const skills = (() => { try { return db.prepare("SELECT name, description FROM skill_registry WHERE source_path LIKE ? OR description LIKE ? LIMIT ?").all('%' + basename + '%', '%' + basename + '%', lim); } catch { return []; } })();
+      return { file_path, basename, ownership: { count: ownership.length, items: ownership }, active_claims: { count: claims.length, items: claims }, related_briefs: { count: briefs.length, items: briefs }, related_decisions: { count: decisions.length, items: decisions }, matching_skills: { count: skills.length, items: skills } };
+    },
+  },
   mem_focus_set: {
     description: "Set the agent's current focus (e.g. code | ops | pitch | support | chill | default). The focus narrows what auto-inject pulls into the next session. Slice rules live in facts/blun.json focus_modes — facts can be edited via mem_company_fact_set without code change.",
     inputSchema: { type: "object", properties: { agent_name: { type: "string" }, focus: { type: "string" }, reason: { type: "string" } }, required: ["agent_name","focus"] },

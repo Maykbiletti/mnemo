@@ -1417,6 +1417,17 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
       return { count: rows.length, projects: rows };
     }
+    case "mem_file_echo": {
+      if (!a.file_path) return { error: "file_path required" };
+      const lim = Math.min(a.limit || 5, 20);
+      const path_basename = a.file_path.split(/[\\/]/).pop() || a.file_path;
+      const ownership = (() => { try { return tdb.prepare("SELECT file_path, last_edit_agent, last_edit_at, last_commit_sha FROM file_ownership WHERE file_path=? OR file_path LIKE ? ORDER BY last_edit_at DESC LIMIT ?").all(a.file_path, '%' + path_basename, lim); } catch { return []; } })();
+      const claims = (() => { try { return tdb.prepare("SELECT id, agent_name, summary, expires_at FROM work_claim WHERE (file_path=? OR file_path LIKE ?) AND status='active' ORDER BY claimed_at DESC LIMIT ?").all(a.file_path, '%' + path_basename, lim); } catch { return []; } })();
+      const briefs = (() => { try { return tdb.prepare("SELECT id, agent_name, source_agent, substr(content,1,180) AS snippet, created_at FROM agent_brief WHERE content LIKE ? OR content LIKE ? ORDER BY created_at DESC LIMIT ?").all('%' + a.file_path + '%', '%' + path_basename + '%', lim); } catch { return []; } })();
+      const decisions = (() => { try { return tdb.prepare("SELECT title, decided_by, decided_at, summary FROM decision_log WHERE summary LIKE ? OR title LIKE ? ORDER BY decided_at DESC LIMIT ?").all('%' + path_basename + '%', '%' + path_basename + '%', lim); } catch { return []; } })();
+      const skills = (() => { try { return tdb.prepare("SELECT name, description FROM skill_registry WHERE source_path LIKE ? OR description LIKE ? LIMIT ?").all('%' + path_basename + '%', '%' + path_basename + '%', lim); } catch { return []; } })();
+      return { file_path: a.file_path, basename: path_basename, ownership: { count: ownership.length, items: ownership }, active_claims: { count: claims.length, items: claims }, related_briefs: { count: briefs.length, items: briefs }, related_decisions: { count: decisions.length, items: decisions }, matching_skills: { count: skills.length, items: skills } };
+    }
     case "mem_focus_set": {
       if (!a.agent_name || !a.focus) return { error: "agent_name + focus required" };
       try { tdb.exec("CREATE TABLE IF NOT EXISTS agent_focus (agent_name TEXT PRIMARY KEY, focus TEXT NOT NULL, set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), reason TEXT)"); } catch {}
