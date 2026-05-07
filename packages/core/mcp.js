@@ -25,6 +25,16 @@
 const Database = require("better-sqlite3");
 const fs = require("fs");
 const path = require("path");
+
+// Strip <private>...</private> blocks from inbound text before SQLite persist.
+// Matches multiline + case-insensitive. Replaces with [private] placeholder so
+// downstream reads see something happened without the secret. Returns
+// {text, hadPrivate} so callers can flag the row.
+function stripPrivate(text) {
+  if (typeof text !== "string" || !text) return { text, hadPrivate: false };
+  if (!/<private>/i.test(text)) return { text, hadPrivate: false };
+  return { text: text.replace(/<private>[\s\S]*?<\/private>/gi, "[private]"), hadPrivate: true };
+}
 const readline = require("readline");
 
 const DB_PATH = process.env.MNEMO_DB || path.join(__dirname, "mnemo.db");

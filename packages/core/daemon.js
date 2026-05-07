@@ -22,6 +22,18 @@ const http = require("http");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+
+// Strip <private>...</private> blocks from text before persisting. Owner can
+// mark sensitive snippets in any inbound content (briefs, wishes, transcripts,
+// mem_add). The marker survives display in the original message but never
+// reaches the SQLite store. Multiline + case-insensitive. Returns a tuple-ish
+// { text, hadPrivate } so callers can decide whether to flag the row.
+function stripPrivate(text) {
+  if (typeof text !== "string" || !text) return { text, hadPrivate: false };
+  const re = /<private>[\s\S]*?<\/private>/gi;
+  if (!re.test(text)) return { text, hadPrivate: false };
+  return { text: text.replace(/<private>[\s\S]*?<\/private>/gi, "[private]"), hadPrivate: true };
+}
 const crypto = require("crypto");
 const zlib = require("zlib");
 const Database = require("better-sqlite3");
@@ -666,17 +678,19 @@ function handleTool(tdb, name, a) {
       return { count: rows.length, channels: rows };
     }
     case "mem_brief_drop": {
+      const _scrub = stripPrivate(a.content);
+      const _content = _scrub.text;
       const info = tdb.prepare(
         "INSERT INTO agent_brief (agent_name, source_agent, content, meta_json, parent_id, supersedes_id) VALUES (?,?,?,?,?,?)"
-      ).run(a.agent_name, a.source_agent || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.parent_id || null, a.supersedes || null);
+      ).run(a.agent_name, a.source_agent || null, _content, a.meta ? JSON.stringify(a.meta) : null, a.parent_id || null, a.supersedes || null);
       const newId = info.lastInsertRowid;
       if (a.supersedes) {
         try { tdb.prepare("UPDATE agent_brief SET superseded_by_id=?, status=CASE WHEN status='pending' THEN 'superseded' ELSE status END WHERE id=?").run(newId, a.supersedes); } catch (e) {}
       }
       try { fireBriefHook(tdb, newId, "drop", { agent_name: a.agent_name }); } catch (e) {}
-      try { ftsIndex(tdb, "brief", newId, a.agent_name, a.source_agent || "", a.content); } catch (e) {}
+      try { ftsIndex(tdb, "brief", newId, a.agent_name, a.source_agent || "", _content); } catch (e) {}
       try {
-        const skMatches = matchSkillsForText(tdb, a.content);
+        const skMatches = matchSkillsForText(tdb, _content);
         if (skMatches.length) {
           const insR = tdb.prepare("INSERT INTO agent_brief_reaction (brief_id, agent_name, kind, payload) VALUES (?,?,?,?)");
           for (const m of skMatches) insR.run(newId, "mnemo-skills-engine", "skill_suggested", JSON.stringify(m));
@@ -1081,13 +1095,15 @@ function handleTool(tdb, name, a) {
     }
     case "mem_transcript_log": {
       if (!a.source || !a.direction || !a.content) return { error: "source + direction + content required" };
+      const _tscrub = stripPrivate(a.content);
+      const _tcontent = _tscrub.text;
       const occurredAt = a.occurred_at || null;
       const info = (occurredAt
-        ? tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
-        : tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, a.content, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+        ? tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, occurred_at, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, _tcontent, a.meta ? JSON.stringify(a.meta) : null, occurredAt, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
+        : tdb.prepare("INSERT INTO transcript (source, channel, direction, speaker, content, meta_json, ref_kind, ref_id) VALUES (?,?,?,?,?,?,?,?)").run(a.source, a.channel || null, a.direction, a.speaker || null, _tcontent, a.meta ? JSON.stringify(a.meta) : null, a.ref_kind || null, a.ref_id ? String(a.ref_id) : null)
       );
-      try { tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)").run(String(info.lastInsertRowid), a.speaker || a.source || '', a.direction + (a.channel ? ' @ ' + a.channel : ''), (a.content || '').slice(0, 8000)); } catch (e) {}
-      return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt };
+      try { tdb.prepare("INSERT INTO mnemo_search_fts (scope, ref_id, agent_name, summary, content) VALUES ('transcript', ?, ?, ?, ?)").run(String(info.lastInsertRowid), a.speaker || a.source || '', a.direction + (a.channel ? ' @ ' + a.channel : ''), (_tcontent || '').slice(0, 8000)); } catch (e) {}
+      return { id: info.lastInsertRowid, source: a.source, direction: a.direction, occurred_at: occurredAt, private_redacted: _tscrub.hadPrivate };
     }
     case "mem_question_answer": {
       if (!a.question) return { error: "question required" };
@@ -1226,8 +1242,9 @@ function handleTool(tdb, name, a) {
     case "mem_wish_capture": {
       if (!a.captured_text) return { error: "captured_text required" };
       try { tdb.exec(`CREATE TABLE IF NOT EXISTS wish_buffer (id INTEGER PRIMARY KEY AUTOINCREMENT, source_channel TEXT, source_chat_id TEXT, source_message_id TEXT, captured_text TEXT NOT NULL, captured_by_agent TEXT, captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), classification TEXT, status TEXT NOT NULL DEFAULT 'pending', reviewed_by TEXT, reviewed_at TEXT, decision_id INTEGER, meta_json TEXT); CREATE INDEX IF NOT EXISTS idx_wish_status ON wish_buffer(status, captured_at);`); } catch {}
-      const info = tdb.prepare("INSERT INTO wish_buffer (source_channel, source_chat_id, source_message_id, captured_text, captured_by_agent, classification, meta_json) VALUES (?,?,?,?,?,?,?)").run(a.source_channel || null, a.source_chat_id || null, a.source_message_id || null, a.captured_text, a.captured_by_agent || null, a.classification || "wish", a.meta ? JSON.stringify(a.meta) : null);
-      return { id: info.lastInsertRowid, classification: a.classification || "wish", status: "pending" };
+      const _wscrub = stripPrivate(a.captured_text);
+      const info = tdb.prepare("INSERT INTO wish_buffer (source_channel, source_chat_id, source_message_id, captured_text, captured_by_agent, classification, meta_json) VALUES (?,?,?,?,?,?,?)").run(a.source_channel || null, a.source_chat_id || null, a.source_message_id || null, _wscrub.text, a.captured_by_agent || null, a.classification || "wish", a.meta ? JSON.stringify(a.meta) : null);
+      return { id: info.lastInsertRowid, classification: a.classification || "wish", status: "pending", private_redacted: _wscrub.hadPrivate };
     }
     case "mem_wish_list": {
       const where = []; const params = [];
