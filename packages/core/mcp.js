@@ -2555,6 +2555,76 @@ ${args.first_invocation_outcome || "(none)"}
       return { status, action_type, scope: sc, agent_name: agent_name || null, checked, missing, facts: status === "ok" ? topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
     },
   },
+  mem_work_claim: {
+    description: "Claim a file or module for exclusive work. Other agents see the claim via mem_work_active and mem_work_similar — prevents two agents fixing the same chrome bug in parallel. Auto-expires after ttl_minutes (default 240 = 4h). Returns {ok:true, id} on success, {ok:false, blocked_by:...} if already claimed by another agent. If same agent re-claims, the existing claim is refreshed (TTL extended).",
+    inputSchema: { type: "object", properties: { project: { type: "string" }, file_path: { type: "string" }, agent_name: { type: "string" }, summary: { type: "string" }, ttl_minutes: { type: "integer" } }, required: ["project","file_path","agent_name"] },
+    handler: ({ project, file_path, agent_name, summary, ttl_minutes }) => {
+      const ttl = Math.max(1, Math.min(1440, ttl_minutes || 240));
+      try { db.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active'); CREATE INDEX IF NOT EXISTS idx_work_claim_active ON work_claim(file_path, status, expires_at); CREATE INDEX IF NOT EXISTS idx_work_claim_project ON work_claim(project, status);"); } catch {}
+      // Auto-expire stale claims first.
+      db.prepare("UPDATE work_claim SET status='expired' WHERE status='active' AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')").run();
+      const existing = db.prepare("SELECT * FROM work_claim WHERE file_path=? AND status='active' ORDER BY id DESC LIMIT 1").get(file_path);
+      if (existing && existing.agent_name !== agent_name) {
+        return { ok: false, blocked_by: existing.agent_name, claimed_at: existing.claimed_at, expires_at: existing.expires_at, existing_id: existing.id, summary: existing.summary, hint: "Coordinate with " + existing.agent_name + " or wait until " + existing.expires_at + ". If their claim is stale, ask them to mem_work_release." };
+      }
+      if (existing && existing.agent_name === agent_name) {
+        const newExp = new Date(Date.now() + ttl * 60000).toISOString();
+        db.prepare("UPDATE work_claim SET expires_at=?, summary=COALESCE(?, summary) WHERE id=?").run(newExp, summary || null, existing.id);
+        return { ok: true, id: existing.id, action: "refreshed", expires_at: newExp };
+      }
+      const expires = new Date(Date.now() + ttl * 60000).toISOString();
+      const info = db.prepare("INSERT INTO work_claim (project, file_path, agent_name, summary, expires_at) VALUES (?,?,?,?,?)").run(project, file_path, agent_name, summary || null, expires);
+      return { ok: true, id: info.lastInsertRowid, action: "claimed", expires_at: expires };
+    },
+  },
+  mem_work_release: {
+    description: "Release a work claim by id, or by (file_path + agent_name). Use after the work is done or when handing off to another agent. Frees the file for someone else to claim.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, file_path: { type: "string" }, agent_name: { type: "string" }, outcome: { type: "string" } } },
+    handler: ({ id, file_path, agent_name, outcome }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      let row;
+      if (id) row = db.prepare("SELECT * FROM work_claim WHERE id=?").get(id);
+      else if (file_path && agent_name) row = db.prepare("SELECT * FROM work_claim WHERE file_path=? AND agent_name=? AND status='active' ORDER BY id DESC LIMIT 1").get(file_path, agent_name);
+      else return { error: "id OR (file_path+agent_name) required" };
+      if (!row) return { error: "no active claim found" };
+      db.prepare("UPDATE work_claim SET status='released', summary=COALESCE(?, summary) WHERE id=?").run(outcome ? "released: " + outcome : null, row.id);
+      return { ok: true, id: row.id, file_path: row.file_path };
+    },
+  },
+  mem_work_active: {
+    description: "List currently-active work claims. Optional filter by project or agent_name. Auto-expires stale claims as a side effect. Use this at the start of a work session to see what teammates are touching.",
+    inputSchema: { type: "object", properties: { project: { type: "string" }, agent_name: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ project, agent_name, limit }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      try { db.prepare("UPDATE work_claim SET status='expired' WHERE status='active' AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')").run(); } catch {}
+      const where = ["status='active'"];
+      const params = [];
+      if (project) { where.push("project=?"); params.push(project); }
+      if (agent_name) { where.push("agent_name=?"); params.push(agent_name); }
+      const lim = Math.min(limit || 50, 200);
+      params.push(lim);
+      const rows = db.prepare("SELECT * FROM work_claim WHERE " + where.join(" AND ") + " ORDER BY claimed_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, claims: rows };
+    },
+  },
+  mem_work_similar: {
+    description: "Find recent claims (active OR recently-released within last 24h) that look related to the file/module you are about to claim. Use BEFORE mem_work_claim so you don't duplicate work or miss context from a teammate's recent fix on the same area.",
+    inputSchema: { type: "object", properties: { file_path: { type: "string" }, project: { type: "string" }, limit: { type: "integer" } }, required: ["file_path"] },
+    handler: ({ file_path, project, limit }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      const lim = Math.min(limit || 20, 100);
+      // Match exact file_path OR same directory prefix (split on last '/').
+      const dir = file_path.includes('/') ? file_path.replace(/\/[^\/]+$/, '/') : file_path;
+      const pattern = dir + '%';
+      const params = [file_path, pattern];
+      let where = "(file_path=? OR file_path LIKE ?)";
+      if (project) { where += " AND project=?"; params.push(project); }
+      where += " AND (status='active' OR claimed_at > datetime('now','-1 day'))";
+      params.push(lim);
+      const rows = db.prepare("SELECT id, project, file_path, agent_name, summary, claimed_at, expires_at, status FROM work_claim WHERE " + where + " ORDER BY claimed_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, similar: rows, exact_match_count: rows.filter(r => r.file_path === file_path).length };
+    },
+  },
   mem_transcript_recent: {
     description: "Most recent transcripts, optionally filtered by speaker/source/channel/direction.",
     inputSchema: { type: "object", properties: { speaker: { type: "string" }, source: { type: "string" }, channel: { type: "string" }, direction: { type: "string" }, limit: { type: "integer" } } },

@@ -1370,6 +1370,60 @@ function handleTool(tdb, name, a) {
       } catch {}
       return { status, action_type: a.action_type, scope: sc, agent_name: a.agent_name || null, checked, missing, facts: status === "ok" ? a.topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
     }
+    case "mem_work_claim": {
+      if (!a.project || !a.file_path || !a.agent_name) return { error: "project + file_path + agent_name required" };
+      const ttl = Math.max(1, Math.min(1440, a.ttl_minutes || 240));
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active'); CREATE INDEX IF NOT EXISTS idx_work_claim_active ON work_claim(file_path, status, expires_at); CREATE INDEX IF NOT EXISTS idx_work_claim_project ON work_claim(project, status);"); } catch {}
+      try { tdb.prepare("UPDATE work_claim SET status='expired' WHERE status='active' AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')").run(); } catch {}
+      const existing = tdb.prepare("SELECT * FROM work_claim WHERE file_path=? AND status='active' ORDER BY id DESC LIMIT 1").get(a.file_path);
+      if (existing && existing.agent_name !== a.agent_name) {
+        return { ok: false, blocked_by: existing.agent_name, claimed_at: existing.claimed_at, expires_at: existing.expires_at, existing_id: existing.id, summary: existing.summary, hint: "Coordinate with " + existing.agent_name + " or wait until " + existing.expires_at + ". If their claim is stale, ask them to mem_work_release." };
+      }
+      if (existing && existing.agent_name === a.agent_name) {
+        const newExp = new Date(Date.now() + ttl * 60000).toISOString();
+        tdb.prepare("UPDATE work_claim SET expires_at=?, summary=COALESCE(?, summary) WHERE id=?").run(newExp, a.summary || null, existing.id);
+        return { ok: true, id: existing.id, action: "refreshed", expires_at: newExp };
+      }
+      const expires = new Date(Date.now() + ttl * 60000).toISOString();
+      const info = tdb.prepare("INSERT INTO work_claim (project, file_path, agent_name, summary, expires_at) VALUES (?,?,?,?,?)").run(a.project, a.file_path, a.agent_name, a.summary || null, expires);
+      return { ok: true, id: info.lastInsertRowid, action: "claimed", expires_at: expires };
+    }
+    case "mem_work_release": {
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      let row;
+      if (a.id) row = tdb.prepare("SELECT * FROM work_claim WHERE id=?").get(a.id);
+      else if (a.file_path && a.agent_name) row = tdb.prepare("SELECT * FROM work_claim WHERE file_path=? AND agent_name=? AND status='active' ORDER BY id DESC LIMIT 1").get(a.file_path, a.agent_name);
+      else return { error: "id OR (file_path+agent_name) required" };
+      if (!row) return { error: "no active claim found" };
+      tdb.prepare("UPDATE work_claim SET status='released', summary=COALESCE(?, summary) WHERE id=?").run(a.outcome ? "released: " + a.outcome : null, row.id);
+      return { ok: true, id: row.id, file_path: row.file_path };
+    }
+    case "mem_work_active": {
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      try { tdb.prepare("UPDATE work_claim SET status='expired' WHERE status='active' AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')").run(); } catch {}
+      const where = ["status='active'"];
+      const params = [];
+      if (a.project) { where.push("project=?"); params.push(a.project); }
+      if (a.agent_name) { where.push("agent_name=?"); params.push(a.agent_name); }
+      const lim = Math.min(a.limit || 50, 200);
+      params.push(lim);
+      const rows = tdb.prepare("SELECT * FROM work_claim WHERE " + where.join(" AND ") + " ORDER BY claimed_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, claims: rows };
+    }
+    case "mem_work_similar": {
+      if (!a.file_path) return { error: "file_path required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS work_claim (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, file_path TEXT NOT NULL, agent_name TEXT NOT NULL, summary TEXT, claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active')"); } catch {}
+      const lim = Math.min(a.limit || 20, 100);
+      const dir = a.file_path.includes('/') ? a.file_path.replace(/\/[^\/]+$/, '/') : a.file_path;
+      const pattern = dir + '%';
+      const params = [a.file_path, pattern];
+      let where = "(file_path=? OR file_path LIKE ?)";
+      if (a.project) { where += " AND project=?"; params.push(a.project); }
+      where += " AND (status='active' OR claimed_at > datetime('now','-1 day'))";
+      params.push(lim);
+      const rows = tdb.prepare("SELECT id, project, file_path, agent_name, summary, claimed_at, expires_at, status FROM work_claim WHERE " + where + " ORDER BY claimed_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, similar: rows, exact_match_count: rows.filter(r => r.file_path === a.file_path).length };
+    }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
       return { count: rows.length, skills: rows };
