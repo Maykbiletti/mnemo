@@ -2555,6 +2555,72 @@ ${args.first_invocation_outcome || "(none)"}
       return { status, action_type, scope: sc, agent_name: agent_name || null, checked, missing, facts: status === "ok" ? topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
     },
   },
+  mem_project_registry_upsert: {
+    description: "Write the operational registry for a project — domain, repo, server, pm2 processes, nginx files, admin URL, auth system, stripe IDs, VAT status, supported languages, live status, etc. This is the 'Was ist wo'-Akte that Alfred outlined: agents and humans both query this when they need to find where pricing lives, which server runs the API, or which Stripe account a project bills under. Pass any subset of fields — only those provided are updated. Project name (matches mem_project_list) is the key.",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, domain: { type: "string" }, repo: { type: "string" }, server: { type: "string" }, pm2_processes: { type: "array", items: { type: "string" } }, nginx_files: { type: "array", items: { type: "string" } }, admin_url: { type: "string" }, auth_system: { type: "string" }, stripe_account: { type: "string" }, stripe_product_ids: { type: "array", items: { type: "string" } }, vat_status: { type: "string", enum: ["none","pending","registered","exempt"] }, vat_id: { type: "string" }, langs: { type: "array", items: { type: "string" } }, live_status: { type: "string", enum: ["live","staging","dev","down","unknown"] }, live_url: { type: "string" }, staging_url: { type: "string" }, last_deploy_at: { type: "string" }, missing_blocks: { type: "array", items: { type: "string" } }, health_checklist: { type: "object" }, notes: { type: "string" }, updated_by: { type: "string" } }, required: ["name"] },
+    handler: (a) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_by TEXT)"); } catch {}
+      const fields = ["name"]; const placeholders = ["?"]; const values = [a.name]; const updates = [];
+      const stringKeys = ["domain","repo","server","admin_url","auth_system","stripe_account","vat_status","vat_id","live_status","live_url","staging_url","last_deploy_at","notes","updated_by"];
+      const jsonKeys = ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"];
+      for (const k of stringKeys) if (a[k] !== undefined) { fields.push(k); placeholders.push("?"); values.push(a[k]); updates.push(k + "=excluded." + k); }
+      for (const k of jsonKeys) if (a[k] !== undefined) { fields.push(k); placeholders.push("?"); values.push(JSON.stringify(a[k])); updates.push(k + "=excluded." + k); }
+      updates.push("updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+      const sql = "INSERT INTO project_registry (" + fields.join(",") + ") VALUES (" + placeholders.join(",") + ") ON CONFLICT(name) DO UPDATE SET " + updates.join(", ");
+      db.prepare(sql).run(...values);
+      return { ok: true, name: a.name };
+    },
+  },
+  mem_project_registry_get: {
+    description: "Read the operational registry for one project. Returns the full record with JSON fields parsed into arrays/objects.",
+    inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+    handler: ({ name }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const row = db.prepare("SELECT * FROM project_registry WHERE name=?").get(name);
+      if (!row) return { error: "not found", name };
+      for (const k of ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"]) {
+        if (row[k]) try { row[k] = JSON.parse(row[k]); } catch {}
+      }
+      return row;
+    },
+  },
+  mem_project_registry_list: {
+    description: "List the operational registry for all projects (or filter by live_status). Use to answer 'which projects are live' / 'which still need VAT' across the board.",
+    inputSchema: { type: "object", properties: { live_status: { type: "string" }, limit: { type: "integer" } } },
+    handler: ({ live_status, limit }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const where = []; const params = [];
+      if (live_status) { where.push("live_status=?"); params.push(live_status); }
+      params.push(Math.min(limit || 50, 200));
+      const rows = db.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, projects: rows };
+    },
+  },
+  mem_project_live_check: {
+    description: "Pre-deploy gate. Reads the project_registry health_checklist + computes pass/block. The checklist holds named gates (auth, billing, vat, legal, seo, mobile, header_footer, pricing, checkout, webhooks, analytics, error_monitoring) each as 'pass' | 'block' | 'unknown'. Returns status='block' if ANY required gate is not 'pass'. Logs the check. Use BEFORE setting live_status='live'.",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, required_gates: { type: "array", items: { type: "string" } }, agent_name: { type: "string" } }, required: ["name"] },
+    handler: ({ name, required_gates, agent_name }) => {
+      try { db.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const row = db.prepare("SELECT name, live_status, vat_status, health_checklist FROM project_registry WHERE name=?").get(name);
+      if (!row) return { status: "block", reason: "project_registry has no row for " + name, hint: "Create it via mem_project_registry_upsert first." };
+      let checklist = {};
+      try { checklist = row.health_checklist ? JSON.parse(row.health_checklist) : {}; } catch {}
+      const defaults = ["auth","billing","vat","legal","mobile","header_footer","pricing","checkout"];
+      const required = Array.isArray(required_gates) && required_gates.length ? required_gates : defaults;
+      const passed = []; const blocked = []; const unknown = [];
+      for (const g of required) {
+        const v = checklist[g];
+        if (v === "pass") passed.push(g);
+        else if (v === "block") blocked.push(g);
+        else unknown.push(g);
+      }
+      const status = (blocked.length === 0 && unknown.length === 0) ? "ok" : "block";
+      try {
+        db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'project_live_check', ?, ?, ?, 'project_live_check')").run(agent_name || "unknown", name, status, JSON.stringify({ required, passed, blocked, unknown }));
+      } catch {}
+      return { status, project: name, required, passed, blocked, unknown, hint: status === "block" ? "Resolve blocked + unknown gates via mem_project_registry_upsert health_checklist={...} before flipping live_status to 'live'." : "All required gates pass — safe to deploy." };
+    },
+  },
   mem_work_claim: {
     description: "Claim a file or module for exclusive work. Other agents see the claim via mem_work_active and mem_work_similar — prevents two agents fixing the same chrome bug in parallel. Auto-expires after ttl_minutes (default 240 = 4h). Returns {ok:true, id} on success, {ok:false, blocked_by:...} if already claimed by another agent. If same agent re-claims, the existing claim is refreshed (TTL extended).",
     inputSchema: { type: "object", properties: { project: { type: "string" }, file_path: { type: "string" }, agent_name: { type: "string" }, summary: { type: "string" }, ttl_minutes: { type: "integer" } }, required: ["project","file_path","agent_name"] },

@@ -1370,6 +1370,59 @@ function handleTool(tdb, name, a) {
       } catch {}
       return { status, action_type: a.action_type, scope: sc, agent_name: a.agent_name || null, checked, missing, facts: status === "ok" ? a.topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
     }
+    case "mem_project_registry_upsert": {
+      if (!a.name) return { error: "name required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_by TEXT)"); } catch {}
+      const fields = ["name"]; const placeholders = ["?"]; const values = [a.name]; const updates = [];
+      const stringKeys = ["domain","repo","server","admin_url","auth_system","stripe_account","vat_status","vat_id","live_status","live_url","staging_url","last_deploy_at","notes","updated_by"];
+      const jsonKeys = ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"];
+      for (const k of stringKeys) if (a[k] !== undefined) { fields.push(k); placeholders.push("?"); values.push(a[k]); updates.push(k + "=excluded." + k); }
+      for (const k of jsonKeys) if (a[k] !== undefined) { fields.push(k); placeholders.push("?"); values.push(JSON.stringify(a[k])); updates.push(k + "=excluded." + k); }
+      updates.push("updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')");
+      const sql = "INSERT INTO project_registry (" + fields.join(",") + ") VALUES (" + placeholders.join(",") + ") ON CONFLICT(name) DO UPDATE SET " + updates.join(", ");
+      tdb.prepare(sql).run(...values);
+      return { ok: true, name: a.name };
+    }
+    case "mem_project_registry_get": {
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const row = tdb.prepare("SELECT * FROM project_registry WHERE name=?").get(a.name);
+      if (!row) return { error: "not found", name: a.name };
+      for (const k of ["pm2_processes","nginx_files","stripe_product_ids","langs","missing_blocks","health_checklist"]) {
+        if (row[k]) try { row[k] = JSON.parse(row[k]); } catch {}
+      }
+      return row;
+    }
+    case "mem_project_registry_list": {
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const where = []; const params = [];
+      if (a.live_status) { where.push("live_status=?"); params.push(a.live_status); }
+      params.push(Math.min(a.limit || 50, 200));
+      const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
+      return { count: rows.length, projects: rows };
+    }
+    case "mem_project_live_check": {
+      if (!a.name) return { error: "name required" };
+      try { tdb.exec("CREATE TABLE IF NOT EXISTS project_registry (name TEXT PRIMARY KEY, domain TEXT, repo TEXT, server TEXT, pm2_processes TEXT, nginx_files TEXT, admin_url TEXT, auth_system TEXT, stripe_account TEXT, stripe_product_ids TEXT, vat_status TEXT, vat_id TEXT, langs TEXT, live_status TEXT, live_url TEXT, staging_url TEXT, last_deploy_at TEXT, missing_blocks TEXT, health_checklist TEXT, notes TEXT, updated_at TEXT, updated_by TEXT)"); } catch {}
+      const row = tdb.prepare("SELECT name, live_status, vat_status, health_checklist FROM project_registry WHERE name=?").get(a.name);
+      if (!row) return { status: "block", reason: "project_registry has no row for " + a.name, hint: "Create it via mem_project_registry_upsert first." };
+      let checklist = {};
+      try { checklist = row.health_checklist ? JSON.parse(row.health_checklist) : {}; } catch {}
+      const defaults = ["auth","billing","vat","legal","mobile","header_footer","pricing","checkout"];
+      const required = Array.isArray(a.required_gates) && a.required_gates.length ? a.required_gates : defaults;
+      const passed = []; const blocked = []; const unknown = [];
+      for (const g of required) {
+        const v = checklist[g];
+        if (v === "pass") passed.push(g);
+        else if (v === "block") blocked.push(g);
+        else unknown.push(g);
+      }
+      const status = (blocked.length === 0 && unknown.length === 0) ? "ok" : "block";
+      try {
+        tdb.exec("CREATE TABLE IF NOT EXISTS agent_action (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT, action_kind TEXT, target TEXT, status TEXT, payload_json TEXT, topic TEXT, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+        tdb.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'project_live_check', ?, ?, ?, 'project_live_check')").run(a.agent_name || "unknown", a.name, status, JSON.stringify({ required, passed, blocked, unknown }));
+      } catch {}
+      return { status, project: a.name, required, passed, blocked, unknown, hint: status === "block" ? "Resolve blocked + unknown gates via mem_project_registry_upsert health_checklist={...} before flipping live_status to 'live'." : "All required gates pass — safe to deploy." };
+    }
     case "mem_work_claim": {
       if (!a.project || !a.file_path || !a.agent_name) return { error: "project + file_path + agent_name required" };
       const ttl = Math.max(1, Math.min(1440, a.ttl_minutes || 240));
