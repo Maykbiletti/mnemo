@@ -1305,6 +1305,71 @@ function handleTool(tdb, name, a) {
       let wishes = []; try { wishes = tdb.prepare("SELECT id, captured_text, classification, captured_by_agent, status FROM wish_buffer WHERE captured_at BETWEEN ? AND ? ORDER BY captured_at DESC LIMIT 50").all(start, end); } catch {}
       return { date: d, agent_name: aname, actions: { count: actions.length, items: actions }, briefs: { count: briefs.length, items: briefs }, decisions: { count: decisions.length, items: decisions }, file_edits: { count: file_edits.length, items: file_edits }, wishes: { count: wishes.length, items: wishes } };
     }
+    case "mem_company_fact_get": {
+      const sc = String(a.scope || "blun").toLowerCase();
+      const factsPath = path.join(__dirname, "facts", sc + ".json");
+      if (!fs.existsSync(factsPath)) return { error: "no facts file for scope: " + sc, hint: "create packages/core/facts/" + sc + ".json" };
+      let data;
+      try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); }
+      catch (e) { return { error: "facts json parse error: " + e.message }; }
+      if (!a.topic) return { scope: sc, _meta: data._meta, topics: Object.keys(data).filter(k => k !== "_meta") };
+      const node = data[a.topic];
+      if (node === undefined) return { error: "unknown topic: " + a.topic, available: Object.keys(data).filter(k => k !== "_meta") };
+      if (!a.key) return { scope: sc, topic: a.topic, value: node };
+      if (Array.isArray(node)) {
+        const matches = node.filter(it => it && (it.name === a.key || it.sub_brand === a.key || it.alias === a.key));
+        return { scope: sc, topic: a.topic, key: a.key, matches };
+      }
+      if (typeof node === "object") return { scope: sc, topic: a.topic, key: a.key, value: node[a.key] };
+      return { scope: sc, topic: a.topic, key: a.key, value: node };
+    }
+    case "mem_company_fact_set": {
+      if (!a.topic || a.value === undefined) return { error: "topic + value required" };
+      const sc = String(a.scope || "blun").toLowerCase();
+      const factsDir = path.join(__dirname, "facts");
+      try { fs.mkdirSync(factsDir, { recursive: true }); } catch {}
+      const factsPath = path.join(factsDir, sc + ".json");
+      let data = {};
+      if (fs.existsSync(factsPath)) {
+        try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); }
+        catch (e) { return { error: "existing facts parse error: " + e.message }; }
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        try { fs.copyFileSync(factsPath, factsPath + ".bak-" + ts); } catch {}
+      }
+      data._meta = data._meta || { scope: sc };
+      data._meta.updated = new Date().toISOString().slice(0, 10);
+      data._meta.last_actor = a.actor || "unknown";
+      data[a.topic] = a.value;
+      const tmp = factsPath + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, factsPath);
+      try {
+        tdb.prepare("INSERT INTO memory (kind, source, actor, topic, importance, layer, text) VALUES ('company_fact_set', 'mnemo:fact-set', ?, ?, 0.9, 'semantic', ?)").run(a.actor || "system", a.topic, "scope=" + sc + " topic=" + a.topic + " value=" + JSON.stringify(a.value).slice(0, 500));
+      } catch {}
+      return { ok: true, scope: sc, topic: a.topic, updated: data._meta.updated };
+    }
+    case "mem_pre_action_check": {
+      if (!a.action_type || !Array.isArray(a.topics)) return { error: "action_type + topics[] required" };
+      const sc = String(a.scope || "blun").toLowerCase();
+      const factsPath = path.join(__dirname, "facts", sc + ".json");
+      const checked = [];
+      const missing = [];
+      let data = null;
+      if (fs.existsSync(factsPath)) {
+        try { data = JSON.parse(fs.readFileSync(factsPath, "utf8")); } catch {}
+      }
+      if (!data) return { status: "block", reason: "no facts file for scope " + sc, action_type: a.action_type, topics: a.topics };
+      for (const t of a.topics) {
+        if (data[t] !== undefined) checked.push({ topic: t, ok: true, preview: Array.isArray(data[t]) ? `${data[t].length} entries` : (typeof data[t] === "object" ? Object.keys(data[t]).join(", ") : String(data[t]).slice(0, 80)) });
+        else missing.push(t);
+      }
+      const status = missing.length === 0 ? "ok" : "block";
+      try {
+        tdb.exec("CREATE TABLE IF NOT EXISTS agent_action (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_name TEXT, action_kind TEXT, target TEXT, status TEXT, payload_json TEXT, topic TEXT, started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))");
+        tdb.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'pre_action_check', ?, ?, ?, 'pre_action_check')").run(a.agent_name || "unknown", a.action_type, status, JSON.stringify({ topics: a.topics, missing, summary: a.summary, scope: sc }));
+      } catch {}
+      return { status, action_type: a.action_type, scope: sc, agent_name: a.agent_name || null, checked, missing, facts: status === "ok" ? a.topics.reduce((acc, t) => (acc[t] = data[t], acc), {}) : null, hint: status === "block" ? "Add missing topics to facts/" + sc + ".json via mem_company_fact_set before proceeding." : "All required facts present — proceed with canonical values, not memory of memory." };
+    }
     case "mem_skill_list": {
       const rows = tdb.prepare("SELECT name, description, sandbox, requires_confirmation, status, source_path, length(body) AS body_len FROM skill_registry ORDER BY name").all();
       return { count: rows.length, skills: rows };
