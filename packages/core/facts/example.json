@@ -1,0 +1,34 @@
+{
+  "_meta": {
+    "scope": "example",
+    "purpose": "Template only. Replace with tenant-specific facts in a private local file or private pack.",
+    "updated": "2026-05-07"
+  },
+  "_comment": "// REPLACE WITH YOUR OWN - copy this to <your-scope>.json and edit. Do not commit real private facts.",
+  "brand": {
+    "name": "Example Company",
+    "tone": "clear, consistent, factual"
+  },
+  "legal": {
+    "entity": "Example Company LLC",
+    "jurisdiction": "Example jurisdiction"
+  },
+  "products": [],
+  "pricing": {},
+  "email_signatures": {
+    "policy": {
+      "required": true,
+      "central_only": true,
+      "no_freestyle_footer": true,
+      "locale_variants": ["de", "en"]
+    },
+    "people": [],
+    "agents": []
+  },
+  "focus_modes": {
+    "default": {
+      "include": ["identity", "open_loops", "recent_decisions"],
+      "limit": 12
+    }
+  }
+}

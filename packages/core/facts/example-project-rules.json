@@ -1,0 +1,90 @@
+{
+  "_meta": {
+    "scope": "example",
+    "purpose": "Template only. Replace with tenant-specific project rules in a private local file or private pack.",
+    "updated": "2026-05-07"
+  },
+  "_comment": "// REPLACE WITH YOUR OWN - copy this to <your-scope>-project-rules.json and edit before enabling blocking hooks.",
+  "defaults": {
+    "canonical_nav": [
+      { "label": "Home", "href": "/" },
+      { "label": "Pricing", "href": "/pricing" },
+      { "label": "Login", "href": "/login" }
+    ],
+    "allowed_domains": [],
+    "auth_matrix": {
+      "status": "unknown",
+      "mode": "unknown",
+      "provider": "unknown",
+      "canonical_project": "unknown",
+      "canonical_login_url": "unknown",
+      "shared_identity_scope": "unknown",
+      "shared_accounts": false,
+      "rule": "Document whether accounts are shared across related products."
+    },
+    "language_matrix": {
+      "required": [],
+      "status": "unknown"
+    },
+    "pricing_rules": {
+      "source_of_truth": "unknown",
+      "status": "unknown"
+    },
+    "checkout_rules": {
+      "provider": "unknown",
+      "status": "unknown"
+    },
+    "vat_rules": {
+      "status": "unknown"
+    },
+    "deploy_rules": {
+      "status": "unknown"
+    },
+    "design_rules": {
+      "status": "unknown",
+      "canonical_brand_project": "unknown",
+      "canonical_header_project": "unknown",
+      "canonical_button_project": "unknown",
+      "canonical_font_source_project": "unknown",
+      "canonical_font_display": "unknown",
+      "canonical_font_body": "unknown",
+      "canonical_logo_light_asset": "unknown",
+      "canonical_logo_dark_asset": "unknown",
+      "canonical_logo_size_rule": "unknown",
+      "canonical_button_size_rule": "unknown",
+      "light_mode_required": true,
+      "dark_mode_required": true,
+      "shared_ui_family": "unknown",
+      "no_local_ui_interpretation": false
+    },
+    "required_gates": ["nav", "header_footer", "links", "auth", "pricing", "checkout", "billing", "vat", "legal", "mobile", "i18n", "deploy", "monitoring"]
+  },
+  "projects": [
+    {
+      "name": "Example Project",
+      "registry": {
+        "domain": "example.test",
+        "live_status": "unknown",
+        "health_checklist": {
+          "nav": "unknown",
+          "header_footer": "unknown",
+          "links": "unknown",
+          "auth": "unknown",
+          "pricing": "unknown",
+          "checkout": "unknown",
+          "billing": "unknown",
+          "vat": "unknown",
+          "legal": "unknown",
+          "mobile": "unknown",
+          "i18n": "unknown",
+          "deploy": "unknown",
+          "monitoring": "unknown"
+        }
+      },
+      "rules": {
+        "notes": "Template project. Replace before using live gates."
+      },
+      "findings": []
+    }
+  ]
+}

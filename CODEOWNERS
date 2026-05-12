@@ -1,0 +1,27 @@
+# CODEOWNERS - who must review what in the Mnemo repo.
+# Format: <path-glob> <@owner1> <@owner2>
+#
+# This public repo ships with the upstream maintainer as the default owner.
+# Organizations installing Mnemo should replace this file with their own
+# maintainer handles, agent owners, and required-review rules.
+
+*                                       @maykbiletti
+
+# Core engine + schema.
+/packages/core/mcp.js                   @maykbiletti
+/packages/core/daemon.js                @maykbiletti
+/packages/core/schema.sql               @maykbiletti
+/packages/core/identity_schema.sql      @maykbiletti
+
+# Public templates and local facts rules.
+/packages/core/facts/                   @maykbiletti
+/packs/                                 @maykbiletti
+
+# Hooks and runtime policy.
+/packages/core/hooks/                   @maykbiletti
+/examples/agent-runtime-config.md       @maykbiletti
+
+# CI + repo policy.
+/.github/                               @maykbiletti
+/CODEOWNERS                             @maykbiletti
+/AGENTS.md                              @maykbiletti

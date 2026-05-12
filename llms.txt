@@ -1,0 +1,113 @@
+## Mnemo - persistent memory and identity for autonomous agents
+
+> Open-source persistent-memory engine with a multi-agent coordination layer.
+> MIT-licensed and self-hostable.
+
+# Core API (HTTP daemon, default port 7117)
+
+POST /ingest
+  Body: {
+    kind: "message" | "edit" | "tool_call" | "scar" | "decision" | "dream" | "memory_md" | "web_fetch" | "ssh_cmd" | "manual" | "skill" | "cron" | "subagent_result" | "identity_soul" | string,
+    source: "telegram" | "terminal" | "session_jsonl" | "hook" | "manual" | "scraper" | string,
+    source_ref: string?,
+    occurred_at: ISO8601,
+    actor: string,
+    actor_id: string?,
+    topic: string?,
+    importance: 0..10,
+    text: string,
+    meta_json: string?
+  }
+  Headers: X-Tenant-Id (defaults to "shared")
+  Returns: { tenant, accepted, inserted, results: [{ ok, inserted, hash }] }
+
+GET /recall?q=<term>&limit=<N>
+  Returns: [ { id, kind, actor, occurred_at, preview, rank } ]
+  Note: q is required, FTS5-indexed.
+
+GET /health
+  Returns: { tenant, memory_rows, writers: [...], uptime_sec }
+
+POST /tool/<tool_name>
+  Body: tool-specific args
+  Available tools (selected): mem_recall_ids, mem_actions_recent, mem_actions_search,
+    mem_belief_get, mem_brief_drop, mem_brief_list, mem_brief_pull, mem_brief_done,
+    mem_commitment_open, mem_commitment_close, mem_commitment_due,
+    mem_connect_register, mem_connect_heartbeat, mem_connect_list,
+    mem_connect_channel_upsert, mem_connect_channel_subscribe, mem_connect_channel_post, mem_connect_channel_list,
+    mem_cycle_recent, mem_delegation_grant, mem_delegation_active,
+    mem_link, mem_neighbors, mem_promise_open, mem_reflect, mem_reflect_now,
+    mem_session_brief, mem_session_route_get, mem_session_route_set,
+    mem_skill_record, mem_skill_run, mem_health, mem_agent_register, mem_agent_list,
+    mem_action_log, mem_action_finish, mem_duration_history
+
+# Mnemo Connect
+
+Each agent registers via `mem_connect_register` with `agent_name`, skills, and channels,
+then heartbeats periodically and pulls briefs queued for it from any channel it subscribes to.
+Channels are simple named topics; any agent can post and subscribers pull.
+
+# Tenants
+
+Multi-tenant. Pass `X-Tenant-Id` on `/ingest`. Common examples:
+  shared  - broadcast / cross-agent knowledge
+  owner   - owner tenant
+  agent-a - example worker tenant
+  agent-b - example worker tenant
+
+# Identity layer
+
+Personality is encoded in three tables:
+- `core_value` for immutable principles
+- `personality_trait` for weighted dimensions
+- `belief` for mutable assumptions
+
+Bootstrap seeds owner identity, autonomy mode, daily ship quota, uncertainty handling, and default channels through an interactive wizard.
+
+# Skills
+
+Skills live as folders containing `SKILL.md` (YAML frontmatter + Markdown body).
+Compatible with the agentskills.io open standard. The skill runner enforces declared sandbox
+(`none` | `shell` | `browser_only` | `docker`) and respects `requires_confirmation`.
+The watcher re-ingests changed `SKILL.md` files automatically.
+
+# Multi-platform gateway
+
+Optional companion process on port 7118. Endpoints:
+- `/slack/events`
+- `/discord/webhook`
+- `/whatsapp/twilio`
+- `/whatsapp/meta`
+- `/generic`
+
+Each inbound message is normalized and ingested via `/ingest`.
+
+# Inspector UI
+
+Optional companion process on port 7119. Live debug view of recent memory entries,
+filterable by tenant, kind, importance, and text.
+
+# NL-Cron
+
+`skills/nl_cron.js` parses natural-language schedules
+(`daily`, `hourly`, `every N minutes`, `weekday HH`) and writes managed lines to `/etc/cron.d/mnemo-nl`.
+Each entry is also ingested as `kind=cron`.
+
+# Subagent pool
+
+`skills/subagent_pool.js` spawns isolated subprocesses for parallel work,
+captures stdout, and persists results as `kind=subagent_result`.
+
+# LLM router
+
+`skills/llm_router.js` chooses a provider/model combination based on task class
+(`chat` | `code` | `summarize` | `classify` | `vision` | `embed`) and target
+(`cheap` | `fast` | `quality`).
+
+# Owner mapping
+
+`skills/owner_map.js` stores cross-platform identity links so the same owner can be recognized across channels.
+
+# License
+
+MIT.

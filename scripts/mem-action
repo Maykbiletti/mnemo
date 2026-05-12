@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Wrapper: log an action to Mnemo Action-Memory
+set -euo pipefail
+HOST="${MNEMO_HOST:-http://127.0.0.1:7117}"
+AGENT="${MNEMO_AGENT:-agent}"
+SESSION="${MNEMO_SESSION:-${MNEMO_SESSION_ID:-}}"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  start)
+    kind="${1:-tool_call}"
+    target="${2:-}"
+    topic="${3:-}"
+    payload="${4:-null}"
+    body=$(jq -nc --arg a "$AGENT" --arg k "$kind" --arg t "$target" --arg topic "$topic" --arg s "$SESSION" --argjson p "${payload}" \
+      '{agent_name:$a, action_kind:$k, target:$t, topic:$topic, session_id:$s, payload:$p}')
+    curl -fsS -X POST "$HOST/tool/mem_action_log" -H 'content-type: application/json' -d "$body" | jq -r '.result.id'
+    ;;
+  finish)
+    id="${1:?id required}"
+    status="${2:-ok}"
+    result="${3:-null}"
+    body=$(jq -nc --argjson id "$id" --arg s "$status" --argjson r "$result" '{id:$id, status:$s, result:$r}')
+    curl -fsS -X POST "$HOST/tool/mem_action_finish" -H 'content-type: application/json' -d "$body" | jq -c
+    ;;
+  one)
+    kind="${1:?kind required}"
+    target="${2:-}"
+    topic="${3:-}"
+    result="${4:-null}"
+    id=$("$0" start "$kind" "$target" "$topic")
+    "$0" finish "$id" ok "$result"
+    ;;
+  recent)
+    limit="${1:-20}"
+    body=$(jq -nc --arg a "$AGENT" --argjson l "$limit" '{agent_name:$a, limit:$l}')
+    curl -fsS -X POST "$HOST/tool/mem_actions_recent" -H 'content-type: application/json' -d "$body" \
+      | jq -r '.result.actions[] | "\(.started_at) \(.action_kind) target=\(.target) status=\(.status) lat=\(.latency_ms // "-")ms"'
+    ;;
+  search)
+    q="${1:?query required}"
+    body=$(jq -nc --arg q "$q" '{q:$q, limit:30}')
+    curl -fsS -X POST "$HOST/tool/mem_actions_search" -H 'content-type: application/json' -d "$body" \
+      | jq -r '.result.actions[] | "\(.started_at) \(.action_kind) target=\(.target) status=\(.status)"'
+    ;;
+  *)
+    echo "usage: mem-action {start <kind> [target] [topic] [payload-json] | finish <id> [status] [result-json] | one <kind> [target] [topic] [result-json] | recent [limit] | search <query>}" >&2
+    exit 2
+    ;;
+esac

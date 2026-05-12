@@ -1,0 +1,256 @@
+<div align="center">
+
+```
+â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•— 
+â–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•â•â•â–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•â–ˆâ–ˆâ•—
+â–ˆâ–ˆâ•”â–ˆâ–ˆâ–ˆâ–ˆâ•”â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â–ˆâ–ˆâ•— â–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•”â–ˆâ–ˆâ–ˆâ–ˆâ•”â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘
+â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•  â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘
+â–ˆâ–ˆâ•‘ â•šâ•â• â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘ â•šâ–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘ â•šâ•â• â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•
+â•šâ•â•     â•šâ•â•â•šâ•â•  â•šâ•â•â•â•â•šâ•â•â•â•â•â•â•â•šâ•â•     â•šâ•â• â•šâ•â•â•â•â•â•
+```
+
+**Persistent memory, identity, and coordination for AI agent teams.**
+
+[![CI](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml/badge.svg)](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1a1a1a?style=flat-square)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-1a1a1a?style=flat-square)](.nvmrc)
+[![Status](https://img.shields.io/badge/status-alpha-22D3EE?style=flat-square)](./ROADMAP.md)
+[![Powered by BLUN](https://img.shields.io/badge/Powered%20by-BLUN-00c9ff?style=flat-square)](https://blun.ai)
+
+</div>
+
+Mnemo gives agents a durable operating layer: searchable memory, identity,
+briefs, work claims, project rules, quality findings, and autonomous loop
+discipline in one local-first SQLite system.
+
+It is built for the practical problem every long-running agent setup hits:
+sessions end, context gets compacted, multiple agents duplicate work, and nobody
+can prove what changed, who did it, or which project gates are still open.
+
+## What Mnemo Does
+
+- Stores conversations, actions, decisions, corrections, handoffs, and source
+  receipts in SQLite.
+- Exposes memory and coordination through MCP, HTTP, CLI tools, and a lightweight
+  frontdoor endpoint.
+- Keeps agent identity, owner preferences, project rules, and team roles as data
+  instead of prompt text.
+- Coordinates multiple agents with briefs, departments, work claims, file
+  ownership, readiness boards, and stale-work recovery.
+- Enforces safer work loops with pre-work, regression, site-contract,
+  completion, and token-efficiency guards.
+- Captures messages and actions from channels, local sessions, PM2 logs, and
+  historical exports through an idempotent universal capture pipeline.
+- Keeps public installs generic: private facts, companies, servers, prices,
+  channels, customers, and personas live in ignored local files or private packs.
+
+## New In The Current Public Core
+
+- **Universal Capture Frontdoor.** `mem_capture_ingest` and
+  `mem_capture_ingest_batch` write raw receipts, duplicate receipts, optional
+  transcript rows, and optional semantic memory rows through one idempotent API.
+- **Backfill Importer.** `mnemo-backfill-universal` replays Telegram exports,
+  local CLI session logs, local agent session roots, and PM2 logs. It defaults to
+  dry-run, supports batching, skips malformed exports with warnings, and keeps
+  dedup receipts.
+- **Capture Receipts.** `capture_receipt` records source, source reference,
+  content hash, first/last seen timestamps, seen count, status, and metadata.
+- **Reminder Memory.** `mem_reminder_capture`, `mem_reminder_add`, and
+  `mem_reminder_due` turn future-dated owner requests into durable reminders
+  instead of loose chat memories.
+- **Runtime Health.** `mem_runtime_health` shows each agent's loop version,
+  Mnemo commit, dirty state, heartbeat age, pending briefs, due reminders, and
+  recent errors. Broken registry rows are counted separately so dashboards do
+  not treat stale path values as real offline agents.
+- **Autonomous Agent Loop.** `mnemo-agent-loop` polls briefs, runs initiative
+  cycles when idle, claims safe work, respects auth cooldowns, and writes
+  handoffs instead of silently stopping.
+- **Runtime Hook.** `mnemo-firm-hook` can enforce session start, project/task
+  preflight, file claims, clean work, token discipline, site contracts, and
+  completion handoffs.
+- **Smart Code Read.** `mem_code_outline` and `mem_code_unfold` let agents
+  inspect symbols and bounded ranges before spending tokens on whole files.
+- **Context Preview.** `mem_context_preview` gives agents a token-budgeted fetch
+  plan before they load memory.
+- **Site And Route Audits.** `mnemo-site-contract-audit` and
+  `mnemo-route-matrix-audit` help verify navigation, auth, language, theme,
+  header/footer, and route surfaces.
+- **Public Pack Structure.** The repo ships only `packs/example-pack`; real
+  preferences and project facts belong in private packs.
+
+## Quick Start
+
+```bash
+git clone https://github.com/Maykbiletti/mnemo.git
+cd mnemo/packages/core
+npm install
+npm run bootstrap
+npm run daemon
+```
+
+The bootstrap asks for owner name, scope name, agent names, and first project
+context. It creates ignored local files for facts, hook env, aliases, and local
+runtime state. Nothing private has to be committed.
+
+Wire the MCP server into an MCP-aware agent client:
+
+```bash
+node /path/to/mnemo/packages/core/mcp.js
+```
+
+Start a session:
+
+```text
+mem_session_start({agent_name:"agent-a", project:"example-project", task:"first run"})
+mem_context_preview({agent_name:"agent-a", project:"example-project", task:"first run", token_budget:1200})
+mem_session_brief({agent_name:"agent-a", project:"example-project", token_budget:250})
+mem_recall("what did we decide about migrations")
+mem_promise_open()
+```
+
+## Start An Agent Loop
+
+After PM2 is installed, an agent can start or repair its own worker loop:
+
+```bash
+cd /path/to/mnemo/packages/core
+npm run agent-loop:start -- agent-a /path/to/workspace --engine agent
+```
+
+The helper starts `agent-loop-agent-a`, saves PM2 state, and enables the
+pre-work, completion, regression, site-contract, token-efficiency, and smart
+code-read guards by default.
+
+For a print-mode external CLI, use `--engine print-cli` and set
+`EXTERNAL_AGENT_BIN` to the binary name. The public core does not require a
+specific runtime.
+
+## Universal Capture
+
+Use the capture frontdoor for every bridge, bot, console, webhook, loop, and
+historical import:
+
+```bash
+mnemo-backfill-universal --source auto --dry-run
+mnemo-backfill-universal --source telegram --path "./ChatExport/result.json" --commit --batch-size 100
+mnemo-backfill-universal --source agent --path "$HOME/.agent-sessions" --commit
+mnemo-backfill-universal --source local-agent --agent-root "/path/to/agent-root" --commit
+```
+
+Rules:
+
+- Every source gets a stable `conversation_id`.
+- Every message/action gets a stable `source_ref`.
+- Burst messages must not be dropped.
+- Duplicate-looking messages still leave a duplicate receipt.
+- Attachments should be indexed with `meta.media_path` when a local file exists.
+- Future requests like "remind me tomorrow" must become `reminder` rows through
+  `mem_reminder_capture`; ambiguous dates are kept as `status=needs_due_at`.
+- Bad export files are reported and skipped, not allowed to stop the whole run.
+
+See [`docs/universal-capture.md`](docs/universal-capture.md).
+
+## Firm-OS Layer
+
+Mnemo can run a small agent organization, not just a memory database:
+
+- **Project registry:** domains, repos, services, admin routes, auth, checkout,
+  VAT, languages, deployment state, and readiness gates.
+- **Departments:** review, frontend, backend, billing, QA, deploy-ops,
+  content/legal, or your own lanes.
+- **Brief inboxes:** one agent or team fanout with status and handoff records.
+- **Work claims:** TTL locks on files/modules before edits.
+- **Quality findings:** owner-visible bugs, regressions, and missing gates.
+- **Readiness board:** project state that turns gaps into autonomy tasks.
+- **Loop doctor:** heartbeats, blocked workers, stale actions, auth failures,
+  and stale briefs.
+- **Completion guard:** no "done" without dependency checks, tests/smokes, and
+  remaining-work status.
+
+Read [`AGENTS.md`](AGENTS.md) before using Mnemo inside an local runtime.
+
+## Public Release Hygiene
+
+This repository is intentionally neutral.
+
+Committed files must not contain:
+
+- real company/customer facts
+- private chat IDs or phone numbers
+- server IPs, SSH commands, tokens, credentials, or key paths
+- pricing, legal, billing, or VAT facts for a real business
+- private personas, family data, internal project names, or support channels
+- copied provenance notes from another project
+
+Use these local/private locations instead:
+
+- `.env.local`
+- `.mnemo-hook.env`
+- `.mnemo-project-aliases.json`
+- `packages/core/facts/<scope>.json`
+- `packages/core/facts/<scope>-project-rules.json`
+- `packs/<name>-personal-pack/`
+- your password manager or vault, referenced by `secret_ref`
+
+The repo includes `packages/core/facts/example.json` and
+`packs/example-pack/` as templates only.
+
+## Packages
+
+| package | purpose |
+|---|---|
+| `@mnemo/core` | daemon, MCP server, schema, hooks, agent loop, capture, backfill, skills, audits |
+| `@mnemo/client` | zero-dependency Node client for tenant-aware ingest and recall |
+| `packages/connect` | distributed agent and machine connection helpers |
+| `mnemo-pc` | Go-based desktop helper for paired machines |
+| `packs/example-pack` | public template for private packs |
+
+## Docs
+
+- [`AGENTS.md`](AGENTS.md) - operating guide for agents
+- [`docs/architecture.md`](docs/architecture.md) - system architecture
+- [`docs/deployment.md`](docs/deployment.md) - server, PM2, env, proxy
+- [`docs/agent-operating-dna.md`](docs/agent-operating-dna.md) - where agents read and store operational truth
+- [`docs/mcp-tools.md`](docs/mcp-tools.md) - tool surface
+- [`docs/universal-capture.md`](docs/universal-capture.md) - capture and backfill
+- [`docs/public-release-hygiene.md`](docs/public-release-hygiene.md) - keeping private data out of the public repo
+- [`docs/UPDATE-AGENT.md`](docs/UPDATE-AGENT.md) - updating local installs
+- [`examples/agent-runtime-config.md`](examples/agent-runtime-config.md) - hook wiring
+
+## Security
+
+Mnemo is local-first and stores private memory in plaintext SQLite by default.
+Protect `mnemo.db` like a private key. Do not expose the HTTP daemon directly to
+the internet without authentication at the proxy layer. Store secrets in a vault
+and put only `secret_ref` labels in Mnemo.
+
+See [`SECURITY.md`](SECURITY.md).
+
+## Status
+
+Alpha. The core memory, MCP, daemon, agent loop, runtime hook, universal capture,
+backfill, and public pack structure are usable today. APIs may still change.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
+
+
+## Mission Control
+
+Mnemo ships a web-based operator panel. Features: live agent status, brief CRUD, task board, signature registry, 10s auto-refresh.
+
+## Channels and Gateways
+
+email_gateway (IMAP+SMTP), multi_gateway (fan-out), mnemo_remote_mcp (HTTP MCP for remote sessions). Managed by ecosystem.config.js.
+
+## Skill Runtime
+
+skills/ directory: nl_cron, approval_queue, subagent_pool, skill_runner, skills_watcher, live_check_sweep, agent_auto_resume, execute_code, trajectory_export.
+
+---
+
+<p align="center">
+  <strong>Get it done. With <a href="https://blun.ai">BLUN</a>.</strong><br>
+  Powered by <a href="https://blun.ai">BLUN</a> Â· Built with Mnemo
+</p>

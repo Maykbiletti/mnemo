@@ -1,0 +1,64 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+.tg_offset
+.models/
+exports/
+sources/
+.env
+.env.local
+.mnemo-hook.env
+.mnemo-project-aliases.json
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+dist/
+build/
+coverage/
+
+# Personal pack — NEVER commit private personality data
+packages/pack-*/data/
+packs/*-personal-pack/
+!packs/example-pack/
+!packs/example-pack/**
+
+# Tenant/company facts are installed locally or through private packs.
+packages/core/facts/*.json
+!packages/core/facts/example*.json
+!packages/core/facts/README.md
+
+# Server snapshots and customer-specific working copies stay outside git.
+_server_work/
+
+# Local/private operator artifacts.
+packages/core/firm-os-daemon-patch.txt
+packages/core/skills/drop_phase_brief_to_*/
+*-demo-counter-preview.png
+
+
+# Playwright runtime cache
+.playwright-cli/
+**/.playwright-cli/
+
+# Daemon runtime logs
+daemon.log.*
+**/daemon.log.*
+
+# Runtime state / local queues
+.approval_queue.json
+.brief_poll_state
+.context_files_state.json
+.nl_cron_state.json
+.owner_map.json
+.subagent_queue.json
+
+# Backup files
+*.bak
+*.bak.*
+*.bak-*
+
+# Local verification / evidence output
+reports/
