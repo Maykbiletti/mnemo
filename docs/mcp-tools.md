@@ -116,7 +116,9 @@ as `summary.invalid_registry_rows`; pass `include_invalid: true` to inspect them
 Mission Control status for memory usage. Shows, per agent, the latest
 `SessionStart`, `UserPromptSubmit`, `PreCompact`, `PostToolUse`, `Stop`, and
 `SessionEnd` hook status, whether transcript sync passed, whether prompt capture
-passed, and whether prior recall ran before the response.
+passed, and whether prior recall ran before the response. Pair this with
+`mnemo-hook-doctor` on the agent machine to check local hook wiring, queue
+backlog, hub health, and queued-write replay.
 
 ```ts
 mem_agent_memory_health({ stale_minutes: 1440 })

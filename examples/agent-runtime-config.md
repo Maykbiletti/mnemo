@@ -73,8 +73,8 @@ For Claude Code, wire the lifecycle hooks to the same command:
     "SessionStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-start" }] }],
     "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js user-prompt" }] }],
     "PreCompact": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-compact" }] }],
-    "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool" }] }],
-    "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool" }] }],
+    "PreToolUse": [{ "matcher": "Read|Edit|Write|MultiEdit|Bash|Grep|Glob", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool" }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool" }] }],
     "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop" }] }],
     "SessionEnd": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-end" }] }]
   }
@@ -85,8 +85,10 @@ For Claude Code, wire the lifecycle hooks to the same command:
 `mem_capture_ingest`, the current Claude transcript tail is synced, relevant
 prior conversations are recalled, and the resulting Mnemo context is injected
 back into Claude. `PreCompact` syncs the transcript before compaction so context
-compression cannot become a memory-loss event. `SessionEnd` writes a final hook
-status snapshot for Mission Control.
+compression cannot become a memory-loss event. `PostToolUse` captures a compact
+tool observation for all tools, not only edits. `Stop` and `SessionEnd` write a
+summary memory plus final hook status for Mission Control. If the hub is down,
+hook writes are queued locally and flushed on the next hook event.
 
 Recommended environment:
 
@@ -116,6 +118,11 @@ export MNEMO_REQUIRE_SMART_CODE_READ=1
 export MNEMO_SMART_CODE_READ_MIN_BYTES=20000
 export MNEMO_REQUIRE_CHAT_CAPTURE=1
 export MNEMO_REQUIRE_PROMPT_RECALL=1
+export MNEMO_CAPTURE_TOOL_OBSERVATION=1
+export MNEMO_CAPTURE_SESSION_SUMMARY=1
+export MNEMO_HOOK_QUEUE_ON_FAILURE=1
+export MNEMO_HOOK_FLUSH_ON_EVENT=1
+export MNEMO_HOOK_QUEUE_DIR="$HOME/.mnemo/hook_queue"
 export MNEMO_TRANSCRIPT_SYNC_LINES=180
 export MNEMO_PROMPT_RECALL_LIMIT=8
 export MNEMO_ALLOW_AUTONOMOUS_LOW_RISK_IDEAS=1
@@ -128,6 +135,13 @@ export MNEMO_ALLOW_DESTRUCTIVE=0
 ```
 
 Flip `MNEMO_HOOK_BLOCK=1` only after smoke tests pass.
+
+Run the doctor after wiring hooks or after any hub restart:
+
+```bash
+mnemo-hook-doctor
+mnemo-hook-doctor --flush
+```
 
 ## 5. Alias Smoke
 

@@ -10,6 +10,7 @@
  *   embed                 backfill missing embeddings
  *   loops                 run open-loop scanner sweep
  *   export                regenerate AGENTS/SOUL/TOOLS markdown
+ *   hook-doctor           diagnose runtime hook, queue, and hub health
  *   pack apply <name>     apply a personality pack
  *   --help                show this
  */
@@ -40,6 +41,8 @@ Commands:
   embed                 backfill embeddings for new memory rows
   loops                 sweep open-loop scanner
   export                regenerate SOUL.md / AGENTS.md / TOOLS.md
+  hook-doctor           diagnose runtime hook, queue, and hub health
+  hook-flush            flush queued hook writes to the hub
   pack apply <name>     load a personality pack
   --help                this message
 
@@ -71,6 +74,8 @@ if (cmd === "mcp")   return process.exit(run("mcp.js"));
 if (cmd === "embed") return process.exit(run("embedding_writer.js"));
 if (cmd === "loops") return process.exit(run("loop_scanner_v2.js"));
 if (cmd === "export") return process.exit(run("export_declarative.js"));
+if (cmd === "hook-doctor") return process.exit(spawnSync(process.execPath, [path.join(ROOT, "hooks", "hook-doctor.js"), ...args.slice(1)], { stdio: "inherit" }).status || 0);
+if (cmd === "hook-flush") return process.exit(spawnSync(process.execPath, [path.join(ROOT, "hooks", "hook-doctor.js"), "--flush", ...args.slice(1)], { stdio: "inherit" }).status || 0);
 
 if (cmd === "pack" && args[1] === "apply" && args[2]) {
   const packName = args[2];

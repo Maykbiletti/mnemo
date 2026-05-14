@@ -66,8 +66,9 @@ can prove what changed, who did it, or which project gates are still open.
   cycles when idle, claims safe work, respects auth cooldowns, and writes
   handoffs instead of silently stopping.
 - **Runtime Hook.** `mnemo-firm-hook` can enforce session start, project/task
-  preflight, file claims, clean work, token discipline, site contracts, and
-  completion handoffs.
+  preflight, file claims, clean work, token discipline, site contracts, tool
+  observation capture, queued-write replay, session summaries, and completion
+  handoffs. `mnemo-hook-doctor` checks local hook wiring and hub health.
 - **Smart Code Read.** `mem_code_outline` and `mem_code_unfold` let agents
   inspect symbols and bounded ranges before spending tokens on whole files.
 - **Context Preview.** `mem_context_preview` gives agents a token-budgeted fetch

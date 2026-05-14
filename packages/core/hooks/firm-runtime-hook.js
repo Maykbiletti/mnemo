@@ -7,6 +7,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 const { stripPrivate } = require("../shared_utils");
+const { enqueueToolCall, flushQueue, queueStats } = require("./hook_queue");
 
 const EVENT = String(process.argv[2] || process.env.MNEMO_HOOK_EVENT || "pre-tool").toLowerCase();
 const BASE_URL = String(process.env.MNEMO_HUB_URL || process.env.MNEMO_HOST || "http://127.0.0.1:7117").replace(/\/+$/, "");
@@ -42,6 +43,8 @@ const TRANSCRIPT_SYNC_LINES = Math.max(20, Number(process.env.MNEMO_TRANSCRIPT_S
 const TRANSCRIPT_TAIL_BYTES = Math.max(65536, Number(process.env.MNEMO_TRANSCRIPT_TAIL_BYTES || 1048576));
 const MAX_CAPTURE_TEXT_CHARS = Math.max(500, Number(process.env.MNEMO_MAX_CAPTURE_TEXT_CHARS || 8000));
 const MAX_INJECTED_CONTEXT_CHARS = Math.max(1000, Number(process.env.MNEMO_MAX_INJECTED_CONTEXT_CHARS || 5500));
+const HOOK_QUEUE_ON_FAILURE = process.env.MNEMO_HOOK_QUEUE_ON_FAILURE !== "0";
+const HOOK_FLUSH_ON_EVENT = process.env.MNEMO_HOOK_FLUSH_ON_EVENT !== "0";
 
 function readStdin() {
   try {
@@ -635,7 +638,30 @@ async function safeTool(name, args) {
   try {
     return { ok: true, result: await callTool(name, args) };
   } catch (e) {
-    return { ok: false, error: e.message };
+    let queued = null;
+    if (HOOK_QUEUE_ON_FAILURE) {
+      try {
+        queued = enqueueToolCall({
+          tool_name: name,
+          args: args || {},
+          error: e.message,
+          source: "firm-runtime-hook",
+          event: EVENT
+        });
+      } catch (queueError) {
+        queued = { ok: false, error: queueError.message };
+      }
+    }
+    return { ok: false, error: e.message, queued };
+  }
+}
+
+async function flushHookQueue() {
+  if (!HOOK_FLUSH_ON_EVENT) return { enabled: false, stats: queueStats() };
+  try {
+    return await flushQueue(BASE_URL, {});
+  } catch (e) {
+    return { ok: false, error: e.message, stats: queueStats() };
   }
 }
 
@@ -651,6 +677,14 @@ function truncateText(value, max) {
 
 function memorySafeText(value) {
   return stripPrivate(String(value || "")).text || "";
+}
+
+function memorySafeJson(value, maxChars) {
+  try {
+    return truncateText(memorySafeText(JSON.stringify(value ?? null, null, 2)), maxChars || 6000);
+  } catch {
+    return truncateText(memorySafeText(String(value || "")), maxChars || 6000);
+  }
 }
 
 function hookSessionId(input) {
@@ -770,9 +804,11 @@ function captureItem(input, opts) {
     }, opts.meta || {}),
     occurred_at: opts.occurred_at || new Date().toISOString(),
     promote_transcript: true,
-    promote_memory: false,
-    remember: false,
-    topic: "claude-code"
+    promote_memory: opts.promote_memory === true,
+    remember: opts.remember === true,
+    memory_kind: opts.memory_kind || undefined,
+    importance: opts.importance || undefined,
+    topic: opts.topic || "claude-code"
   };
 }
 
@@ -902,6 +938,165 @@ async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
     blockers: errors.length ? ["transcript sync failed: " + errors.slice(0, 3).join("; ")] : [],
     warnings: errors.slice(0, 5)
   };
+}
+
+function toolInputSnapshot(input) {
+  return input.tool_input || input.args || (input.tool && input.tool.input) || {};
+}
+
+function toolResultSnapshot(input) {
+  return input.tool_result || input.result || input.response || input.output || input.error || null;
+}
+
+async function captureToolObservation(input, agent, project) {
+  if (process.env.MNEMO_CAPTURE_TOOL_OBSERVATION === "0") return { enabled: false, ok: true, skipped: "disabled" };
+  const name = toolName(input) || EVENT;
+  const toolInput = toolInputSnapshot(input);
+  const toolResult = toolResultSnapshot(input);
+  const files = filePaths(input);
+  const content = [
+    "Claude tool observation",
+    `agent: ${agent}`,
+    `project: ${project}`,
+    `tool: ${name}`,
+    `cwd: ${cwdFrom(input)}`,
+    files.length ? `files: ${files.slice(0, 12).join(", ")}` : "",
+    "",
+    "input:",
+    memorySafeJson(toolInput, 5000),
+    "",
+    "result:",
+    memorySafeJson(toolResult, 5000)
+  ].filter((line) => line !== "").join("\n");
+  const sessionId = hookSessionId(input) || "no-session";
+  const item = captureItem(input, {
+    project,
+    role: "system",
+    speaker: agent,
+    event_kind: "claude_tool_observation",
+    reason: "post-tool",
+    content,
+    dedupe_key: `claude-tool:${sessionId}:${name}:${shortHash(content)}`,
+    payload: {
+      tool_name: name,
+      has_input: !!toolInput && Object.keys(Object(toolInput)).length > 0,
+      has_result: toolResult != null,
+      error: input.error || null,
+      files
+    },
+    meta: { agent_name: agent, tool_name: name }
+  });
+  const result = await safeTool("mem_capture_ingest", item);
+  if (!result.ok || (result.result && result.result.error)) {
+    const error = result.error || result.result.error;
+    return {
+      enabled: true,
+      ok: false,
+      blockers: [],
+      warnings: ["tool observation capture failed: " + error],
+      queued: result.queued || null
+    };
+  }
+  return { enabled: true, ok: true, result: result.result };
+}
+
+function summarizeTranscriptForMemory(input, agent, project, reason) {
+  let tail;
+  try {
+    tail = readTranscriptTail(hookTranscriptPath(input), Math.max(120, TRANSCRIPT_SYNC_LINES));
+  } catch (e) {
+    tail = { ok: false, error: e.message };
+  }
+  if (!tail.ok) return { ok: false, warning: tail.error };
+
+  const user = [];
+  const assistant = [];
+  for (const raw of tail.lines) {
+    let entry = null;
+    try { entry = JSON.parse(raw); } catch { continue; }
+    const extracted = claudeEntryText(entry);
+    const text = compactQueryText(memorySafeText(extracted.text));
+    if (!text) continue;
+    if (extracted.role === "user") user.push(text);
+    if (extracted.role === "assistant") assistant.push(text);
+  }
+
+  const files = filePaths(input).slice(0, 12);
+  const lines = [
+    `Session summary for ${agent} on ${project}`,
+    `reason: ${reason}`,
+    `session_id: ${hookSessionId(input) || "unknown"}`,
+    "",
+    "Recent user requests:",
+    ...(user.slice(-6).map((text) => `- ${truncateText(text, 420)}`)),
+    "",
+    "Recent assistant work:",
+    ...(assistant.slice(-8).map((text) => `- ${truncateText(text, 420)}`)),
+    "",
+    "Files seen in hook payload:",
+    ...(files.length ? files.map((file) => `- ${file}`) : ["- none"])
+  ];
+  const summary = lines.join("\n").trim();
+  if (!user.length && !assistant.length && !files.length) return { ok: false, warning: "no transcript turns or file references found" };
+  return {
+    ok: true,
+    summary: truncateText(summary, MAX_CAPTURE_TEXT_CHARS),
+    user_turns: user.length,
+    assistant_turns: assistant.length,
+    transcript_path: tail.transcript_path,
+    scanned_lines: tail.lines.length
+  };
+}
+
+async function captureSessionSummary(input, agent, project, reason) {
+  if (process.env.MNEMO_CAPTURE_SESSION_SUMMARY === "0") return { enabled: false, ok: true, skipped: "disabled" };
+  const summary = summarizeTranscriptForMemory(input, agent, project, reason);
+  if (!summary.ok) {
+    return {
+      enabled: true,
+      ok: true,
+      skipped: "no-summary",
+      warnings: summary.warning ? [summary.warning] : []
+    };
+  }
+  const sessionId = hookSessionId(input) || "no-session";
+  const item = captureItem(input, {
+    project,
+    role: "system",
+    speaker: agent,
+    event_kind: "claude_session_summary",
+    reason,
+    content: summary.summary,
+    dedupe_key: `claude-session-summary:${sessionId}:${reason}:${shortHash(summary.summary)}`,
+    payload: {
+      reason,
+      user_turns: summary.user_turns,
+      assistant_turns: summary.assistant_turns,
+      scanned_lines: summary.scanned_lines
+    },
+    meta: {
+      agent_name: agent,
+      summary_reason: reason,
+      transcript_path: summary.transcript_path
+    },
+    promote_memory: true,
+    remember: true,
+    memory_kind: "reflection",
+    importance: 6,
+    topic: "session_summary"
+  });
+  const result = await safeTool("mem_capture_ingest", item);
+  if (!result.ok || (result.result && result.result.error)) {
+    const error = result.error || result.result.error;
+    return {
+      enabled: true,
+      ok: false,
+      blockers: [],
+      warnings: ["session summary capture failed: " + error],
+      queued: result.queued || null
+    };
+  }
+  return { enabled: true, ok: true, result: result.result, user_turns: summary.user_turns, assistant_turns: summary.assistant_turns };
 }
 
 function compactQueryText(text) {
@@ -1066,6 +1261,7 @@ function compactHookPayload(data) {
   const prior = data.prior_context || {};
   const prompt = data.prompt_capture || {};
   const session = data.session_start || data.result || {};
+  const queue = data.queue_flush || {};
   return {
     hook_event: data.hook_event,
     project: data.project,
@@ -1077,6 +1273,9 @@ function compactHookPayload(data) {
     prior_recall_ok: prior.ok == null ? null : !!prior.ok,
     prior_count: prior.count == null ? null : Number(prior.count || 0),
     session_start_ok: session.ok == null ? null : !!session.ok,
+    queue_flush_ok: queue.ok == null ? null : !!queue.ok,
+    queue_flushed: queue.flushed == null ? null : Number(queue.flushed || 0),
+    queue_remaining: queue.remaining == null ? null : Number(queue.remaining || 0),
     blockers: asArray(data.blockers).slice(0, 8),
     warnings: [
       ...asArray(prompt.warnings),
@@ -1113,6 +1312,7 @@ async function sessionStart(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const result = await safeTool("mem_session_start", {
     agent_name: agent,
     project: project_info.name,
@@ -1122,7 +1322,7 @@ async function sessionStart(input) {
   const prior_context = await priorContextCheck(input, project, inferTopics(input), promptText(input) || taskText(input));
   const context = injectedContextText("SessionStart", { project_info, session_start: result, transcript_sync, prior_context });
   const ok = result.ok && transcript_sync.ok && prior_context.ok;
-  const hook_status = await logHookStatus(input, agent, project, "SessionStart", ok, { result, transcript_sync, prior_context });
+  const hook_status = await logHookStatus(input, agent, project, "SessionStart", ok, { result, transcript_sync, prior_context, queue_flush });
   print({
     ok,
     event: "session-start",
@@ -1130,6 +1330,7 @@ async function sessionStart(input) {
     result: result.ok ? result.result : { error: result.error },
     transcript_sync,
     prior_context,
+    queue_flush,
     hook_status,
     hookSpecificOutput: {
       hookEventName: "SessionStart",
@@ -1143,6 +1344,7 @@ async function userPromptSubmit(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const prompt = promptText(input);
   const topics = Array.from(new Set([...inferTopics(input), ...inferTopics(Object.assign({}, input, { prompt }))]));
   const prompt_capture = await capturePromptSubmit(input, agent, project, prompt);
@@ -1164,7 +1366,7 @@ async function userPromptSubmit(input) {
 
   if (blockers.length && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ");
-    const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", false, { prompt_capture, transcript_sync, prior_context, blockers });
+    const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", false, { prompt_capture, transcript_sync, prior_context, queue_flush, blockers });
     print({
       ok: false,
       event: "user-prompt",
@@ -1174,6 +1376,7 @@ async function userPromptSubmit(input) {
       prompt_capture,
       transcript_sync,
       prior_context,
+      queue_flush,
       hook_status,
       hookSpecificOutput: {
         hookEventName: "UserPromptSubmit",
@@ -1186,7 +1389,7 @@ async function userPromptSubmit(input) {
   }
 
   const ok = prompt_capture.ok && transcript_sync.ok && prior_context.ok;
-  const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", ok, { prompt_capture, transcript_sync, prior_context, session_start });
+  const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", ok, { prompt_capture, transcript_sync, prior_context, session_start, queue_flush });
   print({
     ok,
     event: "user-prompt",
@@ -1194,6 +1397,7 @@ async function userPromptSubmit(input) {
     prompt_capture,
     transcript_sync,
     prior_context,
+    queue_flush,
     hook_status,
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
@@ -1207,6 +1411,7 @@ async function preCompact(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const transcript_sync = await syncTranscriptTail(input, agent, project, "pre-compact", Math.max(240, TRANSCRIPT_SYNC_LINES));
   const snapshot = await safeTool("mem_capture_ingest", captureItem(input, {
     project,
@@ -1226,7 +1431,7 @@ async function preCompact(input) {
   const context = injectedContextText("PreCompact", { project_info, transcript_sync });
   if (blockers.length && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ");
-    const hook_status = await logHookStatus(input, agent, project, "PreCompact", false, { transcript_sync, snapshot, blockers });
+    const hook_status = await logHookStatus(input, agent, project, "PreCompact", false, { transcript_sync, snapshot, queue_flush, blockers });
     print({
       ok: false,
       event: "pre-compact",
@@ -1234,6 +1439,7 @@ async function preCompact(input) {
       reason,
       project_info,
       transcript_sync,
+      queue_flush,
       snapshot,
       hook_status,
       hookSpecificOutput: {
@@ -1246,12 +1452,13 @@ async function preCompact(input) {
     return;
   }
   const ok = transcript_sync.ok && snapshot.ok;
-  const hook_status = await logHookStatus(input, agent, project, "PreCompact", ok, { transcript_sync, snapshot });
+  const hook_status = await logHookStatus(input, agent, project, "PreCompact", ok, { transcript_sync, snapshot, queue_flush });
   print({
     ok,
     event: "pre-compact",
     project_info,
     transcript_sync,
+    queue_flush,
     snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
     hook_status,
     hookSpecificOutput: {
@@ -1266,6 +1473,7 @@ async function preTool(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const files = filePaths(input);
   const topics = inferTopics(input);
   const action_type = inferActionType(input);
@@ -1312,7 +1520,7 @@ async function preTool(input) {
   ];
   if ((preflight.status === "block" || blockers.length) && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ") || "Mnemo preflight blocked this action.";
-    const hook_status = await logHookStatus(input, agent, project, "PreToolUse", false, { blockers, prior_context: { ok: true, count: 0 }, transcript_sync: { ok: true, count: 0 } });
+    const hook_status = await logHookStatus(input, agent, project, "PreToolUse", false, { queue_flush, blockers, prior_context: { ok: true, count: 0 }, transcript_sync: { ok: true, count: 0 } });
     print({
       ok: false,
       event: "pre-tool",
@@ -1327,6 +1535,7 @@ async function preTool(input) {
       token_efficiency,
       smart_code_read,
       autonomy,
+      queue_flush,
       hook_status,
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -1337,20 +1546,21 @@ async function preTool(input) {
     process.exitCode = 2;
     return;
   }
-  const hook_status = await logHookStatus(input, agent, project, "PreToolUse", true, { transcript_sync: { ok: true, count: 0 }, prior_context: { ok: true, count: 0 } });
-  print({ ok: true, event: "pre-tool", file_echo, project_info, preflight, hard_rules, owner_taste, identity, token_efficiency, smart_code_read, autonomy, hook_status });
+  const hook_status = await logHookStatus(input, agent, project, "PreToolUse", true, { queue_flush, transcript_sync: { ok: true, count: 0 }, prior_context: { ok: true, count: 0 } });
+  print({ ok: true, event: "pre-tool", file_echo, project_info, preflight, hard_rules, owner_taste, identity, token_efficiency, smart_code_read, autonomy, queue_flush, hook_status });
 }
 
 async function postTool(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const files = filePaths(input);
   const transcript_sync = await syncTranscriptTail(input, agent, project, "post-tool", Math.max(40, Math.floor(TRANSCRIPT_SYNC_LINES / 2)));
   const ownership = [];
   if (isEditLike(input)) {
     for (const f of files) {
-      ownership.push(await callTool("mem_file_owner_set", {
+      ownership.push(await safeTool("mem_file_owner_set", {
         file_path: f,
         host: os.hostname(),
         primary_agent: agent,
@@ -1359,7 +1569,7 @@ async function postTool(input) {
       }));
     }
   }
-  const action = await callTool("mem_action_log", {
+  const action = await safeTool("mem_action_log", {
     agent_name: agent,
     action_kind: "runtime_hook_post_tool",
     target: toolName(input),
@@ -1373,21 +1583,23 @@ async function postTool(input) {
       tool: toolName(input)
     }
   });
-  const ok = !input.error && transcript_sync.ok;
-  const hook_status = await logHookStatus(input, agent, project, "PostToolUse", ok, { transcript_sync, blockers: input.error ? [String(input.error)] : [] });
-  print({ ok: true, event: "post-tool", project_info, ownership, action, transcript_sync, hook_status });
+  const tool_observation = await captureToolObservation(input, agent, project);
+  const ok = !input.error && transcript_sync.ok && tool_observation.ok && action.ok;
+  const hook_status = await logHookStatus(input, agent, project, "PostToolUse", ok, { transcript_sync, queue_flush, tool_observation, blockers: input.error ? [String(input.error)] : [] });
+  print({ ok, event: "post-tool", project_info, ownership, action, transcript_sync, tool_observation, queue_flush, hook_status });
 }
 
 async function stop(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const files = filePaths(input);
   const transcript_sync = await syncTranscriptTail(input, agent, project, "stop", Math.max(240, TRANSCRIPT_SYNC_LINES));
   const remaining = await remainingWorkCheck(input, agent, project);
   if (remaining.enabled && remaining.blockers.length && BLOCK_STOP_WITHOUT_REMAINING) {
     const reason = remaining.blockers.join("; ");
-    const hook_status = await logHookStatus(input, agent, project, "Stop", false, { transcript_sync, blockers: remaining.blockers });
+    const hook_status = await logHookStatus(input, agent, project, "Stop", false, { transcript_sync, queue_flush, blockers: remaining.blockers });
     print({
       ok: false,
       event: "stop",
@@ -1395,6 +1607,7 @@ async function stop(input) {
       reason,
       project_info,
       remaining_work_check: remaining,
+      queue_flush,
       hook_status,
       hookSpecificOutput: {
         hookEventName: "Stop",
@@ -1406,7 +1619,7 @@ async function stop(input) {
     return;
   }
   const handoffBlockers = Array.from(new Set([...asArray(input.blockers), ...((remaining && remaining.auto_blockers) || [])]));
-  const result = await callTool("mem_session_handoff", {
+  const result = await safeTool("mem_session_handoff", {
     agent_name: agent,
     project,
     summary: stopSummaryText(input) || taskText(input) || "Session stopped.",
@@ -1418,15 +1631,17 @@ async function stop(input) {
     release_claims: process.env.MNEMO_RELEASE_CLAIMS_ON_STOP !== "0",
     meta: Object.assign({}, input.meta || {}, { event: EVENT, hook: "firm-runtime-hook", project_info, remaining_work_check: remaining, transcript_sync })
   });
-  const ok = !result.error && transcript_sync.ok;
-  const hook_status = await logHookStatus(input, agent, project, "Stop", ok, { transcript_sync, result });
-  print({ ok, event: "stop", project_info, remaining_work_check: remaining, transcript_sync, result, hook_status });
+  const summary_capture = await captureSessionSummary(input, agent, project, "stop");
+  const ok = result.ok && !(result.result && result.result.error) && transcript_sync.ok && summary_capture.ok;
+  const hook_status = await logHookStatus(input, agent, project, "Stop", ok, { transcript_sync, result, summary_capture, queue_flush });
+  print({ ok, event: "stop", project_info, remaining_work_check: remaining, transcript_sync, summary_capture, queue_flush, result, hook_status });
 }
 
 async function sessionEnd(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
   const project = project_info.name;
+  const queue_flush = await flushHookQueue();
   const transcript_sync = await syncTranscriptTail(input, agent, project, "session-end", Math.max(240, TRANSCRIPT_SYNC_LINES));
   const snapshot = await safeTool("mem_capture_ingest", captureItem(input, {
     project,
@@ -1439,13 +1654,16 @@ async function sessionEnd(input) {
     payload: { reason: input.reason || null, source: input.source || null },
     meta: { agent_name: agent }
   }));
-  const ok = transcript_sync.ok && snapshot.ok;
-  const hook_status = await logHookStatus(input, agent, project, "SessionEnd", ok, { transcript_sync, snapshot });
+  const summary_capture = await captureSessionSummary(input, agent, project, "session-end");
+  const ok = transcript_sync.ok && snapshot.ok && summary_capture.ok;
+  const hook_status = await logHookStatus(input, agent, project, "SessionEnd", ok, { transcript_sync, snapshot, summary_capture, queue_flush });
   print({
     ok,
     event: "session-end",
     project_info,
     transcript_sync,
+    summary_capture,
+    queue_flush,
     snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
     hook_status
   });

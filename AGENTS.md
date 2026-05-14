@@ -178,10 +178,17 @@ Use `packages/core/hooks/firm-runtime-hook.js` for lifecycle enforcement:
   cannot erase the only copy of recent work.
 - `pre-tool` runs file echo, project preflight, identity check, owner preference
   check, token-efficiency guard, clean-work guard, and optional auto-claim.
-- `post-tool` records file ownership, action logs, and recent transcript turns.
+- `post-tool` records file ownership, action logs, tool observations, and
+  recent transcript turns.
 - `stop` checks active claims, open findings, readiness board, and writes a
-  handoff.
-- `session-end` writes the final transcript sync and hook status snapshot.
+  handoff plus a durable session summary.
+- `session-end` writes the final transcript sync, session summary, and hook
+  status snapshot.
+
+If the hub is temporarily unavailable, hook writes are queued under
+`MNEMO_HOOK_QUEUE_DIR` or `$HOME/.mnemo/hook_queue` and replayed on the next hook
+event. Run `mnemo-hook-doctor` or `mnemo-hook-doctor --flush` after wiring a new
+agent, after compaction failures, or after a hub restart.
 
 Memory-private text must be wrapped before it enters Mnemo. Supported tags:
 `<private>...</private>`, `<no-memory>...</no-memory>`,
@@ -208,6 +215,10 @@ MNEMO_BLOCK_WITHOUT_OWNER_TASTE=1
 MNEMO_REQUIRE_TOKEN_EFFICIENT_MEMORY=1
 MNEMO_MAX_MEMORY_FETCH_IDS=8
 MNEMO_REQUIRE_SMART_CODE_READ=1
+MNEMO_CAPTURE_TOOL_OBSERVATION=1
+MNEMO_CAPTURE_SESSION_SUMMARY=1
+MNEMO_HOOK_QUEUE_ON_FAILURE=1
+MNEMO_HOOK_FLUSH_ON_EVENT=1
 MNEMO_SMART_CODE_READ_MIN_BYTES=20000
 MNEMO_REQUIRE_CHAT_CAPTURE=1
 MNEMO_REQUIRE_PROMPT_RECALL=1

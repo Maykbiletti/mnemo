@@ -70,8 +70,10 @@ memory boundary. Wire the firm runtime hook to:
   recall prior conversations/solutions, and inject the hits before the answer.
 - `PreCompact`: sync the transcript tail and write a compaction snapshot before
   Claude compresses context.
-- `PostToolUse`, `Stop`, and `SessionEnd`: keep recent transcript turns,
-  handoffs, and final hook status fresh.
+- `PostToolUse`: capture a compact observation for every tool result so reads,
+  searches, edits, shell output, and failed actions leave receipts.
+- `Stop` and `SessionEnd`: keep recent transcript turns, handoffs, durable
+  session summaries, and final hook status fresh.
 
 When `MNEMO_REQUIRE_CHAT_CAPTURE=1` and `MNEMO_REQUIRE_PROMPT_RECALL=1`, failed
 prompt capture or failed prior-context recall is a blocker if the runtime has
@@ -81,6 +83,12 @@ after losing access to the shared memory layer.
 Use `mem_agent_memory_health` in Mission Control to see whether each agent's
 hooks are alive, when it last captured a prompt, whether transcript sync passed,
 and whether prior recall ran before answering.
+
+The hook has a local queue fallback. If the hub is unavailable, failed writes
+are appended under `MNEMO_HOOK_QUEUE_DIR` or `$HOME/.mnemo/hook_queue` and
+flushed on the next hook event. Run `mnemo-hook-doctor` to inspect hook wiring,
+hub health, queue depth, and the agent memory-health endpoint; add `--flush` to
+force a queue replay.
 
 ## Memory-Private Tags
 

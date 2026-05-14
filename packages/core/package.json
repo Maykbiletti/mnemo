@@ -14,6 +14,7 @@
     "mnemo-agent-loop-start": "./bin/agent-loop-start.js",
     "mnemo-backfill-universal": "./universal_backfill.js",
     "mnemo-firm-hook": "./hooks/firm-runtime-hook.js",
+    "mnemo-hook-doctor": "./hooks/hook-doctor.js",
     "mnemo-site-contract-audit": "./bin/site-contract-audit.js",
     "mnemo-route-matrix-audit": "./bin/route-matrix-audit.js"
   },
@@ -34,6 +35,7 @@
     "hook:post-tool": "node hooks/firm-runtime-hook.js post-tool",
     "hook:stop": "node hooks/firm-runtime-hook.js stop",
     "hook:session-end": "node hooks/firm-runtime-hook.js session-end",
+    "hook:doctor": "node hooks/hook-doctor.js",
     "site-contract-audit": "node bin/site-contract-audit.js",
     "route-matrix-audit": "node bin/route-matrix-audit.js",
     "embed": "node embedding_writer.js",
