@@ -60,6 +60,23 @@ Do not silently drop burst messages, duplicate-looking messages, or throttled me
 
 Keep public repos neutral: put private chat IDs, names, customer details, and project-specific channels in local runtime configuration or personal packs, not in committed source.
 
+## Claude Code Memory Hooks
+
+Claude Code runtimes must treat context compaction as a capture event, not as a
+memory boundary. Wire the firm runtime hook to:
+
+- `SessionStart`: load the canonical session bundle and inject it as context.
+- `UserPromptSubmit`: capture the exact user prompt, sync the transcript tail,
+  recall prior conversations/solutions, and inject the hits before the answer.
+- `PreCompact`: sync the transcript tail and write a compaction snapshot before
+  Claude compresses context.
+- `PostToolUse` and `Stop`: keep recent transcript turns and handoffs fresh.
+
+When `MNEMO_REQUIRE_CHAT_CAPTURE=1` and `MNEMO_REQUIRE_PROMPT_RECALL=1`, failed
+prompt capture or failed prior-context recall is a blocker if the runtime has
+`MNEMO_HOOK_BLOCK=1`. This is deliberate: an agent should not continue blind
+after losing access to the shared memory layer.
+
 ## Dedup And Burst Safety
 
 Dedup should use a stable `source_ref` when the upstream source provides one

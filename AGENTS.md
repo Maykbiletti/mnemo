@@ -169,10 +169,16 @@ Tokens are shared team capacity. Agents must not waste them.
 
 Use `packages/core/hooks/firm-runtime-hook.js` for lifecycle enforcement:
 
-- `session-start` records session start.
+- `session-start` records session start and injects the canonical Mnemo startup
+  context.
+- `user-prompt` captures every user prompt, syncs the Claude transcript tail,
+  searches prior conversations/solutions, and injects the results before the
+  agent answers.
+- `pre-compact` syncs the transcript before Claude context compaction so compacting
+  cannot erase the only copy of recent work.
 - `pre-tool` runs file echo, project preflight, identity check, owner preference
   check, token-efficiency guard, clean-work guard, and optional auto-claim.
-- `post-tool` records file ownership and action logs.
+- `post-tool` records file ownership, action logs, and recent transcript turns.
 - `stop` checks active claims, open findings, readiness board, and writes a
   handoff.
 
@@ -196,6 +202,10 @@ MNEMO_REQUIRE_TOKEN_EFFICIENT_MEMORY=1
 MNEMO_MAX_MEMORY_FETCH_IDS=8
 MNEMO_REQUIRE_SMART_CODE_READ=1
 MNEMO_SMART_CODE_READ_MIN_BYTES=20000
+MNEMO_REQUIRE_CHAT_CAPTURE=1
+MNEMO_REQUIRE_PROMPT_RECALL=1
+MNEMO_TRANSCRIPT_SYNC_LINES=180
+MNEMO_PROMPT_RECALL_LIMIT=8
 MNEMO_ALLOW_AUTONOMOUS_LOW_RISK_IDEAS=1
 MNEMO_REQUIRE_PRE_WORK_GUARD=1
 PREWORK_MAX_TURNS=20

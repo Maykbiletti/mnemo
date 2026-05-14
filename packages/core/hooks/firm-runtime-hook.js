@@ -4,6 +4,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
 const EVENT = String(process.argv[2] || process.env.MNEMO_HOOK_EVENT || "pre-tool").toLowerCase();
@@ -33,6 +34,13 @@ const REQUIRE_TOKEN_EFFICIENT_MEMORY = process.env.MNEMO_REQUIRE_TOKEN_EFFICIENT
 const MAX_MEMORY_FETCH_IDS = Math.max(1, Number(process.env.MNEMO_MAX_MEMORY_FETCH_IDS || 8));
 const REQUIRE_SMART_CODE_READ = process.env.MNEMO_REQUIRE_SMART_CODE_READ !== "0";
 const SMART_CODE_READ_MIN_BYTES = Math.max(1024, Number(process.env.MNEMO_SMART_CODE_READ_MIN_BYTES || 20000));
+const REQUIRE_CHAT_CAPTURE = process.env.MNEMO_REQUIRE_CHAT_CAPTURE !== "0";
+const REQUIRE_PROMPT_RECALL = process.env.MNEMO_REQUIRE_PROMPT_RECALL !== "0";
+const PROMPT_RECALL_LIMIT = Math.max(1, Number(process.env.MNEMO_PROMPT_RECALL_LIMIT || 8));
+const TRANSCRIPT_SYNC_LINES = Math.max(20, Number(process.env.MNEMO_TRANSCRIPT_SYNC_LINES || 160));
+const TRANSCRIPT_TAIL_BYTES = Math.max(65536, Number(process.env.MNEMO_TRANSCRIPT_TAIL_BYTES || 1048576));
+const MAX_CAPTURE_TEXT_CHARS = Math.max(500, Number(process.env.MNEMO_MAX_CAPTURE_TEXT_CHARS || 8000));
+const MAX_INJECTED_CONTEXT_CHARS = Math.max(1000, Number(process.env.MNEMO_MAX_INJECTED_CONTEXT_CHARS || 5500));
 
 function readStdin() {
   try {
@@ -63,8 +71,27 @@ async function recallQuery(query, limit) {
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error(`recall ${res.status}: ${text.slice(0, 300)}`);
-  return Array.isArray(json) ? json : [];
+  if (!res.ok) {
+    try {
+      const fallback = await callTool("mem_recall", {
+        query,
+        limit: limit || 8,
+        mode: "hybrid",
+        include_journal: true,
+        journal_scopes: ["transcript", "brief", "event"]
+      });
+      if (Array.isArray(fallback)) return fallback;
+      if (fallback && Array.isArray(fallback.rows)) return fallback.rows;
+      if (fallback && Array.isArray(fallback.results)) return fallback.results;
+    } catch (fallbackError) {
+      throw new Error(`recall ${res.status}: ${text.slice(0, 300)}; mem_recall fallback failed: ${fallbackError.message}`);
+    }
+    throw new Error(`recall ${res.status}: ${text.slice(0, 300)}; mem_recall fallback returned no rows`);
+  }
+  if (Array.isArray(json)) return json;
+  if (json && Array.isArray(json.rows)) return json.rows;
+  if (json && Array.isArray(json.results)) return json.results;
+  return [];
 }
 
 function firstString(...values) {
@@ -611,6 +638,357 @@ async function safeTool(name, args) {
   }
 }
 
+function shortHash(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 20);
+}
+
+function truncateText(value, max) {
+  const text = String(value || "");
+  if (text.length <= max) return text;
+  return text.slice(0, max - 32) + "\n[truncated by mnemo hook]";
+}
+
+function hookSessionId(input) {
+  return firstString(input.session_id, input.sessionId, input.thread_id, input.conversation_id);
+}
+
+function hookTranscriptPath(input) {
+  return firstString(input.transcript_path, input.transcriptPath, input.claude_transcript_path);
+}
+
+function promptText(input) {
+  const direct = firstString(
+    input.user_prompt,
+    input.prompt,
+    input.message,
+    input.text,
+    input.lastPrompt,
+    input.last_prompt,
+    input.summary
+  );
+  if (direct) return direct;
+  const messages = Array.isArray(input.messages) ? input.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg && (msg.role === "user" || msg.type === "user")) {
+      const text = claudeContentText(msg.content || msg.message || msg.text);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function claudeContentText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) {
+    if (content && typeof content === "object") {
+      return firstString(content.text, content.content, content.message);
+    }
+    return "";
+  }
+  const parts = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue;
+    const type = String(item.type || "").toLowerCase();
+    if (type && !["text", "input_text", "output_text"].includes(type)) continue;
+    const text = firstString(item.text, item.content, item.message);
+    if (text) parts.push(text);
+  }
+  return parts.join("\n").trim();
+}
+
+function claudeEntryText(entry) {
+  if (!entry || typeof entry !== "object") return { role: "", text: "" };
+  if (entry.type === "last-prompt") return { role: "user", text: firstString(entry.lastPrompt, entry.prompt) };
+  if (entry.type === "summary") return { role: "system", text: firstString(entry.summary, entry.text) };
+  const message = entry.message && typeof entry.message === "object" ? entry.message : entry;
+  const role = firstString(message.role, entry.role, entry.type).toLowerCase();
+  const text = claudeContentText(message.content || message.text || entry.content || entry.text);
+  if (!text) return { role, text: "" };
+  if (role.includes("assistant")) return { role: "assistant", text };
+  if (role.includes("user")) return { role: "user", text };
+  return { role: role || "system", text };
+}
+
+function readTranscriptTail(filePath, maxLines) {
+  const transcriptPath = String(filePath || "").trim();
+  if (!transcriptPath) return { ok: false, error: "transcript_path missing" };
+  if (!fs.existsSync(transcriptPath)) return { ok: false, error: "transcript_path not found: " + transcriptPath };
+  const stat = fs.statSync(transcriptPath);
+  const bytes = Math.min(stat.size, TRANSCRIPT_TAIL_BYTES);
+  const fd = fs.openSync(transcriptPath, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    fs.readSync(fd, buffer, 0, bytes, Math.max(0, stat.size - bytes));
+    const raw = buffer.toString("utf8");
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    if (stat.size > bytes && lines.length) lines.shift();
+    return {
+      ok: true,
+      transcript_path: transcriptPath,
+      total_bytes: stat.size,
+      scanned_bytes: bytes,
+      lines: lines.slice(-Math.max(1, maxLines || TRANSCRIPT_SYNC_LINES))
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function captureItem(input, opts) {
+  const sessionId = hookSessionId(input);
+  const role = String(opts.role || "").toLowerCase();
+  const speaker = firstString(opts.speaker, role === "assistant" ? agentName(input) : OWNER_NAME);
+  return {
+    dedupe_key: opts.dedupe_key,
+    source: "claude-code",
+    channel: "claude-code",
+    direction: opts.direction || (role === "assistant" ? "outbound" : "inbound"),
+    actor: speaker,
+    speaker,
+    event_kind: opts.event_kind || "chat_turn",
+    ref_kind: "claude_session",
+    ref_id: sessionId || null,
+    source_ref: hookTranscriptPath(input) || null,
+    thread_id: sessionId || null,
+    session_id: sessionId || null,
+    status: "captured",
+    content: truncateText(opts.content, MAX_CAPTURE_TEXT_CHARS),
+    payload: opts.payload || {},
+    meta: Object.assign({
+      project: opts.project || projectName(input),
+      cwd: cwdFrom(input),
+      hook_event_name: input.hook_event_name || EVENT,
+      role: role || null,
+      capture_reason: opts.reason || EVENT
+    }, opts.meta || {}),
+    occurred_at: opts.occurred_at || new Date().toISOString(),
+    promote_transcript: true,
+    promote_memory: false,
+    remember: false,
+    topic: "claude-code"
+  };
+}
+
+async function capturePromptSubmit(input, agent, project, prompt) {
+  if (!REQUIRE_CHAT_CAPTURE) return { enabled: false, ok: true, skipped: "disabled" };
+  const text = String(prompt || "").trim();
+  if (!text) {
+    return {
+      enabled: true,
+      ok: false,
+      blockers: ["user prompt capture failed: hook input did not include user_prompt"],
+      warnings: ["UserPromptSubmit did not provide prompt text"]
+    };
+  }
+  const sessionId = hookSessionId(input) || "no-session";
+  const item = captureItem(input, {
+    project,
+    role: "user",
+    speaker: OWNER_NAME,
+    event_kind: "user_prompt_submit",
+    reason: "user-prompt",
+    content: text,
+    dedupe_key: `claude-user-prompt:${sessionId}:${shortHash(text)}`,
+    payload: { prompt: text },
+    meta: { agent_name: agent }
+  });
+  const result = await safeTool("mem_capture_ingest", item);
+  if (!result.ok || (result.result && result.result.error)) {
+    const error = result.error || result.result.error;
+    return {
+      enabled: true,
+      ok: false,
+      blockers: ["user prompt capture failed: " + error],
+      warnings: ["user prompt capture failed: " + error]
+    };
+  }
+  return { enabled: true, ok: true, result: result.result };
+}
+
+async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
+  if (!REQUIRE_CHAT_CAPTURE) return { enabled: false, ok: true, skipped: "disabled" };
+  let tail;
+  try {
+    tail = readTranscriptTail(hookTranscriptPath(input), lineLimit || TRANSCRIPT_SYNC_LINES);
+  } catch (e) {
+    tail = { ok: false, error: e.message };
+  }
+  if (!tail.ok) {
+    return {
+      enabled: true,
+      ok: false,
+      blockers: [`transcript sync failed: ${tail.error}`],
+      warnings: [`transcript sync failed: ${tail.error}`]
+    };
+  }
+  const sessionId = hookSessionId(input) || "no-session";
+  const items = [];
+  for (const raw of tail.lines) {
+    let entry = null;
+    try { entry = JSON.parse(raw); } catch { continue; }
+    const extracted = claudeEntryText(entry);
+    if (!extracted.text) continue;
+    const role = extracted.role;
+    if (!["user", "assistant", "system"].includes(role)) continue;
+    const occurredAt = firstString(entry.timestamp, entry.created_at, entry.updated_at, entry.message && entry.message.timestamp);
+    items.push(captureItem(input, {
+      project,
+      role,
+      speaker: role === "assistant" ? agent : (role === "user" ? OWNER_NAME : "system"),
+      event_kind: "claude_transcript_turn",
+      reason,
+      content: extracted.text,
+      occurred_at: occurredAt || undefined,
+      dedupe_key: `claude-jsonl:${sessionId}:${shortHash(raw)}`,
+      payload: { role, type: entry.type || null },
+      meta: {
+        agent_name: agent,
+        transcript_hash: shortHash(raw),
+        transcript_path: tail.transcript_path
+      }
+    }));
+  }
+  if (!items.length) {
+    return {
+      enabled: true,
+      ok: true,
+      count: 0,
+      transcript_path: tail.transcript_path,
+      scanned_lines: tail.lines.length,
+      warnings: ["transcript tail had no user/assistant text turns to capture"]
+    };
+  }
+
+  const batch = await safeTool("mem_capture_ingest_batch", { items, limit: items.length });
+  if (batch.ok && batch.result && !batch.result.error) {
+    return {
+      enabled: true,
+      ok: true,
+      count: items.length,
+      transcript_path: tail.transcript_path,
+      scanned_lines: tail.lines.length,
+      result: batch.result
+    };
+  }
+
+  const errors = [];
+  let captured = 0;
+  let duplicate = 0;
+  for (const item of items) {
+    const one = await safeTool("mem_capture_ingest", item);
+    if (!one.ok || (one.result && one.result.error)) {
+      errors.push(one.error || one.result.error);
+    } else if (one.result && one.result.duplicate) {
+      duplicate++;
+    } else {
+      captured++;
+    }
+  }
+  return {
+    enabled: true,
+    ok: errors.length === 0,
+    count: items.length,
+    captured,
+    duplicate,
+    transcript_path: tail.transcript_path,
+    scanned_lines: tail.lines.length,
+    blockers: errors.length ? ["transcript sync failed: " + errors.slice(0, 3).join("; ")] : [],
+    warnings: errors.slice(0, 5)
+  };
+}
+
+function compactQueryText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
+}
+
+async function priorContextCheck(input, project, topics, prompt) {
+  if (!REQUIRE_PROMPT_RECALL) return { enabled: false, ok: true, skipped: "disabled" };
+  const task = compactQueryText(prompt || taskText(input));
+  const files = filePaths(input).slice(0, 8);
+  const queries = [];
+  if (task) queries.push(task);
+  if (project && project !== "unknown" && task) queries.push(`${project} ${task}`);
+  if (project && project !== "unknown") queries.push(`${project} current work open blockers decisions`);
+  if (topics && topics.length) queries.push(`${project} ${topics.join(" ")} rules decisions no-touch`);
+  if (files.length) queries.push(`${project} ${files.join(" ")}`);
+  if (!queries.length) queries.push(`${project || "unknown"} recent conversation solution`);
+
+  const seen = new Set();
+  const memories = [];
+  try {
+    for (const query of Array.from(new Set(queries)).slice(0, 6)) {
+      const rows = await recallQuery(query, PROMPT_RECALL_LIMIT);
+      for (const row of rows) {
+        const key = row && (row.id || `${row.kind}:${row.occurred_at}:${row.preview}`);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        memories.push({
+          id: row.id || null,
+          kind: row.kind || null,
+          actor: row.actor || row.speaker || null,
+          occurred_at: row.occurred_at || null,
+          preview: truncateText(row.preview || row.content || row.text || "", 360)
+        });
+        if (memories.length >= PROMPT_RECALL_LIMIT) break;
+      }
+      if (memories.length >= PROMPT_RECALL_LIMIT) break;
+    }
+    return { enabled: true, ok: true, queries: Array.from(new Set(queries)).slice(0, 6), count: memories.length, memories };
+  } catch (e) {
+    return {
+      enabled: true,
+      ok: false,
+      queries: Array.from(new Set(queries)).slice(0, 6),
+      blockers: ["prior conversation recall failed: " + e.message],
+      warnings: ["prior conversation recall failed: " + e.message]
+    };
+  }
+}
+
+function injectedContextText(kind, data) {
+  const lines = [
+    "MNEMO AUTO-CONTEXT",
+    `Event: ${kind}`,
+    `Project: ${data.project_info ? data.project_info.name : "unknown"}`,
+    "",
+    "Mandatory protocol:",
+    "- Treat Mnemo as the source of truth before answering or editing.",
+    "- Check the prior-context hits below for existing discussions, no-touch rules, decisions, and partial solutions.",
+    "- If hits conflict with the short chat context, pause and verify in Mnemo instead of guessing.",
+    "- If the task touches auth, billing, live infra, design lock, or protected pages, run the matching Mnemo preflight/claims before edits.",
+    "- Keep identity from Mnemo/session brief; do not rewrite your role from compacted chat noise."
+  ];
+
+  if (data.session_start && data.session_start.ok) {
+    lines.push("", "Session bundle:");
+    lines.push(truncateText(JSON.stringify(data.session_start.result || data.session_start, null, 2), 1200));
+  } else if (data.session_start && !data.session_start.ok) {
+    lines.push("", "Session bundle failed: " + data.session_start.error);
+  }
+
+  if (data.prior_context && data.prior_context.enabled) {
+    lines.push("", `Prior Mnemo hits: ${data.prior_context.count || 0}`);
+    for (const mem of (data.prior_context.memories || []).slice(0, PROMPT_RECALL_LIMIT)) {
+      const head = [mem.id ? `#${mem.id}` : null, mem.kind, mem.actor, mem.occurred_at].filter(Boolean).join(" ");
+      lines.push(`- ${head}: ${mem.preview || ""}`.trim());
+    }
+    if (!(data.prior_context.memories || []).length) lines.push("- No prior hit found; still record new facts/evidence as work proceeds.");
+  }
+
+  if (data.prompt_capture && !data.prompt_capture.ok) {
+    lines.push("", "Prompt capture warning: " + (data.prompt_capture.warnings || []).join("; "));
+  }
+  if (data.transcript_sync && !data.transcript_sync.ok) {
+    lines.push("", "Transcript sync warning: " + (data.transcript_sync.warnings || []).join("; "));
+  }
+
+  return truncateText(lines.join("\n"), MAX_INJECTED_CONTEXT_CHARS);
+}
+
 async function remainingWorkCheck(input, agent, project) {
   if (!REQUIRE_REMAINING_CHECK) return { enabled: false, blockers: [], auto_blockers: [], warnings: [] };
   const scope = runtimeScope();
@@ -678,13 +1056,143 @@ async function remainingWorkCheck(input, agent, project) {
 }
 
 async function sessionStart(input) {
+  const agent = agentName(input);
   const project_info = projectInfo(input);
-  const result = await callTool("mem_session_start", {
-    agent_name: agentName(input),
+  const project = project_info.name;
+  const result = await safeTool("mem_session_start", {
+    agent_name: agent,
     project: project_info.name,
     task: taskText(input)
   });
-  print({ ok: !result.error, event: "session-start", project_info, result });
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "session-start", Math.max(80, TRANSCRIPT_SYNC_LINES));
+  const prior_context = await priorContextCheck(input, project, inferTopics(input), promptText(input) || taskText(input));
+  const context = injectedContextText("SessionStart", { project_info, session_start: result, transcript_sync, prior_context });
+  print({
+    ok: result.ok && transcript_sync.ok && prior_context.ok,
+    event: "session-start",
+    project_info,
+    result: result.ok ? result.result : { error: result.error },
+    transcript_sync,
+    prior_context,
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: context
+    },
+    additional_context: context
+  });
+}
+
+async function userPromptSubmit(input) {
+  const agent = agentName(input);
+  const project_info = projectInfo(input);
+  const project = project_info.name;
+  const prompt = promptText(input);
+  const topics = Array.from(new Set([...inferTopics(input), ...inferTopics(Object.assign({}, input, { prompt }))]));
+  const prompt_capture = await capturePromptSubmit(input, agent, project, prompt);
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "user-prompt", TRANSCRIPT_SYNC_LINES);
+  const prior_context = await priorContextCheck(input, project, topics, prompt);
+  const session_start = await safeTool("mem_session_start", { agent_name: agent, project, task: prompt || taskText(input) });
+  const blockers = [
+    ...((prompt_capture && prompt_capture.blockers) || []),
+    ...((transcript_sync && transcript_sync.blockers) || []),
+    ...((prior_context && prior_context.blockers) || [])
+  ];
+  const context = injectedContextText("UserPromptSubmit", {
+    project_info,
+    session_start,
+    prompt_capture,
+    transcript_sync,
+    prior_context
+  });
+
+  if (blockers.length && BLOCK_ON_PREFLIGHT) {
+    const reason = blockers.join("; ");
+    print({
+      ok: false,
+      event: "user-prompt",
+      decision: "block",
+      reason,
+      project_info,
+      prompt_capture,
+      transcript_sync,
+      prior_context,
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: context
+      },
+      additional_context: context
+    });
+    process.exitCode = 2;
+    return;
+  }
+
+  print({
+    ok: prompt_capture.ok && transcript_sync.ok && prior_context.ok,
+    event: "user-prompt",
+    project_info,
+    prompt_capture,
+    transcript_sync,
+    prior_context,
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: context
+    },
+    additional_context: context
+  });
+}
+
+async function preCompact(input) {
+  const agent = agentName(input);
+  const project_info = projectInfo(input);
+  const project = project_info.name;
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "pre-compact", Math.max(240, TRANSCRIPT_SYNC_LINES));
+  const snapshot = await safeTool("mem_capture_ingest", captureItem(input, {
+    project,
+    role: "system",
+    speaker: "system",
+    event_kind: "claude_precompact_snapshot",
+    reason: "pre-compact",
+    content: `Claude Code PreCompact fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.trigger, "context compaction")}`,
+    dedupe_key: `claude-precompact:${hookSessionId(input) || "no-session"}:${Date.now()}`,
+    payload: { reason: input.reason || null, trigger: input.trigger || null },
+    meta: { agent_name: agent }
+  }));
+  const blockers = [
+    ...((transcript_sync && transcript_sync.blockers) || []),
+    ...((snapshot.ok && !(snapshot.result && snapshot.result.error)) ? [] : ["pre-compact snapshot failed: " + (snapshot.error || (snapshot.result && snapshot.result.error) || "unknown")])
+  ];
+  const context = injectedContextText("PreCompact", { project_info, transcript_sync });
+  if (blockers.length && BLOCK_ON_PREFLIGHT) {
+    const reason = blockers.join("; ");
+    print({
+      ok: false,
+      event: "pre-compact",
+      decision: "block",
+      reason,
+      project_info,
+      transcript_sync,
+      snapshot,
+      hookSpecificOutput: {
+        hookEventName: "PreCompact",
+        additionalContext: context
+      },
+      additional_context: context
+    });
+    process.exitCode = 2;
+    return;
+  }
+  print({
+    ok: transcript_sync.ok && snapshot.ok,
+    event: "pre-compact",
+    project_info,
+    transcript_sync,
+    snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
+    hookSpecificOutput: {
+      hookEventName: "PreCompact",
+      additionalContext: context
+    },
+    additional_context: context
+  });
 }
 
 async function preTool(input) {
@@ -768,6 +1276,7 @@ async function postTool(input) {
   const project_info = projectInfo(input);
   const project = project_info.name;
   const files = filePaths(input);
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "post-tool", Math.max(40, Math.floor(TRANSCRIPT_SYNC_LINES / 2)));
   const ownership = [];
   if (isEditLike(input)) {
     for (const f of files) {
@@ -794,7 +1303,7 @@ async function postTool(input) {
       tool: toolName(input)
     }
   });
-  print({ ok: true, event: "post-tool", project_info, ownership, action });
+  print({ ok: true, event: "post-tool", project_info, ownership, action, transcript_sync });
 }
 
 async function stop(input) {
@@ -802,6 +1311,7 @@ async function stop(input) {
   const project_info = projectInfo(input);
   const project = project_info.name;
   const files = filePaths(input);
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "stop", Math.max(240, TRANSCRIPT_SYNC_LINES));
   const remaining = await remainingWorkCheck(input, agent, project);
   if (remaining.enabled && remaining.blockers.length && BLOCK_STOP_WITHOUT_REMAINING) {
     const reason = remaining.blockers.join("; ");
@@ -832,14 +1342,16 @@ async function stop(input) {
     blockers: handoffBlockers,
     next_actions: asArray(input.next_actions),
     release_claims: process.env.MNEMO_RELEASE_CLAIMS_ON_STOP !== "0",
-    meta: Object.assign({}, input.meta || {}, { event: EVENT, hook: "firm-runtime-hook", project_info, remaining_work_check: remaining })
+    meta: Object.assign({}, input.meta || {}, { event: EVENT, hook: "firm-runtime-hook", project_info, remaining_work_check: remaining, transcript_sync })
   });
-  print({ ok: !result.error, event: "stop", project_info, remaining_work_check: remaining, result });
+  print({ ok: !result.error, event: "stop", project_info, remaining_work_check: remaining, transcript_sync, result });
 }
 
 async function main() {
   const input = readStdin();
   if (EVENT === "session-start" || EVENT === "sessionstart" || EVENT === "start") return sessionStart(input);
+  if (EVENT === "user-prompt" || EVENT === "userpromptsubmit" || EVENT === "prompt") return userPromptSubmit(input);
+  if (EVENT === "pre-compact" || EVENT === "precompact" || EVENT === "compact") return preCompact(input);
   if (EVENT === "pre-tool" || EVENT === "pretooluse" || EVENT === "pre") return preTool(input);
   if (EVENT === "post-tool" || EVENT === "posttooluse" || EVENT === "post") return postTool(input);
   if (EVENT === "stop" || EVENT === "session-end" || EVENT === "sessionend") return stop(input);

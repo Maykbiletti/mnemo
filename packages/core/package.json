@@ -28,6 +28,8 @@
     "backfill:universal": "node universal_backfill.js",
     "mcp": "node mcp.js",
     "hook:session-start": "node hooks/firm-runtime-hook.js session-start",
+    "hook:user-prompt": "node hooks/firm-runtime-hook.js user-prompt",
+    "hook:pre-compact": "node hooks/firm-runtime-hook.js pre-compact",
     "hook:pre-tool": "node hooks/firm-runtime-hook.js pre-tool",
     "hook:post-tool": "node hooks/firm-runtime-hook.js post-tool",
     "hook:stop": "node hooks/firm-runtime-hook.js stop",

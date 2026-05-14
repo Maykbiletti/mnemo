@@ -57,10 +57,33 @@ Use the same hook script for each lifecycle event:
 
 ```bash
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-start
+node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js user-prompt
+node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-compact
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop
 ```
+
+For Claude Code, wire the lifecycle hooks to the same command:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-start" }] }],
+    "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js user-prompt" }] }],
+    "PreCompact": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-compact" }] }],
+    "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool" }] }],
+    "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool" }] }],
+    "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop" }] }]
+  }
+}
+```
+
+`UserPromptSubmit` is the hard memory gate: every user prompt is captured through
+`mem_capture_ingest`, the current Claude transcript tail is synced, relevant
+prior conversations are recalled, and the resulting Mnemo context is injected
+back into Claude. `PreCompact` syncs the transcript before compaction so context
+compression cannot become a memory-loss event.
 
 Recommended environment:
 
@@ -88,6 +111,10 @@ export MNEMO_REQUIRE_TOKEN_EFFICIENT_MEMORY=1
 export MNEMO_MAX_MEMORY_FETCH_IDS=8
 export MNEMO_REQUIRE_SMART_CODE_READ=1
 export MNEMO_SMART_CODE_READ_MIN_BYTES=20000
+export MNEMO_REQUIRE_CHAT_CAPTURE=1
+export MNEMO_REQUIRE_PROMPT_RECALL=1
+export MNEMO_TRANSCRIPT_SYNC_LINES=180
+export MNEMO_PROMPT_RECALL_LIMIT=8
 export MNEMO_ALLOW_AUTONOMOUS_LOW_RISK_IDEAS=1
 export MNEMO_REQUIRE_REMAINING_CHECK=1
 export MNEMO_BLOCK_STOP_WITHOUT_REMAINING=1
