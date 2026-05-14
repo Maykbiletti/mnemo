@@ -33,6 +33,7 @@
     "hook:pre-tool": "node hooks/firm-runtime-hook.js pre-tool",
     "hook:post-tool": "node hooks/firm-runtime-hook.js post-tool",
     "hook:stop": "node hooks/firm-runtime-hook.js stop",
+    "hook:session-end": "node hooks/firm-runtime-hook.js session-end",
     "site-contract-audit": "node bin/site-contract-audit.js",
     "route-matrix-audit": "node bin/route-matrix-audit.js",
     "embed": "node embedding_writer.js",

@@ -111,6 +111,18 @@ runtime preflight state reported by each loop. Invalid registry rows such as
 blank names or path-shaped names are excluded from the agent totals and counted
 as `summary.invalid_registry_rows`; pass `include_invalid: true` to inspect them.
 
+### `mem_agent_memory_health([agent_name, stale_minutes, window_minutes])`
+
+Mission Control status for memory usage. Shows, per agent, the latest
+`SessionStart`, `UserPromptSubmit`, `PreCompact`, `PostToolUse`, `Stop`, and
+`SessionEnd` hook status, whether transcript sync passed, whether prompt capture
+passed, and whether prior recall ran before the response.
+
+```ts
+mem_agent_memory_health({ stale_minutes: 1440 })
+mem_agent_memory_health({ agent_name: "angel" })
+```
+
 ### `mem_skill_search(query)`
 
 Search the local `skills/` folder by trigger-phrase or name. Returns matching `SKILL.md` descriptors. **Use BEFORE attempting any new task** — if a recipe exists, follow it.

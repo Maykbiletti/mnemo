@@ -6,6 +6,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { execFileSync } = require("child_process");
+const { stripPrivate } = require("../shared_utils");
 
 const EVENT = String(process.argv[2] || process.env.MNEMO_HOOK_EVENT || "pre-tool").toLowerCase();
 const BASE_URL = String(process.env.MNEMO_HUB_URL || process.env.MNEMO_HOST || "http://127.0.0.1:7117").replace(/\/+$/, "");
@@ -648,6 +649,10 @@ function truncateText(value, max) {
   return text.slice(0, max - 32) + "\n[truncated by mnemo hook]";
 }
 
+function memorySafeText(value) {
+  return stripPrivate(String(value || "")).text || "";
+}
+
 function hookSessionId(input) {
   return firstString(input.session_id, input.sessionId, input.thread_id, input.conversation_id);
 }
@@ -739,6 +744,7 @@ function captureItem(input, opts) {
   const sessionId = hookSessionId(input);
   const role = String(opts.role || "").toLowerCase();
   const speaker = firstString(opts.speaker, role === "assistant" ? agentName(input) : OWNER_NAME);
+  const safeContent = memorySafeText(opts.content);
   return {
     dedupe_key: opts.dedupe_key,
     source: "claude-code",
@@ -753,7 +759,7 @@ function captureItem(input, opts) {
     thread_id: sessionId || null,
     session_id: sessionId || null,
     status: "captured",
-    content: truncateText(opts.content, MAX_CAPTURE_TEXT_CHARS),
+    content: truncateText(safeContent, MAX_CAPTURE_TEXT_CHARS),
     payload: opts.payload || {},
     meta: Object.assign({
       project: opts.project || projectName(input),
@@ -772,7 +778,7 @@ function captureItem(input, opts) {
 
 async function capturePromptSubmit(input, agent, project, prompt) {
   if (!REQUIRE_CHAT_CAPTURE) return { enabled: false, ok: true, skipped: "disabled" };
-  const text = String(prompt || "").trim();
+  const text = memorySafeText(prompt).trim();
   if (!text) {
     return {
       enabled: true,
@@ -790,7 +796,7 @@ async function capturePromptSubmit(input, agent, project, prompt) {
     reason: "user-prompt",
     content: text,
     dedupe_key: `claude-user-prompt:${sessionId}:${shortHash(text)}`,
-    payload: { prompt: text },
+    payload: { prompt: text, private_redacted: text !== String(prompt || "").trim() },
     meta: { agent_name: agent }
   });
   const result = await safeTool("mem_capture_ingest", item);
@@ -907,7 +913,7 @@ function compactQueryText(text) {
 
 async function priorContextCheck(input, project, topics, prompt) {
   if (!REQUIRE_PROMPT_RECALL) return { enabled: false, ok: true, skipped: "disabled" };
-  const task = compactQueryText(prompt || taskText(input));
+  const task = compactQueryText(memorySafeText(prompt || taskText(input)));
   const files = filePaths(input).slice(0, 8);
   const queries = [];
   if (task) queries.push(task);
@@ -1055,6 +1061,54 @@ async function remainingWorkCheck(input, agent, project) {
   };
 }
 
+function compactHookPayload(data) {
+  const sync = data.transcript_sync || {};
+  const prior = data.prior_context || {};
+  const prompt = data.prompt_capture || {};
+  const session = data.session_start || data.result || {};
+  return {
+    hook_event: data.hook_event,
+    project: data.project,
+    ok: data.ok,
+    prompt_capture_ok: prompt.ok == null ? null : !!prompt.ok,
+    transcript_sync_ok: sync.ok == null ? null : !!sync.ok,
+    transcript_count: sync.count == null ? null : Number(sync.count || 0),
+    transcript_scanned_lines: sync.scanned_lines == null ? null : Number(sync.scanned_lines || 0),
+    prior_recall_ok: prior.ok == null ? null : !!prior.ok,
+    prior_count: prior.count == null ? null : Number(prior.count || 0),
+    session_start_ok: session.ok == null ? null : !!session.ok,
+    blockers: asArray(data.blockers).slice(0, 8),
+    warnings: [
+      ...asArray(prompt.warnings),
+      ...asArray(sync.warnings),
+      ...asArray(prior.warnings)
+    ].slice(0, 8)
+  };
+}
+
+async function logHookStatus(input, agent, project, hookEvent, ok, data) {
+  const payload = compactHookPayload(Object.assign({}, data || {}, {
+    hook_event: hookEvent,
+    project,
+    ok: !!ok
+  }));
+  return safeTool("mem_action_log", {
+    agent_name: agent,
+    action_kind: "mnemo_runtime_hook",
+    target: hookEvent,
+    status: ok ? "ok" : "error",
+    topic: "runtime_hook",
+    session_id: hookSessionId(input) || null,
+    payload,
+    meta: {
+      hook: "firm-runtime-hook",
+      event: EVENT,
+      cwd: cwdFrom(input),
+      transcript_path: hookTranscriptPath(input) || null
+    }
+  });
+}
+
 async function sessionStart(input) {
   const agent = agentName(input);
   const project_info = projectInfo(input);
@@ -1067,13 +1121,16 @@ async function sessionStart(input) {
   const transcript_sync = await syncTranscriptTail(input, agent, project, "session-start", Math.max(80, TRANSCRIPT_SYNC_LINES));
   const prior_context = await priorContextCheck(input, project, inferTopics(input), promptText(input) || taskText(input));
   const context = injectedContextText("SessionStart", { project_info, session_start: result, transcript_sync, prior_context });
+  const ok = result.ok && transcript_sync.ok && prior_context.ok;
+  const hook_status = await logHookStatus(input, agent, project, "SessionStart", ok, { result, transcript_sync, prior_context });
   print({
-    ok: result.ok && transcript_sync.ok && prior_context.ok,
+    ok,
     event: "session-start",
     project_info,
     result: result.ok ? result.result : { error: result.error },
     transcript_sync,
     prior_context,
+    hook_status,
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext: context
@@ -1107,6 +1164,7 @@ async function userPromptSubmit(input) {
 
   if (blockers.length && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ");
+    const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", false, { prompt_capture, transcript_sync, prior_context, blockers });
     print({
       ok: false,
       event: "user-prompt",
@@ -1116,6 +1174,7 @@ async function userPromptSubmit(input) {
       prompt_capture,
       transcript_sync,
       prior_context,
+      hook_status,
       hookSpecificOutput: {
         hookEventName: "UserPromptSubmit",
         additionalContext: context
@@ -1126,13 +1185,16 @@ async function userPromptSubmit(input) {
     return;
   }
 
+  const ok = prompt_capture.ok && transcript_sync.ok && prior_context.ok;
+  const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", ok, { prompt_capture, transcript_sync, prior_context, session_start });
   print({
-    ok: prompt_capture.ok && transcript_sync.ok && prior_context.ok,
+    ok,
     event: "user-prompt",
     project_info,
     prompt_capture,
     transcript_sync,
     prior_context,
+    hook_status,
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: context
@@ -1164,6 +1226,7 @@ async function preCompact(input) {
   const context = injectedContextText("PreCompact", { project_info, transcript_sync });
   if (blockers.length && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ");
+    const hook_status = await logHookStatus(input, agent, project, "PreCompact", false, { transcript_sync, snapshot, blockers });
     print({
       ok: false,
       event: "pre-compact",
@@ -1172,6 +1235,7 @@ async function preCompact(input) {
       project_info,
       transcript_sync,
       snapshot,
+      hook_status,
       hookSpecificOutput: {
         hookEventName: "PreCompact",
         additionalContext: context
@@ -1181,12 +1245,15 @@ async function preCompact(input) {
     process.exitCode = 2;
     return;
   }
+  const ok = transcript_sync.ok && snapshot.ok;
+  const hook_status = await logHookStatus(input, agent, project, "PreCompact", ok, { transcript_sync, snapshot });
   print({
-    ok: transcript_sync.ok && snapshot.ok,
+    ok,
     event: "pre-compact",
     project_info,
     transcript_sync,
     snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
+    hook_status,
     hookSpecificOutput: {
       hookEventName: "PreCompact",
       additionalContext: context
@@ -1245,6 +1312,7 @@ async function preTool(input) {
   ];
   if ((preflight.status === "block" || blockers.length) && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ") || "Mnemo preflight blocked this action.";
+    const hook_status = await logHookStatus(input, agent, project, "PreToolUse", false, { blockers, prior_context: { ok: true, count: 0 }, transcript_sync: { ok: true, count: 0 } });
     print({
       ok: false,
       event: "pre-tool",
@@ -1259,6 +1327,7 @@ async function preTool(input) {
       token_efficiency,
       smart_code_read,
       autonomy,
+      hook_status,
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
@@ -1268,7 +1337,8 @@ async function preTool(input) {
     process.exitCode = 2;
     return;
   }
-  print({ ok: true, event: "pre-tool", file_echo, project_info, preflight, hard_rules, owner_taste, identity, token_efficiency, smart_code_read, autonomy });
+  const hook_status = await logHookStatus(input, agent, project, "PreToolUse", true, { transcript_sync: { ok: true, count: 0 }, prior_context: { ok: true, count: 0 } });
+  print({ ok: true, event: "pre-tool", file_echo, project_info, preflight, hard_rules, owner_taste, identity, token_efficiency, smart_code_read, autonomy, hook_status });
 }
 
 async function postTool(input) {
@@ -1303,7 +1373,9 @@ async function postTool(input) {
       tool: toolName(input)
     }
   });
-  print({ ok: true, event: "post-tool", project_info, ownership, action, transcript_sync });
+  const ok = !input.error && transcript_sync.ok;
+  const hook_status = await logHookStatus(input, agent, project, "PostToolUse", ok, { transcript_sync, blockers: input.error ? [String(input.error)] : [] });
+  print({ ok: true, event: "post-tool", project_info, ownership, action, transcript_sync, hook_status });
 }
 
 async function stop(input) {
@@ -1315,6 +1387,7 @@ async function stop(input) {
   const remaining = await remainingWorkCheck(input, agent, project);
   if (remaining.enabled && remaining.blockers.length && BLOCK_STOP_WITHOUT_REMAINING) {
     const reason = remaining.blockers.join("; ");
+    const hook_status = await logHookStatus(input, agent, project, "Stop", false, { transcript_sync, blockers: remaining.blockers });
     print({
       ok: false,
       event: "stop",
@@ -1322,6 +1395,7 @@ async function stop(input) {
       reason,
       project_info,
       remaining_work_check: remaining,
+      hook_status,
       hookSpecificOutput: {
         hookEventName: "Stop",
         permissionDecision: "deny",
@@ -1344,7 +1418,37 @@ async function stop(input) {
     release_claims: process.env.MNEMO_RELEASE_CLAIMS_ON_STOP !== "0",
     meta: Object.assign({}, input.meta || {}, { event: EVENT, hook: "firm-runtime-hook", project_info, remaining_work_check: remaining, transcript_sync })
   });
-  print({ ok: !result.error, event: "stop", project_info, remaining_work_check: remaining, transcript_sync, result });
+  const ok = !result.error && transcript_sync.ok;
+  const hook_status = await logHookStatus(input, agent, project, "Stop", ok, { transcript_sync, result });
+  print({ ok, event: "stop", project_info, remaining_work_check: remaining, transcript_sync, result, hook_status });
+}
+
+async function sessionEnd(input) {
+  const agent = agentName(input);
+  const project_info = projectInfo(input);
+  const project = project_info.name;
+  const transcript_sync = await syncTranscriptTail(input, agent, project, "session-end", Math.max(240, TRANSCRIPT_SYNC_LINES));
+  const snapshot = await safeTool("mem_capture_ingest", captureItem(input, {
+    project,
+    role: "system",
+    speaker: "system",
+    event_kind: "claude_session_end_snapshot",
+    reason: "session-end",
+    content: `Claude Code SessionEnd fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.source, "session ended")}`,
+    dedupe_key: `claude-session-end:${hookSessionId(input) || "no-session"}:${Date.now()}`,
+    payload: { reason: input.reason || null, source: input.source || null },
+    meta: { agent_name: agent }
+  }));
+  const ok = transcript_sync.ok && snapshot.ok;
+  const hook_status = await logHookStatus(input, agent, project, "SessionEnd", ok, { transcript_sync, snapshot });
+  print({
+    ok,
+    event: "session-end",
+    project_info,
+    transcript_sync,
+    snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
+    hook_status
+  });
 }
 
 async function main() {
@@ -1354,7 +1458,8 @@ async function main() {
   if (EVENT === "pre-compact" || EVENT === "precompact" || EVENT === "compact") return preCompact(input);
   if (EVENT === "pre-tool" || EVENT === "pretooluse" || EVENT === "pre") return preTool(input);
   if (EVENT === "post-tool" || EVENT === "posttooluse" || EVENT === "post") return postTool(input);
-  if (EVENT === "stop" || EVENT === "session-end" || EVENT === "sessionend") return stop(input);
+  if (EVENT === "session-end" || EVENT === "sessionend" || EVENT === "end") return sessionEnd(input);
+  if (EVENT === "stop") return stop(input);
   print({ ok: false, error: "unknown hook event", event: EVENT });
   process.exitCode = 2;
 }

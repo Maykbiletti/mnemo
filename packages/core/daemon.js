@@ -33,6 +33,7 @@ const { handleContextPreviewTool } = require("./context_preview_tools");
 const { LOOP_DOCTOR_TOOL_DEFS, handleLoopDoctorTool } = require("./loop_doctor_tools");
 const { TIMELINE_REPORT_TOOL_DEFS, handleTimelineReportTool } = require("./timeline_report_tools");
 const { ensureTeamQualityTables, handleTeamQualityTool } = require("./team_quality_ops");
+const { memoryHealth } = require("./memory_health_tools");
 
 const DB_PATH = process.env.MNEMO_DB || path.join(__dirname, "mnemo.db");
 const PORT = parseInt(process.env.MNEMO_HTTP_PORT || "7117", 10);
@@ -1650,7 +1651,7 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_recall","mem_recall_ids","mem_recall_layered","mem_recall_at_time","mem_recall_on_date","mem_recall_between",
   "mem_search","mem_question_answer","mem_neighbors","mem_get","mem_who_am_i",
   "mem_health","mem_loop_doctor","mem_agent_name_migrate","mem_brief_requeue_stale","mem_brief_reconcile_stale","mem_project_timeline_report","mem_work_report_feed","mem_brief_health","mem_brief_status","mem_brief_list","mem_brief_pull","mem_brief_done",
-  "mem_runtime_health",
+  "mem_runtime_health","mem_agent_memory_health",
   "mem_action_log","mem_action_finish","mem_actions_recent","mem_actions_search",
   "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_event_log",
   "mem_connector_upsert","mem_connector_list","mem_agent_pass_set","mem_agent_pass_get","mem_agent_pass_list","mem_drift_check_report","mem_drift_status",
@@ -4009,6 +4010,9 @@ function handleTool(tdb, name, a) {
     }
     case "mem_runtime_health": {
       return runtimeHealth(tdb, a || {});
+    }
+    case "mem_agent_memory_health": {
+      return memoryHealth(tdb, a || {});
     }
     case "mem_connect_register": {
       const agentName = normalizeAgentName(a.agent_name);

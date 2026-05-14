@@ -31,6 +31,7 @@ const { CODE_READ_TOOL_DEFS, handleCodeReadTool } = require("./code_read_tools")
 const { CONTEXT_PREVIEW_TOOL_DEFS, handleContextPreviewTool } = require("./context_preview_tools");
 const { LOOP_DOCTOR_TOOL_DEFS, handleLoopDoctorTool } = require("./loop_doctor_tools");
 const { TIMELINE_REPORT_TOOL_DEFS, handleTimelineReportTool } = require("./timeline_report_tools");
+const { memoryHealth } = require("./memory_health_tools");
 const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow } = require("./shared_utils");
 
 const readline = require("readline");
@@ -3405,6 +3406,21 @@ const tools = {
       },
     },
     handler: (a = {}) => runtimeHealth(a),
+  },
+
+  mem_agent_memory_health: {
+    description: "Memory-hook health per agent: last SessionStart/UserPromptSubmit/PreCompact/PostToolUse/Stop/SessionEnd, transcript sync, prompt capture, and prior recall status. Mission Control should use this to detect agents that are not using memory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_name: { type: "string" },
+        since: { type: "string" },
+        stale_minutes: { type: "integer", default: 1440 },
+        window_minutes: { type: "integer", default: 1440 },
+        limit: { type: "integer", default: 2000 }
+      }
+    },
+    handler: (a = {}) => memoryHealth(db, a || {}),
   },
 
   mem_add: {

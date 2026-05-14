@@ -62,6 +62,7 @@ node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-compac
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop
+node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-end
 ```
 
 For Claude Code, wire the lifecycle hooks to the same command:
@@ -74,7 +75,8 @@ For Claude Code, wire the lifecycle hooks to the same command:
     "PreCompact": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-compact" }] }],
     "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js pre-tool" }] }],
     "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js post-tool" }] }],
-    "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop" }] }]
+    "Stop": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop" }] }],
+    "SessionEnd": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-end" }] }]
   }
 }
 ```
@@ -83,7 +85,8 @@ For Claude Code, wire the lifecycle hooks to the same command:
 `mem_capture_ingest`, the current Claude transcript tail is synced, relevant
 prior conversations are recalled, and the resulting Mnemo context is injected
 back into Claude. `PreCompact` syncs the transcript before compaction so context
-compression cannot become a memory-loss event.
+compression cannot become a memory-loss event. `SessionEnd` writes a final hook
+status snapshot for Mission Control.
 
 Recommended environment:
 

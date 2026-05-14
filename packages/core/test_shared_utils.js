@@ -91,6 +91,18 @@ test("stripPrivate is case-insensitive and multiline", () => {
   assert.strictEqual(r.hadPrivate, true);
 });
 
+test("stripPrivate removes no-memory and comment blocks", () => {
+  const r = su.stripPrivate("a <no-memory>skip</no-memory> b <!-- mnemo:private -->secret<!-- /mnemo:private --> c");
+  assert.strictEqual(r.text, "a [no-memory] b [private] c");
+  assert.strictEqual(r.hadPrivate, true);
+});
+
+test("stripPrivate removes bracket blocks", () => {
+  const r = su.stripPrivate("keep [private]secret[/private] and [no-memory]discard[/no-memory]");
+  assert.strictEqual(r.text, "keep [private] and [no-memory]");
+  assert.strictEqual(r.hadPrivate, true);
+});
+
 test("stripPrivate no-ops without markers", () => {
   const r = su.stripPrivate("plain text");
   assert.strictEqual(r.text, "plain text");

@@ -181,6 +181,13 @@ Use `packages/core/hooks/firm-runtime-hook.js` for lifecycle enforcement:
 - `post-tool` records file ownership, action logs, and recent transcript turns.
 - `stop` checks active claims, open findings, readiness board, and writes a
   handoff.
+- `session-end` writes the final transcript sync and hook status snapshot.
+
+Memory-private text must be wrapped before it enters Mnemo. Supported tags:
+`<private>...</private>`, `<no-memory>...</no-memory>`,
+`<mnemo-private>...</mnemo-private>`, `[private]...[/private]`, and
+`<!-- mnemo:private -->...<!-- /mnemo:private -->`. These blocks are redacted
+before capture, transcript promotion, memory promotion, and hook payload logging.
 
 Recommended hard-enforcement environment:
 

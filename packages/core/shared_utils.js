@@ -30,11 +30,31 @@ function deepMergePlain(base, override) {
   return out;
 }
 
-// Strip <private>...</private> blocks from text before SQLite persist.
+// Strip memory-private blocks from text before SQLite persist.
 function stripPrivate(text) {
   if (typeof text !== "string" || !text) return { text, hadPrivate: false };
-  if (!/<private>/i.test(text)) return { text, hadPrivate: false };
-  return { text: text.replace(/<private>[\s\S]*?<\/private>/gi, "[private]"), hadPrivate: true };
+  const patterns = [
+    { re: /<private\b[^>]*>[\s\S]*?<\/private>/gi, marker: "[private]" },
+    { re: /<mnemo-private\b[^>]*>[\s\S]*?<\/mnemo-private>/gi, marker: "[private]" },
+    { re: /<memory-private\b[^>]*>[\s\S]*?<\/memory-private>/gi, marker: "[private]" },
+    { re: /<no-memory\b[^>]*>[\s\S]*?<\/no-memory>/gi, marker: "[no-memory]" },
+    { re: /<nomemory\b[^>]*>[\s\S]*?<\/nomemory>/gi, marker: "[no-memory]" },
+    { re: /\[private\][\s\S]*?\[\/private\]/gi, marker: "[private]" },
+    { re: /\[no-memory\][\s\S]*?\[\/no-memory\]/gi, marker: "[no-memory]" },
+    { re: /<!--\s*(?:mnemo:)?private\s*-->[\s\S]*?<!--\s*\/(?:mnemo:)?private\s*-->/gi, marker: "[private]" },
+    { re: /<!--\s*(?:mnemo:)?no-memory\s*-->[\s\S]*?<!--\s*\/(?:mnemo:)?no-memory\s*-->/gi, marker: "[no-memory]" },
+  ];
+  let out = text;
+  let hadPrivate = false;
+  for (const pattern of patterns) {
+    pattern.re.lastIndex = 0;
+    if (pattern.re.test(out)) {
+      hadPrivate = true;
+      pattern.re.lastIndex = 0;
+      out = out.replace(pattern.re, pattern.marker);
+    }
+  }
+  return { text: out, hadPrivate };
 }
 
 function parseAgentCsv(value) {

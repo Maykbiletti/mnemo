@@ -70,12 +70,31 @@ memory boundary. Wire the firm runtime hook to:
   recall prior conversations/solutions, and inject the hits before the answer.
 - `PreCompact`: sync the transcript tail and write a compaction snapshot before
   Claude compresses context.
-- `PostToolUse` and `Stop`: keep recent transcript turns and handoffs fresh.
+- `PostToolUse`, `Stop`, and `SessionEnd`: keep recent transcript turns,
+  handoffs, and final hook status fresh.
 
 When `MNEMO_REQUIRE_CHAT_CAPTURE=1` and `MNEMO_REQUIRE_PROMPT_RECALL=1`, failed
 prompt capture or failed prior-context recall is a blocker if the runtime has
 `MNEMO_HOOK_BLOCK=1`. This is deliberate: an agent should not continue blind
 after losing access to the shared memory layer.
+
+Use `mem_agent_memory_health` in Mission Control to see whether each agent's
+hooks are alive, when it last captured a prompt, whether transcript sync passed,
+and whether prior recall ran before answering.
+
+## Memory-Private Tags
+
+Anything inside memory-private tags is redacted before persistence:
+
+- `<private>...</private>`
+- `<no-memory>...</no-memory>`
+- `<mnemo-private>...</mnemo-private>`
+- `[private]...[/private]`
+- `<!-- mnemo:private -->...<!-- /mnemo:private -->`
+
+Use these for sensitive local-only text. Do not put raw secrets, passwords,
+private keys, tokens, customer data, or billing secrets in Mnemo even inside a
+private tag; store a `secret_ref` instead.
 
 ## Dedup And Burst Safety
 
