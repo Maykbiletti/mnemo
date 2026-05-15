@@ -116,6 +116,7 @@ shape is:
 
 - `POST /mnemo/tool/<tool_name>` for structured MCP-style HTTP tools.
 - `POST /mnemo/memory-tool` for file-like memory reads and listings.
+- `GET /mnemo/health` for daemon health checks used by hook doctors.
 
 Useful memory paths include:
 

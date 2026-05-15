@@ -34,6 +34,16 @@ location = /mnemo/memory-tool {
   proxy_read_timeout 60s;
 }
 
+location = /mnemo/health {
+  proxy_pass http://127.0.0.1:7117/health;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_read_timeout 60s;
+}
+
 location /mnemo/ {
   proxy_pass http://127.0.0.1:7119/;
   proxy_set_header Host $host;
@@ -71,6 +81,9 @@ Recommended first reads:
 
 `POST /mnemo/tool/<tool_name>` calls structured tools over HTTP. Use it for
 automation, diagnostics, and bridges that cannot use stdio MCP directly.
+
+`GET /mnemo/health` should route to the core daemon's `/health` endpoint so
+`mnemo hook-doctor` can distinguish a real hub problem from a proxy gap.
 
 Examples:
 
@@ -118,6 +131,8 @@ curl -s https://your-mnemo.example/mnemo/tool/mem_recall \
 curl -s https://your-mnemo.example/mnemo/tool/mem_project_registry_list \
   -H 'content-type: application/json' \
   -d '{"limit":5}'
+
+curl -s https://your-mnemo.example/mnemo/health
 ```
 
 A good result is not only HTTP 200. Confirm that the response contains current
