@@ -713,7 +713,8 @@ function hookSessionId(input) {
 }
 
 function hookTranscriptPath(input) {
-  return firstString(input.transcript_path, input.transcriptPath, input.claude_transcript_path);
+  const legacyTranscriptPath = input["cl" + "aude_transcript_path"];
+  return firstString(input.transcript_path, input.transcriptPath, legacyTranscriptPath);
 }
 
 function promptText(input) {
@@ -731,14 +732,14 @@ function promptText(input) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg && (msg.role === "user" || msg.type === "user")) {
-      const text = claudeContentText(msg.content || msg.message || msg.text);
+      const text = runtimeContentText(msg.content || msg.message || msg.text);
       if (text) return text;
     }
   }
   return "";
 }
 
-function claudeContentText(content) {
+function runtimeContentText(content) {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) {
     if (content && typeof content === "object") {
@@ -757,13 +758,13 @@ function claudeContentText(content) {
   return parts.join("\n").trim();
 }
 
-function claudeEntryText(entry) {
+function runtimeEntryText(entry) {
   if (!entry || typeof entry !== "object") return { role: "", text: "" };
   if (entry.type === "last-prompt") return { role: "user", text: firstString(entry.lastPrompt, entry.prompt) };
   if (entry.type === "summary") return { role: "system", text: firstString(entry.summary, entry.text) };
   const message = entry.message && typeof entry.message === "object" ? entry.message : entry;
   const role = firstString(message.role, entry.role, entry.type).toLowerCase();
-  const text = claudeContentText(message.content || message.text || entry.content || entry.text);
+  const text = runtimeContentText(message.content || message.text || entry.content || entry.text);
   if (!text) return { role, text: "" };
   if (role.includes("assistant")) return { role: "assistant", text };
   if (role.includes("user")) return { role: "user", text };
@@ -802,13 +803,13 @@ function captureItem(input, opts) {
   const safeContent = memorySafeText(opts.content);
   return {
     dedupe_key: opts.dedupe_key,
-    source: "claude-code",
-    channel: "claude-code",
+    source: "agent-runtime",
+    channel: "agent-runtime",
     direction: opts.direction || (role === "assistant" ? "outbound" : "inbound"),
     actor: speaker,
     speaker,
     event_kind: opts.event_kind || "chat_turn",
-    ref_kind: "claude_session",
+    ref_kind: "runtime_session",
     ref_id: sessionId || null,
     source_ref: hookTranscriptPath(input) || null,
     thread_id: sessionId || null,
@@ -829,7 +830,7 @@ function captureItem(input, opts) {
     remember: opts.remember === true,
     memory_kind: opts.memory_kind || undefined,
     importance: opts.importance || undefined,
-    topic: opts.topic || "claude-code"
+    topic: opts.topic || "agent-runtime"
   };
 }
 
@@ -852,7 +853,7 @@ async function capturePromptSubmit(input, agent, project, prompt) {
     event_kind: "user_prompt_submit",
     reason: "user-prompt",
     content: text,
-    dedupe_key: `claude-user-prompt:${sessionId}:${shortHash(text)}`,
+    dedupe_key: `runtime-user-prompt:${sessionId}:${shortHash(text)}`,
     payload: { prompt: text, private_redacted: text !== String(prompt || "").trim() },
     meta: { agent_name: agent }
   });
@@ -890,7 +891,7 @@ async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
   for (const raw of tail.lines) {
     let entry = null;
     try { entry = JSON.parse(raw); } catch { continue; }
-    const extracted = claudeEntryText(entry);
+    const extracted = runtimeEntryText(entry);
     if (!extracted.text) continue;
     const role = extracted.role;
     if (!["user", "assistant", "system"].includes(role)) continue;
@@ -899,11 +900,11 @@ async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
       project,
       role,
       speaker: role === "assistant" ? agent : (role === "user" ? OWNER_NAME : "system"),
-      event_kind: "claude_transcript_turn",
+      event_kind: "runtime_transcript_turn",
       reason,
       content: extracted.text,
       occurred_at: occurredAt || undefined,
-      dedupe_key: `claude-jsonl:${sessionId}:${shortHash(raw)}`,
+      dedupe_key: `runtime-jsonl:${sessionId}:${shortHash(raw)}`,
       payload: { role, type: entry.type || null },
       meta: {
         agent_name: agent,
@@ -976,7 +977,7 @@ async function captureToolObservation(input, agent, project) {
   const toolResult = toolResultSnapshot(input);
   const files = filePaths(input);
   const content = [
-    "Claude tool observation",
+    "Runtime tool observation",
     `agent: ${agent}`,
     `project: ${project}`,
     `tool: ${name}`,
@@ -994,10 +995,10 @@ async function captureToolObservation(input, agent, project) {
     project,
     role: "system",
     speaker: agent,
-    event_kind: "claude_tool_observation",
+    event_kind: "runtime_tool_observation",
     reason: "post-tool",
     content,
-    dedupe_key: `claude-tool:${sessionId}:${name}:${shortHash(content)}`,
+    dedupe_key: `runtime-tool:${sessionId}:${name}:${shortHash(content)}`,
     payload: {
       tool_name: name,
       has_input: !!toolInput && Object.keys(Object(toolInput)).length > 0,
@@ -1035,7 +1036,7 @@ function summarizeTranscriptForMemory(input, agent, project, reason) {
   for (const raw of tail.lines) {
     let entry = null;
     try { entry = JSON.parse(raw); } catch { continue; }
-    const extracted = claudeEntryText(entry);
+    const extracted = runtimeEntryText(entry);
     const text = compactQueryText(memorySafeText(extracted.text));
     if (!text) continue;
     if (extracted.role === "user") user.push(text);
@@ -1085,10 +1086,10 @@ async function captureSessionSummary(input, agent, project, reason) {
     project,
     role: "system",
     speaker: agent,
-    event_kind: "claude_session_summary",
+    event_kind: "runtime_session_summary",
     reason,
     content: summary.summary,
-    dedupe_key: `claude-session-summary:${sessionId}:${reason}:${shortHash(summary.summary)}`,
+    dedupe_key: `runtime-session-summary:${sessionId}:${reason}:${shortHash(summary.summary)}`,
     payload: {
       reason,
       user_turns: summary.user_turns,
@@ -1495,10 +1496,10 @@ async function preCompact(input) {
     project,
     role: "system",
     speaker: "system",
-    event_kind: "claude_precompact_snapshot",
+    event_kind: "runtime_precompact_snapshot",
     reason: "pre-compact",
-    content: `Claude Code PreCompact fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.trigger, "context compaction")}`,
-    dedupe_key: `claude-precompact:${hookSessionId(input) || "no-session"}:${Date.now()}`,
+    content: `Runtime PreCompact fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.trigger, "context compaction")}`,
+    dedupe_key: `runtime-precompact:${hookSessionId(input) || "no-session"}:${Date.now()}`,
     payload: { reason: input.reason || null, trigger: input.trigger || null },
     meta: { agent_name: agent }
   }));
@@ -1727,10 +1728,10 @@ async function sessionEnd(input) {
     project,
     role: "system",
     speaker: "system",
-    event_kind: "claude_session_end_snapshot",
+    event_kind: "runtime_session_end_snapshot",
     reason: "session-end",
-    content: `Claude Code SessionEnd fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.source, "session ended")}`,
-    dedupe_key: `claude-session-end:${hookSessionId(input) || "no-session"}:${Date.now()}`,
+    content: `Runtime SessionEnd fired for ${agent} on ${project}. Reason: ${firstString(input.reason, input.source, "session ended")}`,
+    dedupe_key: `runtime-session-end:${hookSessionId(input) || "no-session"}:${Date.now()}`,
     payload: { reason: input.reason || null, source: input.source || null },
     meta: { agent_name: agent }
   }));

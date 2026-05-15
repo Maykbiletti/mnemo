@@ -22,11 +22,39 @@ Then in your client:
 
 Search across all memories. Default `mode: 'hybrid'` blends FTS5 BM25 + semantic cosine via Reciprocal Rank Fusion. Set `mode: 'fts'` for exact-keyword only or `mode: 'semantic'` for vector-only.
 
+If exact/full-text recall returns no useful rows, Mnemo runs a bounded fuzzy
+fallback over recent memory, transcript, and journal text. This helps typo-heavy
+queries find existing rows without requiring agents to guess exact keywords.
+
 ```ts
 mem_recall({ query: "stripe webhook timeout", limit: 10 })
 mem_recall({ query: "what did the owner say about pricing", since: "2026-04-01", actor: "owner" })
 mem_recall({ query: "auth bug", mode: "fts", kind: "scar" })
 ```
+
+### `mem_autonomy_task_update(id, status, [...])`
+
+Update an autonomy task. The `id` can be the autonomy task ID or a linked brief
+ID when Mnemo can resolve the relationship. If the new status is `blocked`, the
+update must include a concrete blocker reason in `notes`,
+`blocked_reason`, or `meta.blocked_reason`.
+
+```ts
+mem_autonomy_task_update({ id: 188, status: "blocked", notes: "blocked: missing API key reference" })
+mem_autonomy_task_update({ id: 188, status: "done", evidence: [{ test_step: "smoke", result: "pass" }] })
+```
+
+### `mem_project_registry_list([project, limit])`
+
+List known project registry rows. If the structured registry is empty but
+Mnemo has candidate project facts in memory, the response includes candidates
+and a hint instead of silently returning an empty operational view.
+
+### `mem_quality_finding_list([project, status, limit])`
+
+List quality findings. If no structured findings match but related finding-like
+records exist in memory, the response includes candidates and a hint so agents
+do not assume "no findings" when the data is simply not normalized yet.
 
 ### `mem_who_am_i()`
 

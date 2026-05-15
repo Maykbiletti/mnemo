@@ -358,7 +358,7 @@ function deterministicPreWorkGuard(kind, target, source) {
     needsCoding ? "callers, shared components, routes, schemas, config, tests, package scripts, and deploy/runtime wiring touched by the change" : "",
     needsSiteContract ? "canonical navigation/header/footer source plus every target route/domain that must match it" : "",
     needsI18n ? "language/locale files, legal routes, translated route targets, and footer/legal link wiring" : "",
-    needsTheme ? "blun.ai visual contract: shared header structure, identical buttons, light/dark behavior, theme assets, and mobile header layout" : "",
+    needsTheme ? "canonical brand visual contract: shared header structure, identical buttons, light/dark behavior, theme assets, and mobile header layout" : "",
     needsAuth ? "canonical auth contract, shared identity scope, central login url, cookie/session scope, and allowed login entrypoints" : "",
     needsCrossover ? "auth/session, pricing, checkout, billing, VAT/OSS, legal, and account surfaces across sibling projects" : ""
   ];
@@ -510,6 +510,25 @@ function extractDomainsFromText(text, urls = []) {
   return uniqueList(domains).slice(0, 25);
 }
 
+function slugFromDomain(domain) {
+  const host = String(domain || "").toLowerCase().replace(/^www\./, "");
+  const parts = host.split(".").filter(Boolean);
+  if (parts.length >= 3) return parts[0];
+  if (parts.length >= 2) return parts[0];
+  return "";
+}
+
+function slugsFromPaths(text) {
+  const out = [];
+  const matches = String(text || "").match(/(?:^|[\s('"`])\/(?:root|var|etc|home|mnt|tmp|usr|opt|srv)\/([A-Za-z0-9_.-]+)/g) || [];
+  for (const match of matches) {
+    const cleaned = match.replace(/^[\s('"`]+/, "");
+    const parts = cleaned.split("/").filter(Boolean);
+    if (parts.length >= 2) out.push(parts[1]);
+  }
+  return uniqueList(out).slice(0, 20);
+}
+
 function extractRoutesFromText(text, urls = []) {
   const routes = [];
   for (const url of urls || []) {
@@ -564,33 +583,19 @@ function inferProjectForHardPreflight(source, text, domains) {
     : "";
   if (explicit) return String(explicit).trim();
   const lower = String(text || "").toLowerCase();
-  const domainText = (domains || []).join(" ").toLowerCase();
-  const both = `${lower}\n${domainText}`;
-  if (/\blisting\.blun\.ai\b|\/root\/listing-company\b|\blisting-company\b/.test(both)) return "listing";
-  if (/\baccount\.blun\.ai\b|\/root\/account\b/.test(both)) return "account";
-  if (/\bapps\.blun\.ai\b|\/root\/apps\b/.test(both)) return "apps";
-  if (/\bchat\.blun\.ai\b|\/root\/chat\b/.test(both)) return "chat";
-  if (/\bapi\.blun\.ai\b/.test(both)) return "api";
-  if (/\bmail\.blun\.ai\b/.test(both)) return "mail";
-  if (/\bshopping\.blun\.ai\b/.test(both)) return "shopping";
-  if (/\badmin\.blun\.ai\b/.test(both)) return "admin";
-  if (/\bblun\.ai\b|\/root\/blun\b/.test(both)) return "blun.ai";
   if (/\ball(?:e|en)?\s+portale\b|\bglobal(?:er|es|e)?\s+login\b/i.test(text)) return "global";
+  const domainSlug = uniqueList((domains || []).map(slugFromDomain).filter(Boolean))[0];
+  if (domainSlug) return domainSlug;
+  const pathSlug = slugsFromPaths(lower)[0];
+  if (pathSlug) return pathSlug;
   return "";
 }
 
 function inferSystemsForHardPreflight(text, domains) {
-  const both = `${String(text || "").toLowerCase()}\n${(domains || []).join(" ").toLowerCase()}`;
-  const systems = [];
-  if (/\blisting\.blun\.ai\b|\/root\/listing-company\b|\blisting-company\b/.test(both)) systems.push("listing-company");
-  if (/\baccount\.blun\.ai\b/.test(both)) systems.push("account");
-  if (/\bapps\.blun\.ai\b/.test(both)) systems.push("apps");
-  if (/\bchat\.blun\.ai\b/.test(both)) systems.push("chat");
-  if (/\bapi\.blun\.ai\b/.test(both)) systems.push("api");
-  if (/\bmail\.blun\.ai\b/.test(both)) systems.push("mail");
-  if (/\bshopping\.blun\.ai\b/.test(both)) systems.push("shopping");
-  if (/\badmin\.blun\.ai\b/.test(both)) systems.push("admin");
-  if (/\bblun\.ai\b|\/root\/blun\b/.test(both)) systems.push("blun-website");
+  const systems = [
+    ...(domains || []).map(slugFromDomain).filter(Boolean),
+    ...slugsFromPaths(text)
+  ];
   return uniqueList(systems).slice(0, 20);
 }
 
@@ -2643,12 +2648,12 @@ function runSelfTest() {
   }
   const listingPayload = buildHardPreflightPayload("brief", 999, {
     id: 999,
-    content: "Rollback listing.blun.ai to older backup and restore /root/listing-company/listing_shared_chrome.js from yesterday.",
+    content: "Rollback listing.example.com to older backup and restore /srv/listing-company/listing_shared_chrome.js from yesterday.",
     meta_json: "{\"source\":\"self-test\"}"
   });
   if (listingPayload.project !== "listing") throw new Error(`hard preflight project inference failed: ${listingPayload.project}`);
-  if (!listingPayload.domains.includes("listing.blun.ai")) throw new Error("hard preflight domain extraction failed");
-  if (!listingPayload.files.includes("/root/listing-company/listing_shared_chrome.js")) throw new Error("hard preflight file extraction failed");
+  if (!listingPayload.domains.includes("listing.example.com")) throw new Error("hard preflight domain extraction failed");
+  if (!listingPayload.files.includes("/srv/listing-company/listing_shared_chrome.js")) throw new Error("hard preflight file extraction failed");
   if (!listingPayload.system_names.includes("listing-company")) throw new Error("hard preflight system inference failed");
   if (!["code_edit", "deploy"].includes(listingPayload.action_type)) throw new Error(`hard preflight action inference failed: ${listingPayload.action_type}`);
   console.log(JSON.stringify({ ok: true, pre_work_mode: "deterministic", results }, null, 2));

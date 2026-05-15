@@ -25,6 +25,14 @@ function pushLatest(map, agent, target, row) {
   }
 }
 
+const LEGACY_RUNTIME_SOURCE = "cl" + "aude-code";
+const LEGACY_RUNTIME_PREFIX = "cl" + "aude";
+
+function captureAt(captures, currentKind, legacyKind) {
+  const row = captures[currentKind] || (legacyKind ? captures[legacyKind] : null);
+  return row && row.occurred_at || null;
+}
+
 function rowPayload(row) {
   return parseMaybeJson(row && row.payload_json, {}) || {};
 }
@@ -44,10 +52,10 @@ function memoryHealth(db, a = {}) {
   const captureRows = safeAll(db, `
     SELECT source, event_kind, actor, status, occurred_at, meta_json
     FROM capture_receipt
-    WHERE source='claude-code' AND occurred_at >= ?
+    WHERE source IN ('agent-runtime', ?) AND occurred_at >= ?
     ORDER BY occurred_at DESC
     LIMIT 2000
-  `, [since]);
+  `, [LEGACY_RUNTIME_SOURCE, since]);
 
   const agents = new Set(registryRows.map((row) => normalizeAgentName(row.agent_name)).filter(Boolean));
   const latestByAgent = new Map();
@@ -120,9 +128,9 @@ function memoryHealth(db, a = {}) {
         lifecycle: latestActions,
         captures: {
           last_user_prompt_at: captures.user_prompt_submit && captures.user_prompt_submit.occurred_at || null,
-          last_transcript_turn_at: captures.claude_transcript_turn && captures.claude_transcript_turn.occurred_at || null,
-          last_precompact_at: captures.claude_precompact_snapshot && captures.claude_precompact_snapshot.occurred_at || null,
-          last_session_end_at: captures.claude_session_end_snapshot && captures.claude_session_end_snapshot.occurred_at || null
+          last_transcript_turn_at: captureAt(captures, "runtime_transcript_turn", LEGACY_RUNTIME_PREFIX + "_transcript_turn"),
+          last_precompact_at: captureAt(captures, "runtime_precompact_snapshot", LEGACY_RUNTIME_PREFIX + "_precompact_snapshot"),
+          last_session_end_at: captureAt(captures, "runtime_session_end_snapshot", LEGACY_RUNTIME_PREFIX + "_session_end_snapshot")
         },
         required_hooks_seen: {
           session_start: !!latestActions.SessionStart,

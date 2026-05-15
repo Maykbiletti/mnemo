@@ -60,16 +60,16 @@ Do not silently drop burst messages, duplicate-looking messages, or throttled me
 
 Keep public repos neutral: put private chat IDs, names, customer details, and project-specific channels in local runtime configuration or personal packs, not in committed source.
 
-## Claude Code Memory Hooks
+## Runtime Memory Hooks
 
-Claude Code runtimes must treat context compaction as a capture event, not as a
+Agent runtimes must treat context compaction as a capture event, not as a
 memory boundary. Wire the firm runtime hook to:
 
 - `SessionStart`: load the canonical session bundle and inject it as context.
 - `UserPromptSubmit`: capture the exact user prompt, sync the transcript tail,
   recall prior conversations/solutions, and inject the hits before the answer.
 - `PreCompact`: sync the transcript tail and write a compaction snapshot before
-  Claude compresses context.
+  the runtime compresses context.
 - `PostToolUse`: capture a compact observation for every tool result so reads,
   searches, edits, shell output, and failed actions leave receipts.
 - `Stop` and `SessionEnd`: keep recent transcript turns, handoffs, durable

@@ -171,10 +171,10 @@ Use `packages/core/hooks/firm-runtime-hook.js` for lifecycle enforcement:
 
 - `session-start` records session start and injects the canonical Mnemo startup
   context.
-- `user-prompt` captures every user prompt, syncs the Claude transcript tail,
+- `user-prompt` captures every user prompt, syncs the runtime transcript tail,
   searches prior conversations/solutions, and injects the results before the
   agent answers.
-- `pre-compact` syncs the transcript before Claude context compaction so compacting
+- `pre-compact` syncs the transcript before runtime context compaction so compacting
   cannot erase the only copy of recent work.
 - `pre-tool` runs file echo, project preflight, identity check, owner preference
   check, token-efficiency guard, clean-work guard, and optional auto-claim.

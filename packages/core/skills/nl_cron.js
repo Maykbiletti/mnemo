@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * nl_cron.js — natural-language cron entries for Mnemo.
+ * nl_cron.js - natural-language cron entries for Mnemo.
  *
  * Usage:
- *   node nl_cron.js "daily 8am: curl https://listing.blun.ai/brief/today"
+ *   node nl_cron.js "daily 8am: curl https://example.com/brief/today"
  *   node nl_cron.js "every 15 minutes: node /root/mnemo/packages/core/cycles.js"
  *   node nl_cron.js "monday 9am: send weekly report"
  *   node nl_cron.js --list
@@ -78,7 +78,7 @@ function ingestToMnemo(body) {
 }
 
 function rebuildCronFile(state) {
-  const header = "# Managed by mnemo nl_cron — do not edit by hand\nSHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n";
+  const header = "# Managed by mnemo nl_cron â€” do not edit by hand\nSHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n";
   const lines = state.entries.map(e => `${e.cron} root ${e.action} >> /var/log/mnemo-nl-cron.log 2>&1  # ${e.id} :: ${e.label}`).join("\n");
   fs.writeFileSync(CRON_FILE, header + lines + "\n");
   try { fs.chmodSync(CRON_FILE, 0o644); } catch (_) {}
@@ -111,7 +111,7 @@ async function add(input) {
       meta_json: JSON.stringify(entry),
     });
   } catch (e) { console.error("(mnemo ingest failed:", e.message + ")"); }
-  console.log("added", id, "—", parsed.label, "→", action);
+  console.log("added", id, "â€”", parsed.label, "â†’", action);
   console.log("cron:", parsed.cron);
 }
 

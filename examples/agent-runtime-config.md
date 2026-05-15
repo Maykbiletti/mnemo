@@ -65,7 +65,7 @@ node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js stop
 node /absolute/path/to/mnemo/packages/core/hooks/firm-runtime-hook.js session-end
 ```
 
-For Claude Code, wire the lifecycle hooks to the same command:
+For runtimes with named lifecycle hooks, wire each event to the matching command:
 
 ```json
 {
@@ -82,10 +82,10 @@ For Claude Code, wire the lifecycle hooks to the same command:
 ```
 
 `UserPromptSubmit` is the hard memory gate: every user prompt is captured through
-`mem_capture_ingest`, the current Claude transcript tail is synced, relevant
+`mem_capture_ingest`, the current runtime transcript tail is synced, relevant
 prior conversations are recalled, and the resulting Mnemo context is injected
-back into Claude. `PreCompact` syncs the transcript before compaction so context
-compression cannot become a memory-loss event. `PostToolUse` captures a compact
+back into the runtime. `PreCompact` syncs the transcript before compaction so
+context compression cannot become a memory-loss event. `PostToolUse` captures a compact
 tool observation for all tools, not only edits. `Stop` and `SessionEnd` write a
 summary memory plus final hook status for Mission Control. If the hub is down,
 hook writes are queued locally and flushed on the next hook event.

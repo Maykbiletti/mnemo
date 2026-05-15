@@ -1,15 +1,8 @@
-<div align="center">
+<h1 align="center">Mnemo</h1>
 
-```
-â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•— 
-â–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•â•â•â–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•â–ˆâ–ˆâ•—
-â–ˆâ–ˆâ•”â–ˆâ–ˆâ–ˆâ–ˆâ•”â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â–ˆâ–ˆâ•— â–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•”â–ˆâ–ˆâ–ˆâ–ˆâ•”â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘
-â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•  â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘
-â–ˆâ–ˆâ•‘ â•šâ•â• â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘ â•šâ–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘ â•šâ•â• â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•
-â•šâ•â•     â•šâ•â•â•šâ•â•  â•šâ•â•â•â•â•šâ•â•â•â•â•â•â•â•šâ•â•     â•šâ•â• â•šâ•â•â•â•â•â•
-```
-
-**Persistent memory, identity, and coordination for AI agent teams.**
+<p align="center">
+  <strong>Persistent memory, identity, and coordination for AI agent teams.</strong>
+</p>
 
 [![CI](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml/badge.svg)](https://github.com/Maykbiletti/mnemo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-1a1a1a?style=flat-square)](./LICENSE)
@@ -17,7 +10,6 @@
 [![Status](https://img.shields.io/badge/status-alpha-22D3EE?style=flat-square)](./ROADMAP.md)
 [![Powered by BLUN](https://img.shields.io/badge/Powered%20by-BLUN-00c9ff?style=flat-square)](https://blun.ai)
 
-</div>
 
 Mnemo gives agents a durable operating layer: searchable memory, identity,
 briefs, work claims, project rules, quality findings, and autonomous loop
@@ -69,6 +61,14 @@ can prove what changed, who did it, or which project gates are still open.
   preflight, file claims, clean work, token discipline, site contracts, tool
   observation capture, queued-write replay, session summaries, and completion
   handoffs. `mnemo-hook-doctor` checks local hook wiring and hub health.
+- **Hub Operations Hardening.** Blocked autonomy-review briefs now carry a
+  concrete blocker reason and batch position, autonomy task updates can resolve
+  linked brief IDs, recall has a fuzzy fallback when exact search misses, and
+  hook queue output is rotated into ASCII-safe JSONL.
+- **Memory Frontdoor.** Hub deployments can expose `POST /mnemo/memory-tool`
+  for file-like memory reads such as `/memories/top.md`, `/memories/today.md`,
+  and project registry views, while keeping private facts outside the public
+  repo.
 - **Smart Code Read.** `mem_code_outline` and `mem_code_unfold` let agents
   inspect symbols and bounded ranges before spending tokens on whole files.
 - **Context Preview.** `mem_context_preview` gives agents a token-budgeted fetch
@@ -108,6 +108,34 @@ mem_session_brief({agent_name:"agent-a", project:"example-project", token_budget
 mem_recall("what did we decide about migrations")
 mem_promise_open()
 ```
+
+## Hub HTTP Frontdoors
+
+Mnemo can run as a central hub behind a reverse proxy. The recommended public
+shape is:
+
+- `POST /mnemo/tool/<tool_name>` for structured MCP-style HTTP tools.
+- `POST /mnemo/memory-tool` for file-like memory reads and listings.
+
+Useful memory paths include:
+
+- `/memories/top.md`
+- `/memories/today.md`
+- `/memories/inbox.md`
+- `/memories/projects/<project>/registry.md`
+- `/memories/projects/<project>/live-check.md`
+- `/memories/projects/<project>/rules.md`
+- `/memories/projects/<project>/findings.md`
+
+Example:
+
+```bash
+curl -s https://your-mnemo.example/mnemo/memory-tool \
+  -H 'content-type: application/json' \
+  -d '{"command":"view","path":"/memories/top.md","agent":"agent-a","project":"example-project"}'
+```
+
+See [`docs/hub-operations.md`](docs/hub-operations.md).
 
 ## Start An Agent Loop
 
@@ -211,6 +239,7 @@ The repo includes `packages/core/facts/example.json` and
 - [`AGENTS.md`](AGENTS.md) - operating guide for agents
 - [`docs/architecture.md`](docs/architecture.md) - system architecture
 - [`docs/deployment.md`](docs/deployment.md) - server, PM2, env, proxy
+- [`docs/hub-operations.md`](docs/hub-operations.md) - hub routes, memory frontdoor, ops hardening
 - [`docs/agent-operating-dna.md`](docs/agent-operating-dna.md) - where agents read and store operational truth
 - [`docs/mcp-tools.md`](docs/mcp-tools.md) - tool surface
 - [`docs/universal-capture.md`](docs/universal-capture.md) - capture and backfill
@@ -253,5 +282,5 @@ skills/ directory: nl_cron, approval_queue, subagent_pool, skill_runner, skills_
 
 <p align="center">
   <strong>Get it done. With <a href="https://blun.ai">BLUN</a>.</strong><br>
-  Powered by <a href="https://blun.ai">BLUN</a> Â· Built with Mnemo
+  Powered by <a href="https://blun.ai">BLUN</a> - Built with Mnemo
 </p>
