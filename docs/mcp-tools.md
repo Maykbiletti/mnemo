@@ -461,13 +461,56 @@ labels, header/footer host leaks, CTA links, and CTA target status. Use
 
 Run reflection cycle for a date — counts corrections/praises in messages, generates a summary, writes `daily_reflection` row. Default date: today.
 
+### `mem_access_preflight({ system_name?, project?, access_kind?, intended_command?, intended_entrypoint?, agent_name? })`
+
+Mandatory gate before touching SSH, dashboards, APIs, databases, providers, or
+shared infra. It resolves the canonical route, logs an allowed/blocked access
+event, and returns `canonical_command` plus `route_steps`.
+
+If an access route is stored as `route_kind: "jump"` or `route_kind: "proxy"`
+with `direct_allowed: false`, direct attempts are blocked and the returned
+canonical route must be used.
+
+```json
+{
+  "system_name": "example-production",
+  "access_kind": "ssh",
+  "agent_name": "dieter",
+  "intended_command": "ssh root@example.org"
+}
+```
+
+### `mem_access_route_resolve({ system_name?, project?, access_kind?, entrypoint?, intended_route_kind?, agent_name? })`
+
+Non-mutating resolver for the same canonical access policy. Use this when an
+agent needs to plan or explain the route without logging a live preflight event.
+
 ### `mem_access_guide({ project?, system_name?, scope?, status?, limit? })`
 
 Fixed access front door. Reads the access inventory plus matching project
 registry rows and returns a grouped guide for "how do I get there?" questions:
 domain, repo, server, PM2, nginx, admin URL, access kind, entrypoint,
-account_hint, and `secret_ref`.
+account_hint, `route_kind`, `direct_allowed`, jump/proxy details,
+`canonical_command`, and `secret_ref`.
 
 Use this before asking where a project lives or before creating a duplicate
 access note. If the route does not exist yet, write it with
 `mem_access_upsert`, then mark it verified via `mem_access_event_log`.
+
+Example route with a jump host:
+
+```json
+{
+  "system_name": "example-production",
+  "access_kind": "ssh",
+  "entrypoint": "example.org",
+  "account_hint": "root",
+  "route_kind": "jump",
+  "direct_allowed": false,
+  "jump_host": "jump.example.org",
+  "jump_user": "root",
+  "canonical_command": "ssh -J root@jump.example.org root@example.org",
+  "secret_ref": "SSH key label",
+  "updated_by": "agent-name"
+}
+```

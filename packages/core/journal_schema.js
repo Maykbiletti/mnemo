@@ -125,6 +125,16 @@ CREATE TABLE IF NOT EXISTS access_inventory (
   secret_ref TEXT,
   allowed_agents TEXT,
   status TEXT NOT NULL DEFAULT 'active',
+  route_kind TEXT NOT NULL DEFAULT 'direct',
+  direct_allowed INTEGER NOT NULL DEFAULT 1,
+  jump_host TEXT,
+  jump_user TEXT,
+  jump_secret_ref TEXT,
+  proxy_command TEXT,
+  canonical_command TEXT,
+  route_steps_json TEXT,
+  preflight_required INTEGER NOT NULL DEFAULT 1,
+  last_route_check_at TEXT,
   last_verified_at TEXT,
   verification_method TEXT,
   notes TEXT,
@@ -516,6 +526,25 @@ CREATE TABLE IF NOT EXISTS session_handoff (
 );
 CREATE INDEX IF NOT EXISTS idx_handoff_agent_project ON session_handoff(agent_name, project, created_at DESC);
 `);
+  try {
+    const accessCols = db.prepare("PRAGMA table_info(access_inventory)").all().map((c) => c.name);
+    const accessAdds = [
+      ["route_kind", "TEXT NOT NULL DEFAULT 'direct'"],
+      ["direct_allowed", "INTEGER NOT NULL DEFAULT 1"],
+      ["jump_host", "TEXT"],
+      ["jump_user", "TEXT"],
+      ["jump_secret_ref", "TEXT"],
+      ["proxy_command", "TEXT"],
+      ["canonical_command", "TEXT"],
+      ["route_steps_json", "TEXT"],
+      ["preflight_required", "INTEGER NOT NULL DEFAULT 1"],
+      ["last_route_check_at", "TEXT"],
+    ];
+    for (const [name, ddl] of accessAdds) {
+      if (!accessCols.includes(name)) db.exec(`ALTER TABLE access_inventory ADD COLUMN ${name} ${ddl}`);
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_access_route_kind ON access_inventory(route_kind, direct_allowed, status)");
+  } catch {}
   try {
     const mediaCols = db.prepare("PRAGMA table_info(media_asset)").all().map((c) => c.name);
     if (!mediaCols.includes("original_file_name")) db.exec("ALTER TABLE media_asset ADD COLUMN original_file_name TEXT");

@@ -8,7 +8,8 @@ Agents must load the canonical source before acting:
 
 - Agent identity and rights: `mem_agent_pass_get`, `mem_session_brief`.
 - Project truth: project registry, project rules, project truth map.
-- Access routes: `mem_access_guide`, `mem_access_list`.
+- Access routes: `mem_access_preflight`, `mem_access_route_resolve`,
+  `mem_access_guide`, `mem_access_list`.
 - Connectors and external systems: `mem_connector_list`.
 - Open work: `mem_work_active`, `mem_actions_search`, timeline reports.
 - Protected final artifacts: artifact-lock checks and hard preflight.
@@ -20,7 +21,9 @@ truth. If a fact matters later, write it into Mnemo.
 ## Where Things Go
 
 - Verified server/repo/admin/API/database access route:
-  `mem_access_upsert` plus `mem_access_event_log`.
+  `mem_access_upsert` plus `mem_access_event_log`. Include `route_kind`,
+  `direct_allowed`, jump/proxy fields, and a `canonical_command` when access
+  is not direct.
 - Secret material:
   never raw in Mnemo or the repo; store only `secret_ref`, env var name, vault
   label, or local path label.
@@ -58,6 +61,16 @@ must update all affected surfaces in one coherent work unit:
 
 If the agent cannot update or verify an affected surface, it must mark the work
 blocked with evidence. It must not report done.
+
+## Access Preflight
+
+Agents must not try direct SSH/API/admin/database access first and only look up
+Mnemo after it fails. Before access, run `mem_access_preflight` with the target,
+access kind, agent name, and intended command or entrypoint.
+
+If the route says `direct_allowed=false`, the returned `canonical_command` and
+`route_steps` are mandatory. A missing route is a blocker until the route is
+added or verified in Mnemo.
 
 ## Public Repo Hygiene
 

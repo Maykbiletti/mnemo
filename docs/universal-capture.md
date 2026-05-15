@@ -14,18 +14,23 @@ The rule is simple: if an agent saw it, said it, did it, changed it, verified it
 - Raw bridge/tool/CLI receipt: `mem_event_log`
 - Work started or finished: `mem_action_log` and `mem_action_finish`
 - Agent assignment: `mem_brief_drop`, `mem_brief_pull`, `mem_brief_done`
-- Access route discovered or verified: `mem_access_guide`, `mem_access_upsert`, and `mem_access_event_log`
+- Access route discovered, resolved, or verified: `mem_access_preflight`,
+  `mem_access_route_resolve`, `mem_access_upsert`, and `mem_access_event_log`
 - Durable fact, decision, preference, correction: `mem_add`, `mem_decision_log`, or `mem_correction_capture`
 
 ## Access Inventory
 
 Store how to reach a system, not the secret itself.
 
-There should be one fixed place to look first: `mem_access_guide`. Humans and
-agents should read that before asking where a server, repo, admin, dashboard,
-API, database, or provider lives. If the route already exists there, reuse it.
-If it does not exist, add it with `mem_access_upsert` and immediately log the
-verification with `mem_access_event_log`.
+There should be one fixed place to look first: `mem_access_preflight` or
+`mem_access_route_resolve`. Humans and agents should resolve that route before
+asking where a server, repo, admin, dashboard, API, database, or provider lives.
+If the route says `jump`, `proxy`, `vpn`, or `tunnel` and
+`direct_allowed=false`, direct access is not allowed. Use the returned
+`canonical_command` and `route_steps`.
+
+If the route does not exist, add it with `mem_access_upsert` and immediately log
+the verification with `mem_access_event_log`.
 
 This is mandatory for operational agents. Access knowledge belongs in Mnemo,
 not only in chat history.
@@ -40,6 +45,11 @@ Example:
   "access_kind": "ssh",
   "entrypoint": "root@example.org",
   "account_hint": "root",
+  "route_kind": "jump",
+  "direct_allowed": false,
+  "jump_host": "jump.example.org",
+  "jump_user": "root",
+  "canonical_command": "ssh -J root@jump.example.org root@example.org",
   "secret_ref": "SSH key label or env var name",
   "project": "Example",
   "updated_by": "agent-name"

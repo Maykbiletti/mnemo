@@ -35,6 +35,7 @@ const { memoryHealth } = require("./memory_health_tools");
 const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
 const briefCoordination = require("./brief_coordination");
 const { AGENT_MAIL_TOOL_DEFS, ensureAgentMailTables, handleAgentMailTool } = require("./agent_mail");
+const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
 
 const readline = require("readline");
 
@@ -79,6 +80,12 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_agent_mail_dispatch",
   "mem_agent_mail_queue_outbound",
   "mem_agent_mail_mark",
+  "mem_access_upsert",
+  "mem_access_list",
+  "mem_access_guide",
+  "mem_access_route_resolve",
+  "mem_access_preflight",
+  "mem_access_event_log",
   "mem_media_capture",
   "mem_media_recent",
   "mem_media_search",
@@ -169,6 +176,7 @@ const db = new Database(DB_PATH, { readonly: false, fileMustExist: true });
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 ensureAgentMailTables(db);
+ensureAccessRouteSchema(db);
 
 function ensureReminderTables() {
   db.exec(`
@@ -8360,6 +8368,16 @@ for (const [name, def] of Object.entries(AGENT_MAIL_TOOL_DEFS)) {
     handler: async (args) => {
       const handled = handleAgentMailTool(db, name, args || {});
       if (!handled.handled) throw new Error("unknown agent mail tool: " + name);
+      return handled.result;
+    },
+  });
+}
+
+for (const [name, def] of Object.entries(ACCESS_ROUTE_TOOL_DEFS)) {
+  tools[name] = Object.assign({}, def, {
+    handler: async (args) => {
+      const handled = handleAccessRouteTool(db, name, args || {});
+      if (!handled.handled) throw new Error("unknown access route tool: " + name);
       return handled.result;
     },
   });

@@ -184,6 +184,16 @@ CREATE TABLE IF NOT EXISTS access_inventory (
   secret_ref          TEXT,                      -- env name, vault path, key filename, password-manager label
   allowed_agents      TEXT,                      -- JSON array or comma list
   status              TEXT NOT NULL DEFAULT 'active',
+  route_kind          TEXT NOT NULL DEFAULT 'direct', -- direct | jump | proxy | vpn | tunnel | manual
+  direct_allowed      INTEGER NOT NULL DEFAULT 1,
+  jump_host           TEXT,
+  jump_user           TEXT,
+  jump_secret_ref     TEXT,
+  proxy_command       TEXT,
+  canonical_command   TEXT,
+  route_steps_json    TEXT,
+  preflight_required  INTEGER NOT NULL DEFAULT 1,
+  last_route_check_at TEXT,
   last_verified_at    TEXT,
   verification_method TEXT,
   notes               TEXT,

@@ -862,10 +862,10 @@ function universalMemoryCaptureProtocol() {
 - Use mem_event_log for small raw receipts that are too noisy for semantic memory but must never disappear.
 - Use mem_action_log/mem_action_finish for every concrete action you start: command, edit, deploy, check, browser run, audit, brief, or investigation.
 - Read your own agent passport first with mem_agent_pass_get so you know your live rights, review duty, and approval class before acting outside simple read/report work.
-- Before touching infra or asking how to get somewhere, read the fixed access point first: mem_access_guide or mem_access_list. Check whether the route already exists before adding a new one.
+- Before touching infra or asking how to get somewhere, run mem_access_preflight or mem_access_route_resolve first. If Mnemo says route_kind=jump/proxy/tunnel and direct_allowed=false, do not try direct access; use the returned canonical_command/route_steps exactly.
 - Before touching providers, OAuth, Stripe, VAT, PM2, nginx, mail, DNS, or shared infra, read the connector register first with mem_connector_list. If a system is missing, add it with mem_connector_upsert before improvising.
-- Use mem_access_upsert / mem_access_event_log when you discover or verify how to reach a server, repo, admin, dashboard, API, database, provider, or console. Otto, Dieter, Angel, and Alfred must all store verified access routes there. Store secret_ref/key/env/path labels only; never store raw passwords, private keys, tokens, or customer secrets.
-- Before asking "did we already do this?", search Mnemo first: mem_event_recent, mem_actions_search, mem_transcript_recent, mem_access_guide, mem_access_list, mem_question_answer, or mem_recall_layered as appropriate.`;
+- Use mem_access_upsert / mem_access_event_log when you discover or verify how to reach a server, repo, admin, dashboard, API, database, provider, or console. Store route_kind, direct_allowed, jump_host/proxy_command, canonical_command, and secret_ref/key/env/path labels only; never store raw passwords, private keys, tokens, or customer secrets.
+- Before asking "did we already do this?", search Mnemo first: mem_event_recent, mem_actions_search, mem_transcript_recent, mem_access_preflight, mem_access_guide, mem_access_list, mem_question_answer, or mem_recall_layered as appropriate.`;
 }
 
 function promptForBrief(brief, prework, memoryContext = "") {

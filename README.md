@@ -70,6 +70,10 @@ can prove what changed, who did it, or which project gates are still open.
   channel lists expose active/offline subscriber heartbeat state, and autonomy
   task updates can resolve linked brief IDs through meta, content, source, and
   reverse-link records.
+- **Canonical Access Routes.** `mem_access_preflight` and
+  `mem_access_route_resolve` make agents resolve SSH/API/admin/database routes
+  before access. Jump/proxy routes can set `direct_allowed=false`, returning the
+  required canonical command instead of letting agents try direct access first.
 - **Memory Frontdoor.** Hub deployments can expose `POST /mnemo/memory-tool`
   for file-like memory reads such as `/memories/top.md`, `/memories/today.md`,
   and project registry views, while keeping private facts outside the public
