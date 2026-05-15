@@ -135,6 +135,20 @@ test("listAccessRoutes returns route policy fields", () => {
   assert.strictEqual(listed.access[0].direct_allowed, true);
 });
 
+test("full ssh command entrypoints are not prefixed twice", () => {
+  const db = setupDb();
+  const created = upsertAccessRoute(db, {
+    system_name: "prod-176",
+    access_kind: "ssh",
+    entrypoint: "ssh -i ~/.ssh/id_ed25519_alfred root@176.9.158.30",
+    route_kind: "direct",
+    direct_allowed: true,
+    updated_by: "alfred",
+  });
+
+  assert.strictEqual(created.route.canonical_command, "ssh -i ~/.ssh/id_ed25519_alfred root@176.9.158.30");
+});
+
 test("legacy updates do not erase stored jump policy", () => {
   const db = setupDb();
   upsertAccessRoute(db, {

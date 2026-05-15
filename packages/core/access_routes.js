@@ -95,6 +95,7 @@ function buildCanonicalCommand(route) {
   const target = sshTarget(route);
 
   if (["ssh", "server", "shell"].includes(kind)) {
+    if (/^ssh\s+/i.test(target)) return target;
     if (routeKind === "jump" && target && jumpTarget(route)) return `ssh -J ${jumpTarget(route)} ${target}`;
     if (routeKind === "proxy" && target && cleanText(route.proxy_command)) return `ssh -o ProxyCommand='${cleanText(route.proxy_command)}' ${target}`;
     if (routeKind === "tunnel" && target && cleanText(route.proxy_command)) return cleanText(route.proxy_command);
