@@ -1,5 +1,7 @@
 "use strict";
 
+const { requeueStaleDispatchedBriefs } = require("./brief_coordination");
+
 const LOOP_DOCTOR_TOOL_DEFS = {
   mem_loop_doctor: {
     description: "Diagnose autonomous agent loop health from Mnemo state: heartbeats, engine cooldowns, pending/dispatched briefs, stale actions, autonomy tasks, and recent handoffs.",
@@ -26,12 +28,13 @@ const LOOP_DOCTOR_TOOL_DEFS = {
     },
   },
   mem_brief_requeue_stale: {
-    description: "Dry-run or requeue stale dispatched briefs back to pending for one agent or all agents. Use after mem_loop_doctor reports stale_dispatched_brief.",
+    description: "Dry-run or requeue stale dispatched briefs back to pending for offline or non-heartbeating agents. Use after mem_loop_doctor reports stale_dispatched_brief.",
     inputSchema: {
       type: "object",
       properties: {
         agent_name: { type: "string" },
-        older_than_minutes: { type: "integer", default: 60 },
+        older_than_minutes: { type: "integer", default: 30 },
+        agent_stale_sec: { type: "integer", default: 300 },
         limit: { type: "integer", default: 25 },
         dry_run: { type: "boolean", default: true },
       },
@@ -57,7 +60,7 @@ function handleLoopDoctorTool(db, name, args) {
   if (!LOOP_DOCTOR_TOOL_DEFS[name]) return { handled: false };
   if (name === "mem_loop_doctor") return { handled: true, result: loopDoctor(db, args || {}) };
   if (name === "mem_agent_name_migrate") return { handled: true, result: agentNameMigrate(db, args || {}) };
-  if (name === "mem_brief_requeue_stale") return { handled: true, result: briefRequeueStale(db, args || {}) };
+  if (name === "mem_brief_requeue_stale") return { handled: true, result: requeueStaleDispatchedBriefs(db, args || {}) };
   if (name === "mem_brief_reconcile_stale") return { handled: true, result: briefReconcileStale(db, args || {}) };
   return { handled: false };
 }
