@@ -76,18 +76,30 @@ function agentAgeSec(lastSeenAt) {
   return Math.max(0, Math.round((Date.now() - t) / 1000));
 }
 
+function shouldReplaceSubscriber(existing, next) {
+  if (!existing) return true;
+  if (next.active !== existing.active) return next.active;
+  const nextRegistered = next.status !== "unregistered";
+  const existingRegistered = existing.status !== "unregistered";
+  if (nextRegistered !== existingRegistered) return nextRegistered;
+  if (next.last_seen_age_sec == null) return false;
+  if (existing.last_seen_age_sec == null) return true;
+  if (next.last_seen_age_sec !== existing.last_seen_age_sec) return next.last_seen_age_sec < existing.last_seen_age_sec;
+  return String(next.subscribed_at || "") > String(existing.subscribed_at || "");
+}
+
 function channelListWithSubscribers(db, options = {}) {
   const activeWindowSec = Math.max(30, Number(options.active_window_sec || process.env.MNEMO_CHANNEL_ACTIVE_SEC || 300));
   const includeSubscribers = options.include_subscribers !== false;
   markStaleAgentsOffline(db, activeWindowSec);
   const rows = db.prepare(
     "SELECT c.name, c.description, c.created_at, " +
-    "(SELECT COUNT(*) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
+    "(SELECT COUNT(DISTINCT lower(s.agent_name)) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
     "FROM channel c ORDER BY c.created_at ASC"
   ).all();
-  if (!includeSubscribers) return { count: rows.length, channels: rows, active_window_sec: activeWindowSec };
+  if (!includeSubscribers) return { ok: true, count: rows.length, channels: rows, active_window_sec: activeWindowSec };
   const subStmt = db.prepare(
-    "SELECT s.agent_name, s.subscribed_at, r.display_name, r.host, r.pid, r.status, r.last_seen_at, r.skills_json, r.meta_json, " +
+    "SELECT s.agent_name, s.subscribed_at, r.agent_name AS registry_agent_name, r.display_name, r.host, r.pid, r.status, r.last_seen_at, r.skills_json, r.meta_json, " +
     "(SELECT COUNT(*) FROM agent_brief b WHERE b.channel=s.channel_name AND lower(b.agent_name)=lower(s.agent_name) AND b.status='pending') AS pending_briefs, " +
     "(SELECT COUNT(*) FROM agent_brief b WHERE b.channel=s.channel_name AND lower(b.agent_name)=lower(s.agent_name) AND b.status='dispatched') AS dispatched_briefs " +
     "FROM channel_subscription s " +
@@ -95,13 +107,13 @@ function channelListWithSubscribers(db, options = {}) {
     "WHERE s.channel_name=? ORDER BY s.agent_name ASC"
   );
   const channels = rows.map((row) => {
-    const details = subStmt.all(row.name).map((sub) => {
+    const rawDetails = subStmt.all(row.name).map((sub) => {
       const age = agentAgeSec(sub.last_seen_at);
       const status = sub.status || "unregistered";
       const active = ["online", "busy", "idle"].includes(String(status).toLowerCase()) && age != null && age <= activeWindowSec;
       return {
-        agent_name: sub.agent_name,
-        display_name: sub.display_name || sub.agent_name,
+        agent_name: sub.registry_agent_name || sub.agent_name,
+        display_name: sub.display_name || sub.registry_agent_name || sub.agent_name,
         subscribed_at: sub.subscribed_at,
         status,
         active,
@@ -115,13 +127,21 @@ function channelListWithSubscribers(db, options = {}) {
         dispatched_briefs: sub.dispatched_briefs || 0
       };
     });
+    const unique = new Map();
+    for (const detail of rawDetails) {
+      const key = normalizeAgentName(detail.agent_name);
+      const existing = unique.get(key);
+      if (shouldReplaceSubscriber(existing, detail)) unique.set(key, detail);
+    }
+    const details = Array.from(unique.values()).sort((a, b) => normalizeAgentName(a.agent_name).localeCompare(normalizeAgentName(b.agent_name)));
     return Object.assign({}, row, {
+      subscribers: details.length,
       active_subscribers: details.filter((sub) => sub.active).length,
       offline_subscribers: details.filter((sub) => !sub.active).length,
       subscribers_detail: details
     });
   });
-  return { count: channels.length, channels, active_window_sec: activeWindowSec };
+  return { ok: true, count: channels.length, channels, active_window_sec: activeWindowSec };
 }
 
 function pushCandidate(candidates, id, source) {

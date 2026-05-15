@@ -113,11 +113,13 @@ function run() {
 
   db.prepare("INSERT INTO channel (name, description) VALUES (?,?)").run("ops", "Operations");
   db.prepare("INSERT INTO channel_subscription (channel_name, agent_name) VALUES (?,?)").run("ops", "active-agent");
+  db.prepare("INSERT INTO channel_subscription (channel_name, agent_name) VALUES (?,?)").run("ops", "Active-Agent");
   db.prepare("INSERT INTO channel_subscription (channel_name, agent_name) VALUES (?,?)").run("ops", "offline-agent");
   const channels = channelListWithSubscribers(db, { active_window_sec: 300 });
   const ops = channels.channels.find((row) => row.name === "ops");
   assert("channel includes active subscriber count", ops && ops.active_subscribers === 1, ops);
   assert("channel includes offline subscriber count", ops && ops.offline_subscribers === 1, ops);
+  assert("channel deduplicates subscriber aliases case-insensitively", ops && ops.subscribers_detail.length === 2, ops);
   assert("channel details expose heartbeat status", ops && ops.subscribers_detail.some((row) => row.agent_name === "active-agent" && row.active));
 
   db.prepare("INSERT INTO autonomy_task (project, department_name, title, category, source_kind, source_id) VALUES (?,?,?,?,?,?)").run("p", "backend", "from source", "coordination", "agent_brief", "900");
