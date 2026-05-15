@@ -270,8 +270,39 @@ test("inferMediaKind detects document by extension", () => {
   assert.strictEqual(su.inferMediaKind({ event_kind: "" }, {}, {}, "doc.pdf", "pdf"), "document");
 });
 
+test("inferMediaKind treats html/text exports as documents", () => {
+  assert.strictEqual(su.inferMediaKind({ event_kind: "" }, {}, {}, "admin.html", "html"), "document");
+  assert.strictEqual(su.inferMediaKind({ event_kind: "" }, {}, {}, "notes.txt", "txt"), "document");
+});
+
 test("inferMediaKind uses hinted kind", () => {
   assert.strictEqual(su.inferMediaKind({ event_kind: "", media_kind: "image" }, {}, {}, "", ""), "image");
+});
+
+test("buildMediaTitle creates chat-context screenshot title", () => {
+  assert.strictEqual(
+    su.buildMediaTitle({
+      source: "telegram",
+      channel: "telegram-chat:-100",
+      occurred_at: "2026-02-22T13:45:00",
+      content: "Hier ein Screenshot vom Admin Design",
+      media_kind: "screenshot"
+    }),
+    "Chat 22.02.2026 13:45 Hier ein Screenshot vom Admin Design"
+  );
+});
+
+test("buildCanonicalMediaFileName creates safe contextual filename", () => {
+  const name = su.buildCanonicalMediaFileName({
+    source: "telegram",
+    channel: "telegram-chat:-100",
+    occurred_at: "2026-02-22T13:45:00",
+    title: "Chat 22.02.2026 13:45 Hier ein Screenshot vom Admin Design",
+    file_ext: "png"
+  });
+  assert(name.endsWith(".png"));
+  assert(name.includes("chat-2026-02-22-13-45"));
+  assert(name.includes("admin-design"));
 });
 
 // --- uniqueStrings ---

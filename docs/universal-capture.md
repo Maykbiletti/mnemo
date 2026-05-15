@@ -148,6 +148,17 @@ Do not embed binary file contents in `mnemo_event_journal` or `memory`. Store a
 path or vault reference and let downstream tooling decide how to inspect the
 asset.
 
+For manual or bridge-side media capture, prefer `mem_media_capture`. It binds
+the asset to the chat/action context and creates both:
+
+- a human title, e.g. `Chat 22.02.2026 13:45 Hier ein Screenshot vom Admin Design`
+- a safe canonical file name, e.g. `chat-2026-02-22-13-45-hier-ein-screenshot-vom-admin-design.png`
+
+When `MNEMO_MEDIA_STORE` is not `0` and the referenced file is local, Mnemo
+copies it into `MNEMO_MEDIA_DIR` so agents can find the exact evidence later
+without re-reading the whole chat export or guessing which screenshot belonged
+to which instruction.
+
 ## Reminders And Future Commitments
 
 Future-dated owner requests are not normal chat. When an owner says things like

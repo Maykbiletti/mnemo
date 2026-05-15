@@ -211,8 +211,9 @@ function inferMediaKind(a, meta, payload, fileName, ext) {
   if (eventKind.includes("screenshot")) return "screenshot";
   if (eventKind.includes("photo") || eventKind.includes("image")) return "image";
   if (eventKind.includes("document") || eventKind.includes("pdf")) return "document";
+  if (eventKind.includes("file") || eventKind.includes("attachment")) return "file";
   if (["png","jpg","jpeg","webp","gif","bmp"].includes(ext)) return "screenshot";
-  if (["pdf","doc","docx","txt","md","rtf"].includes(ext)) return "document";
+  if (["pdf","doc","docx","txt","md","rtf","html","htm","csv","tsv","json","jsonl","xml","log"].includes(ext)) return "document";
   if (fileName) return "file";
   return "";
 }
@@ -225,6 +226,80 @@ function inferMediaType(ext, kind) {
 
 function uniqueStrings(list) {
   return Array.from(new Set((Array.isArray(list) ? list : [list]).map(x => String(x || "").trim()).filter(Boolean)));
+}
+
+function compactTitleText(value, max = 90) {
+  const raw = String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[`*_#>\[\](){}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!raw) return "";
+  return raw.length > max ? raw.slice(0, max - 1).trim() + "…" : raw;
+}
+
+function captureSourceLabel(source, channel) {
+  const s = String(source || "").toLowerCase();
+  const c = String(channel || "").toLowerCase();
+  if (s.includes("telegram") || c.includes("telegram") || c.includes("chat")) return "Chat";
+  if (s.includes("email") || c.includes("mail")) return "Email";
+  if (s.includes("browser")) return "Browser";
+  if (s.includes("brief")) return "Brief";
+  if (s.includes("manual")) return "Manual";
+  return source ? String(source).replace(/[-_]+/g, " ").replace(/\b\w/g, m => m.toUpperCase()) : "Capture";
+}
+
+function formatCaptureDisplayTime(value) {
+  const d = value ? new Date(value) : new Date();
+  if (!Number.isFinite(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatCaptureFileTime(value) {
+  const d = value ? new Date(value) : new Date();
+  if (!Number.isFinite(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
+}
+
+function slugFilePart(value, max = 96) {
+  const s = String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, max)
+    .replace(/-+$/g, "");
+  return s || "media";
+}
+
+function buildMediaTitle(input = {}) {
+  const explicit = input.title || input.meta && input.meta.title || input.payload && input.payload.title;
+  if (explicit) return compactTitleText(explicit, 160);
+  const sourceLabel = captureSourceLabel(input.source, input.channel);
+  const stamp = formatCaptureDisplayTime(input.occurred_at);
+  const context = compactTitleText(
+    input.context_text || input.content || input.text ||
+    input.meta && (input.meta.context_text || input.meta.caption || input.meta.message_text || input.meta.notes) ||
+    input.payload && (input.payload.context_text || input.payload.caption || input.payload.message_text || input.payload.notes) ||
+    "",
+    100
+  );
+  const fallback = compactTitleText([input.project, input.media_kind, input.route, input.page_url, input.file_name].filter(Boolean).join(" "), 100);
+  return [sourceLabel, stamp, context || fallback].filter(Boolean).join(" ").trim();
+}
+
+function buildCanonicalMediaFileName(input = {}) {
+  const ext = String(input.file_ext || extensionName(input.file_name || input.media_path) || "asset").toLowerCase();
+  const title = input.title || buildMediaTitle(input);
+  const stamp = formatCaptureFileTime(input.occurred_at);
+  const label = captureSourceLabel(input.source, input.channel);
+  const source = slugFilePart(label, 24);
+  const body = slugFilePart(title.replace(formatCaptureDisplayTime(input.occurred_at), "").replace(new RegExp("^" + label + "\\s*", "i"), ""), 100);
+  const base = [source, stamp, body].filter(Boolean).join("-");
+  return `${base || "media"}${ext ? "." + ext.replace(/^\./, "") : ""}`;
 }
 
 // --- Contract validation constants ---
@@ -590,7 +665,7 @@ module.exports = {
   cleanScope, uniqueAgentNames, isTeamBriefTarget,
   hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent,
   // File / media
-  baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings,
+  baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, compactTitleText, captureSourceLabel, formatCaptureDisplayTime, formatCaptureFileTime, slugFilePart, buildMediaTitle, buildCanonicalMediaFileName,
   // Readiness / flags
   boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments,
   // Contract validation

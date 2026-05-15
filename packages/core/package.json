@@ -4,7 +4,10 @@
   "description": "Persistent memory + identity engine. SQLite + FTS5 + sqlite-vec embeddings + MCP server. The core a personal/team agent runs on so it never starts at zero.",
   "license": "MIT",
   "homepage": "https://github.com/Maykbiletti/mnemo",
-  "repository": { "type": "git", "url": "https://github.com/Maykbiletti/mnemo.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Maykbiletti/mnemo.git"
+  },
   "main": "mcp.js",
   "bin": {
     "mnemo": "./bin/mnemo.js",
@@ -47,12 +50,16 @@
   "dependencies": {
     "@xenova/transformers": "^2.17.2",
     "better-sqlite3": "^12.9.0",
+    "imapflow": "^1.3.3",
+    "mailparser": "^3.9.8",
     "sqlite-vec": "^0.1.9"
   },
   "overrides": {
     "protobufjs": "^7.5.5"
   },
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "keywords": [
     "memory",
     "agent",

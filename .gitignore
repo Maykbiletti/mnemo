@@ -62,3 +62,6 @@ daemon.log.*
 
 # Local verification / evidence output
 reports/
+
+# Mnemo captured screenshots/files are runtime evidence, not source.
+packages/core/media/

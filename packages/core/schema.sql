@@ -211,6 +211,81 @@ CREATE TABLE IF NOT EXISTS access_event (
 CREATE INDEX IF NOT EXISTS idx_access_event_access ON access_event(access_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_access_event_actor ON access_event(actor, occurred_at DESC);
 
+-- =========================================================================
+-- Agent mail: fixed BLUN employee mailboxes for agents.
+-- Secrets are stored as references (env:/file:), not raw passwords.
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS agent_mail_account (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name          TEXT NOT NULL,
+  employee_name       TEXT,
+  company_name        TEXT NOT NULL DEFAULT 'BLUN',
+  employee_status     TEXT NOT NULL DEFAULT 'active',
+  department          TEXT,
+  role_title          TEXT,
+  email_address       TEXT NOT NULL UNIQUE,
+  inbound_enabled     INTEGER NOT NULL DEFAULT 1,
+  outbound_enabled    INTEGER NOT NULL DEFAULT 1,
+  imap_host           TEXT,
+  imap_port           INTEGER,
+  imap_secure         INTEGER NOT NULL DEFAULT 1,
+  imap_user_ref       TEXT,
+  imap_pass_ref       TEXT,
+  imap_mailbox        TEXT NOT NULL DEFAULT 'INBOX',
+  smtp_host           TEXT,
+  smtp_port           INTEGER,
+  smtp_secure         INTEGER NOT NULL DEFAULT 1,
+  smtp_user_ref       TEXT,
+  smtp_pass_ref       TEXT,
+  signature_text      TEXT,
+  handling_policy     TEXT,
+  send_policy         TEXT NOT NULL DEFAULT 'agent_queue',
+  status              TEXT NOT NULL DEFAULT 'active',
+  last_fetch_at       TEXT,
+  last_fetch_status   TEXT,
+  last_send_at        TEXT,
+  last_error          TEXT,
+  meta_json           TEXT,
+  created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_mail_account_agent ON agent_mail_account(agent_name, status);
+CREATE INDEX IF NOT EXISTS idx_agent_mail_account_email ON agent_mail_account(email_address);
+
+CREATE TABLE IF NOT EXISTS agent_mail_message (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id          INTEGER NOT NULL REFERENCES agent_mail_account(id) ON DELETE CASCADE,
+  agent_name          TEXT NOT NULL,
+  direction           TEXT NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'new',
+  provider_message_id TEXT,
+  thread_key          TEXT,
+  from_addr           TEXT,
+  to_addr             TEXT,
+  cc_addr             TEXT,
+  bcc_addr            TEXT,
+  reply_to            TEXT,
+  subject             TEXT,
+  body_text           TEXT,
+  body_html           TEXT,
+  body_preview        TEXT,
+  received_at         TEXT,
+  queued_at           TEXT,
+  sent_at             TEXT,
+  processed_at        TEXT,
+  brief_id            INTEGER,
+  error               TEXT,
+  meta_json           TEXT,
+  created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(account_id, direction, provider_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_mail_message_agent ON agent_mail_message(agent_name, direction, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_mail_message_account ON agent_mail_message(account_id, direction, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_mail_message_brief ON agent_mail_message(brief_id);
+
 -- Future-dated owner requests, appointments, and follow-up reminders.
 CREATE TABLE IF NOT EXISTS reminder (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,

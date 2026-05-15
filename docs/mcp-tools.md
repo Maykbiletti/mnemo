@@ -343,12 +343,15 @@ For multi-portal product families, this is treated as a top directive:
 - no local reinterpretation is allowed once the canonical source is set
 - display/body fonts, font sizing, light-logo PNG, dark-logo PNG, logo size, button size, and header spacing must match the canonical source
 
-### `mem_media_recent/search/get`
+### `mem_media_capture/recent/search/get`
 
 Captured screenshots, photos, PDFs, and documents are stored as first-class
 media assets with:
 
 - human-readable title
+- canonical file name
+- original file name
+- optional copied storage path under `MNEMO_MEDIA_DIR`
 - labels
 - project
 - route/page URL
@@ -358,13 +361,30 @@ media assets with:
 Use:
 
 ```ts
+mem_media_capture({
+  media_path: "/tmp/screenshot.png",
+  source: "telegram",
+  channel: "telegram-chat:-100123",
+  actor: "mayk",
+  content: "Hier ein Screenshot vom Admin Design",
+  project: "admin",
+  occurred_at: "2026-02-22T13:45:00"
+})
 mem_media_recent({ project: "Example Project", media_kind: "screenshot", limit: 20 })
 mem_media_search({ query: "dark logo pricing page", project: "Example Project" })
 mem_media_get({ id: 42 })
 ```
 
 `mem_capture_ingest` now auto-indexes media when `media_path`, `file_path`,
-`file_name`, or media-like event metadata is present.
+`file_name`, or media-like event metadata is present. If `MNEMO_MEDIA_STORE`
+is not `0` and the path is local, Mnemo also copies the file into the media
+store with a contextual safe name, for example:
+
+`chat-2026-02-22-13-45-hier-ein-screenshot-vom-admin-design.png`
+
+The searchable title stays human-readable:
+
+`Chat 22.02.2026 13:45 Hier ein Screenshot vom Admin Design`
 
 ### `mem_session_handoff(agent_name, summary, [...])`
 

@@ -29,6 +29,8 @@ const TOOLS = [
   { name: "mem_recall", description: "Search Mnemo memory by text query.", schema: { type: "object", properties: { q: { type: "string" }, limit: { type: "integer", default: 20 } }, required: ["q"] } },
   { name: "mem_ingest", description: "Insert a new memory entry.", schema: { type: "object", properties: { kind: { type: "string" }, source: { type: "string" }, actor: { type: "string" }, text: { type: "string" }, importance: { type: "integer" } }, required: ["kind", "source", "actor", "text"] } },
   { name: "mem_brief_post", description: "Post a brief into a Mnemo Connect channel.", schema: { type: "object", properties: { channel: { type: "string" }, agent_name: { type: "string" }, content: { type: "string" }, source_agent: { type: "string" } }, required: ["channel", "content"] } },
+  { name: "mem_media_capture", description: "Capture a screenshot/file with chat/action context and canonical Mnemo media naming.", schema: { type: "object", properties: { media_path: { type: "string" }, file_path: { type: "string" }, content: { type: "string" }, project: { type: "string" }, page_url: { type: "string" }, route: { type: "string" }, actor: { type: "string" }, source: { type: "string" }, channel: { type: "string" } } } },
+  { name: "mem_media_search", description: "Search captured Mnemo media assets.", schema: { type: "object", properties: { query: { type: "string" }, project: { type: "string" }, media_kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } },
   { name: "mem_health", description: "Get Mnemo daemon health.", schema: { type: "object", properties: {} } },
   { name: "mem_agent_memory_health", description: "Get per-agent memory hook health for Mission Control.", schema: { type: "object", properties: { agent_name: { type: "string" }, stale_minutes: { type: "integer" }, window_minutes: { type: "integer" } } } },
 ];
@@ -96,6 +98,8 @@ const server = http.createServer(async (req, res) => {
         r = await callMnemo("POST", "/ingest", Object.assign({ occurred_at: new Date().toISOString() }, args), tenant);
       } else if (name === "mem_brief_post") {
         r = await callMnemo("POST", "/tool/mem_connect_channel_post", args);
+      } else if (name === "mem_media_capture" || name === "mem_media_search") {
+        r = await callMnemo("POST", "/tool/" + name, args);
       } else if (name === "mem_health") {
         r = await callMnemo("GET", "/health", null);
       } else if (name === "mem_agent_memory_health") {

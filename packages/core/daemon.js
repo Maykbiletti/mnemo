@@ -57,8 +57,9 @@ const TZ_OFFSET_HOURS = parseInt(process.env.MNEMO_TZ_OFFSET_HOURS || "0", 10);
 const QUIET_START = parseInt(process.env.MNEMO_QUIET_START || "23", 10);
 const QUIET_END = parseInt(process.env.MNEMO_QUIET_END || "7", 10);
 const { collectBody } = require("./http_utils");
-const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow } = require("./shared_utils");
+const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
 const briefCoordination = require("./brief_coordination");
+const { ensureAgentMailTables, handleAgentMailTool, dispatchInboundBriefs } = require("./agent_mail");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
 const FACTS_DIR = process.env.MNEMO_FACTS_DIR || path.join(__dirname, "facts");
@@ -166,6 +167,7 @@ CREATE INDEX IF NOT EXISTS idx_reaction_brief ON agent_brief_reaction(brief_id);
 const { ensureUniversalJournalSchema, ensureProjectRegistryTable, ensureFirmOpsTables } = require("./journal_schema");
 
 bootstrapBaseSchema(db, "host");
+ensureAgentMailTables(db);
 // Mnemo Connect schema bootstrap (idempotent)
 db.exec(`
 CREATE TABLE IF NOT EXISTS agent_brief (
@@ -489,7 +491,8 @@ function mediaCaptureDetails(a = {}) {
   const meta = a.meta && typeof a.meta === "object" ? a.meta : {};
   const payload = a.payload && typeof a.payload === "object" ? a.payload : {};
   const mediaPath = a.media_path || meta.media_path || payload.media_path || a.file_path || meta.file_path || payload.file_path || "";
-  const fileName = a.file_name || meta.file_name || payload.file_name || baseName(mediaPath);
+  const originalFileName = a.file_name || meta.file_name || payload.file_name || baseName(mediaPath);
+  const fileName = originalFileName;
   const ext = extensionName(fileName || mediaPath);
   const mediaKind = inferMediaKind(a, meta, payload, fileName, ext);
   const mediaType = a.media_type || meta.media_type || payload.media_type || inferMediaType(ext, mediaKind);
@@ -497,6 +500,7 @@ function mediaCaptureDetails(a = {}) {
   const pageUrl = a.page_url || meta.page_url || payload.page_url || meta.url || payload.url || "";
   const route = a.route || meta.route || payload.route || "";
   const actor = a.actor || a.speaker || meta.actor || "";
+  const contextText = a.context_text || a.content || a.text || meta.context_text || meta.caption || meta.message_text || meta.notes || payload.context_text || payload.caption || payload.message_text || payload.notes || "";
   const labels = uniqueStrings([]
     .concat(a.labels || [])
     .concat(meta.labels || [])
@@ -507,10 +511,13 @@ function mediaCaptureDetails(a = {}) {
     .concat(mediaType ? [mediaType] : [])
     .concat(actor ? [actor] : [])
     .concat(a.channel ? [a.channel] : []));
-  const title = a.title || meta.title || payload.title || [project || null, mediaKind || "media", route || null, fileName || null].filter(Boolean).join(" | ");
+  const title = buildMediaTitle(Object.assign({}, a, { meta, payload, project, media_kind: mediaKind, route, page_url: pageUrl, file_name: fileName, context_text: contextText }));
+  const canonicalName = buildCanonicalMediaFileName({ source: a.source, channel: a.channel, occurred_at: a.occurred_at, title, file_ext: ext || extensionName(mediaPath), file_name: fileName, media_path: mediaPath });
   return {
     media_path: mediaPath,
-    file_name: fileName,
+    file_name: canonicalName,
+    original_file_name: originalFileName || null,
+    canonical_name: canonicalName,
     file_ext: ext,
     media_kind: mediaKind,
     media_type: mediaType,
@@ -518,13 +525,93 @@ function mediaCaptureDetails(a = {}) {
     page_url: pageUrl,
     route,
     labels,
-    title: title || `${mediaKind || "media"} | ${a.source || "capture"}`
+    title: title || `${mediaKind || "media"} | ${a.source || "capture"}`,
+    context_text: contextText || null
   };
 }
 
+function materializeMediaFile(details, occurred) {
+  if (process.env.MNEMO_MEDIA_STORE === "0") return null;
+  const sourcePath = details && details.media_path ? String(details.media_path) : "";
+  if (!sourcePath || (/^[a-z]+:/i.test(sourcePath) && !/^[a-z]:[\\/]/i.test(sourcePath))) return null;
+  let realSource;
+  let stat;
+  try {
+    realSource = path.resolve(sourcePath);
+    stat = fs.statSync(realSource);
+  } catch {
+    return null;
+  }
+  if (!stat.isFile()) return null;
+  const maxBytes = Math.max(1024, parseInt(process.env.MNEMO_MEDIA_COPY_MAX_BYTES || String(25 * 1024 * 1024), 10));
+  if (stat.size > maxBytes) return null;
+  const root = process.env.MNEMO_MEDIA_DIR || path.join(__dirname, "media");
+  const datePart = String(occurred || now()).slice(0, 10) || "undated";
+  const projectPart = slugFilePart(details.project || "unassigned", 80);
+  const destDir = path.join(root, projectPart, datePart);
+  const destPath = path.join(destDir, details.canonical_name || details.file_name || baseName(realSource));
+  try {
+    fs.mkdirSync(destDir, { recursive: true });
+    if (path.resolve(destPath) !== realSource && !fs.existsSync(destPath)) fs.copyFileSync(realSource, destPath);
+    return destPath;
+  } catch {
+    return null;
+  }
+}
+
+function ensureMediaAssetRuntimeSchema(target) {
+  target.exec(`
+CREATE TABLE IF NOT EXISTS media_asset (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dedupe_key TEXT UNIQUE,
+  source TEXT NOT NULL,
+  channel TEXT,
+  thread_id TEXT,
+  actor TEXT,
+  event_kind TEXT,
+  media_kind TEXT NOT NULL,
+  media_type TEXT,
+  title TEXT NOT NULL,
+  file_name TEXT,
+  original_file_name TEXT,
+  canonical_name TEXT,
+  file_ext TEXT,
+  media_path TEXT,
+  storage_path TEXT,
+  content_ref TEXT,
+  page_url TEXT,
+  route TEXT,
+  project TEXT,
+  labels_json TEXT,
+  notes TEXT,
+  ref_kind TEXT,
+  ref_id TEXT,
+  occurred_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'captured',
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+)`);
+  const cols = target.prepare("PRAGMA table_info(media_asset)").all().map((c) => c.name);
+  if (!cols.includes("original_file_name")) target.exec("ALTER TABLE media_asset ADD COLUMN original_file_name TEXT");
+  if (!cols.includes("canonical_name")) target.exec("ALTER TABLE media_asset ADD COLUMN canonical_name TEXT");
+  if (!cols.includes("storage_path")) target.exec("ALTER TABLE media_asset ADD COLUMN storage_path TEXT");
+  if (!cols.includes("content_ref")) target.exec("ALTER TABLE media_asset ADD COLUMN content_ref TEXT");
+  target.exec(`
+CREATE INDEX IF NOT EXISTS idx_media_occurred ON media_asset(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_media_project ON media_asset(project, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_media_kind ON media_asset(media_kind, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_media_thread ON media_asset(thread_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_media_canonical ON media_asset(canonical_name);
+`);
+}
+
 function upsertMediaAssetFromCapture(tdb, a = {}, dedupeKey, occurred, meta) {
-  const details = mediaCaptureDetails(a);
+  const details = mediaCaptureDetails(Object.assign({}, a, { occurred_at: a.occurred_at || occurred }));
   if (!details.media_path && !details.file_name && !details.media_kind) return null;
+  ensureMediaAssetRuntimeSchema(tdb);
+  const storagePath = materializeMediaFile(details, occurred);
+  const contentRef = a.ref_kind && a.ref_id != null ? `${a.ref_kind}:${a.ref_id}` : (a.source_ref || a.thread_id || a.session_id || null);
   const existing = tdb.prepare("SELECT id FROM media_asset WHERE dedupe_key=?").get(dedupeKey);
   const payload = {
     dedupe_key: dedupeKey,
@@ -537,8 +624,12 @@ function upsertMediaAssetFromCapture(tdb, a = {}, dedupeKey, occurred, meta) {
     media_type: details.media_type || null,
     title: details.title,
     file_name: details.file_name || null,
+    original_file_name: details.original_file_name || null,
+    canonical_name: details.canonical_name || details.file_name || null,
     file_ext: details.file_ext || null,
     media_path: details.media_path || null,
+    storage_path: storagePath || null,
+    content_ref: contentRef || null,
     page_url: details.page_url || null,
     route: details.route || null,
     project: details.project || null,
@@ -548,15 +639,15 @@ function upsertMediaAssetFromCapture(tdb, a = {}, dedupeKey, occurred, meta) {
     ref_id: a.ref_id != null ? String(a.ref_id) : (a.source_ref || null),
     occurred_at: occurred,
     status: a.status || "captured",
-    meta_json: JSON.stringify(Object.assign({}, meta || {}, { media_indexed: true }))
+    meta_json: JSON.stringify(Object.assign({}, meta || {}, { media_indexed: true, original_file_name: details.original_file_name || null, canonical_name: details.canonical_name || null, storage_path: storagePath || null, context_text: details.context_text || null }))
   };
   if (existing) {
-    tdb.prepare("UPDATE media_asset SET source=?, channel=?, thread_id=?, actor=?, event_kind=?, media_kind=?, media_type=?, title=?, file_name=?, file_ext=?, media_path=?, page_url=?, route=?, project=?, labels_json=?, notes=?, ref_kind=?, ref_id=?, occurred_at=?, status=?, meta_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE dedupe_key=?")
-      .run(payload.source, payload.channel, payload.thread_id, payload.actor, payload.event_kind, payload.media_kind, payload.media_type, payload.title, payload.file_name, payload.file_ext, payload.media_path, payload.page_url, payload.route, payload.project, payload.labels_json, payload.notes, payload.ref_kind, payload.ref_id, payload.occurred_at, payload.status, payload.meta_json, dedupeKey);
+    tdb.prepare("UPDATE media_asset SET source=?, channel=?, thread_id=?, actor=?, event_kind=?, media_kind=?, media_type=?, title=?, file_name=?, original_file_name=?, canonical_name=?, file_ext=?, media_path=?, storage_path=?, content_ref=?, page_url=?, route=?, project=?, labels_json=?, notes=?, ref_kind=?, ref_id=?, occurred_at=?, status=?, meta_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE dedupe_key=?")
+      .run(payload.source, payload.channel, payload.thread_id, payload.actor, payload.event_kind, payload.media_kind, payload.media_type, payload.title, payload.file_name, payload.original_file_name, payload.canonical_name, payload.file_ext, payload.media_path, payload.storage_path, payload.content_ref, payload.page_url, payload.route, payload.project, payload.labels_json, payload.notes, payload.ref_kind, payload.ref_id, payload.occurred_at, payload.status, payload.meta_json, dedupeKey);
     return { id: existing.id, status: "updated", title: payload.title, media_kind: payload.media_kind };
   }
-  const info = tdb.prepare("INSERT INTO media_asset (dedupe_key, source, channel, thread_id, actor, event_kind, media_kind, media_type, title, file_name, file_ext, media_path, page_url, route, project, labels_json, notes, ref_kind, ref_id, occurred_at, status, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-    .run(payload.dedupe_key, payload.source, payload.channel, payload.thread_id, payload.actor, payload.event_kind, payload.media_kind, payload.media_type, payload.title, payload.file_name, payload.file_ext, payload.media_path, payload.page_url, payload.route, payload.project, payload.labels_json, payload.notes, payload.ref_kind, payload.ref_id, payload.occurred_at, payload.status, payload.meta_json);
+  const info = tdb.prepare("INSERT INTO media_asset (dedupe_key, source, channel, thread_id, actor, event_kind, media_kind, media_type, title, file_name, original_file_name, canonical_name, file_ext, media_path, storage_path, content_ref, page_url, route, project, labels_json, notes, ref_kind, ref_id, occurred_at, status, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(payload.dedupe_key, payload.source, payload.channel, payload.thread_id, payload.actor, payload.event_kind, payload.media_kind, payload.media_type, payload.title, payload.file_name, payload.original_file_name, payload.canonical_name, payload.file_ext, payload.media_path, payload.storage_path, payload.content_ref, payload.page_url, payload.route, payload.project, payload.labels_json, payload.notes, payload.ref_kind, payload.ref_id, payload.occurred_at, payload.status, payload.meta_json);
   return { id: info.lastInsertRowid, status: "created", title: payload.title, media_kind: payload.media_kind };
 }
 
@@ -1665,7 +1756,7 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_health","mem_loop_doctor","mem_agent_name_migrate","mem_brief_requeue_stale","mem_brief_reconcile_stale","mem_project_timeline_report","mem_work_report_feed","mem_brief_health","mem_brief_status","mem_brief_list","mem_brief_pull","mem_brief_done",
   "mem_runtime_health","mem_agent_memory_health",
   "mem_action_log","mem_action_finish","mem_actions_recent","mem_actions_search",
-  "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_event_log",
+  "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_media_capture","mem_media_recent","mem_media_search","mem_media_get","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_event_log",
   "mem_connector_upsert","mem_connector_list","mem_agent_pass_set","mem_agent_pass_get","mem_agent_pass_list","mem_drift_check_report","mem_drift_status",
   "mem_duplicate_work_check","mem_impact_map","mem_write_gate_check",
   "mem_maintenance_window_upsert","mem_maintenance_window_list","mem_maintenance_window_check",
@@ -1679,6 +1770,7 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_transcript_log","mem_transcript_recent",
   "mem_idle_loop_set","mem_idle_loop_status","mem_set_mode","mem_get_mode",
   "mem_connect_register","mem_connect_heartbeat","mem_connect_list","mem_agent_list","mem_agent_register",
+  "mem_agent_mail_account_upsert","mem_agent_mail_account_list","mem_agent_mail_inbox","mem_agent_mail_outbox","mem_agent_mail_record_inbound","mem_agent_mail_dispatch","mem_agent_mail_queue_outbound","mem_agent_mail_mark",
   "mem_skill_list","mem_skill_get","mem_skill_match","mem_skill_search","mem_skill_run","mem_skill_record",
   "mem_consults_inbox","mem_consult_agent_pending","mem_consult_agent_status",
   "mem_proposals_pending","mem_project_list","mem_task_available","mem_task_list",
@@ -4246,6 +4338,8 @@ function handleTool(tdb, name, a) {
   }
   const teamQuality = handleTeamQualityTool(tdb, name, a || {});
   if (teamQuality.handled) return teamQuality.result;
+  const agentMail = handleAgentMailTool(tdb, name, a || {});
+  if (agentMail.handled) return agentMail.result;
   switch (name) {
     case "mem_recall": {
       return recallMemories(tdb, a || {});
@@ -4920,7 +5014,21 @@ function handleTool(tdb, name, a) {
       const rows = tdb.prepare("SELECT dedupe_key, source, channel, direction, actor, event_kind, ref_kind, ref_id, thread_id, occurred_at, substr(content_preview,1,300) AS content_preview, event_id, transcript_id, memory_id, status, seen_count, last_seen_at FROM capture_receipt" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY occurred_at DESC, last_seen_at DESC LIMIT ?").all(...params);
       return { count: rows.length, receipts: rows };
     }
+    case "mem_media_capture": {
+      if (!a.media_path && !a.file_path && !a.file_name) return { ok: false, error: "media_path, file_path, or file_name required" };
+      return captureIngest(tdb, Object.assign({
+        source: "manual",
+        channel: "chat",
+        event_kind: a.media_kind === "document" ? "document_capture" : "screenshot_capture",
+        promote_memory: true,
+        remember: true
+      }, a, {
+        media_path: a.media_path || a.file_path,
+        content: a.content || a.text || a.notes || ""
+      }));
+    }
     case "mem_media_recent": {
+      ensureMediaAssetRuntimeSchema(tdb);
       const where = [];
       const params = [];
       if (a.project) { where.push("project=?"); params.push(a.project); }
@@ -4930,21 +5038,23 @@ function handleTool(tdb, name, a) {
       if (a.channel) { where.push("channel=?"); params.push(a.channel); }
       if (a.thread_id) { where.push("thread_id=?"); params.push(String(a.thread_id)); }
       params.push(Math.min(a.limit || 50, 500));
-      const rows = tdb.prepare("SELECT id, title, media_kind, media_type, project, route, page_url, file_name, media_path, labels_json, actor, channel, thread_id, occurred_at, status FROM media_asset" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
+      const rows = tdb.prepare("SELECT id, title, media_kind, media_type, project, route, page_url, file_name, original_file_name, canonical_name, media_path, storage_path, content_ref, labels_json, actor, channel, thread_id, occurred_at, status FROM media_asset" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
       return { count: rows.length, media: rows.map(r => Object.assign({}, r, { labels: parseMaybeJson(r.labels_json, []) })) };
     }
     case "mem_media_search": {
+      ensureMediaAssetRuntimeSchema(tdb);
       if (!a.query) return { error: "query required" };
       const q = "%" + String(a.query || "").trim() + "%";
-      const where = ["(title LIKE ? OR file_name LIKE ? OR media_path LIKE ? OR page_url LIKE ? OR route LIKE ? OR labels_json LIKE ? OR notes LIKE ?)"];
-      const params = [q, q, q, q, q, q, q];
+      const where = ["(title LIKE ? OR file_name LIKE ? OR original_file_name LIKE ? OR canonical_name LIKE ? OR media_path LIKE ? OR storage_path LIKE ? OR content_ref LIKE ? OR page_url LIKE ? OR route LIKE ? OR labels_json LIKE ? OR notes LIKE ?)"];
+      const params = [q, q, q, q, q, q, q, q, q, q, q];
       if (a.project) { where.push("project=?"); params.push(a.project); }
       if (a.media_kind) { where.push("media_kind=?"); params.push(a.media_kind); }
       params.push(Math.min(a.limit || 50, 200));
-      const rows = tdb.prepare("SELECT id, title, media_kind, media_type, project, route, page_url, file_name, media_path, labels_json, actor, channel, occurred_at, status FROM media_asset WHERE " + where.join(" AND ") + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
+      const rows = tdb.prepare("SELECT id, title, media_kind, media_type, project, route, page_url, file_name, original_file_name, canonical_name, media_path, storage_path, content_ref, labels_json, actor, channel, occurred_at, status FROM media_asset WHERE " + where.join(" AND ") + " ORDER BY occurred_at DESC LIMIT ?").all(...params);
       return { count: rows.length, media: rows.map(r => Object.assign({}, r, { labels: parseMaybeJson(r.labels_json, []) })) };
     }
     case "mem_media_get": {
+      ensureMediaAssetRuntimeSchema(tdb);
       const row = a.id
         ? tdb.prepare("SELECT * FROM media_asset WHERE id=?").get(a.id)
         : (a.dedupe_key ? tdb.prepare("SELECT * FROM media_asset WHERE dedupe_key=?").get(String(a.dedupe_key)) : null);
@@ -7303,6 +7413,21 @@ function reminderDispatchCycle() {
 }
 setInterval(reminderDispatchCycle, 60 * 1000);
 setTimeout(reminderDispatchCycle, 10 * 1000);
+
+// ---------- Agent mail inbox dispatcher ----------
+// The email gateway fetches mail into agent_mail_message; this loop turns new
+// inbound rows into agent_briefs so agents see their mailbox in the same work
+// queue as everything else.
+function agentMailDispatchCycle() {
+  try {
+    const result = dispatchInboundBriefs(db, { limit: parseInt(process.env.MNEMO_AGENT_MAIL_DISPATCH_LIMIT || "50", 10) });
+    if (result.dispatched) recordWrite("agent_mail_dispatch", result.dispatched, "alive");
+  } catch (e) {
+    recordWrite("agent_mail_dispatch", 0, "error: " + String(e.message || e).slice(0, 120));
+  }
+}
+setInterval(agentMailDispatchCycle, parseInt(process.env.MNEMO_AGENT_MAIL_DISPATCH_MS || "60000", 10));
+setTimeout(agentMailDispatchCycle, 15 * 1000);
 
 // ---------- Daily reflection cron ----------
 function maybeRunDailyReflection() {

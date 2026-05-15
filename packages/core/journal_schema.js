@@ -90,8 +90,12 @@ CREATE TABLE IF NOT EXISTS media_asset (
   media_type TEXT,
   title TEXT NOT NULL,
   file_name TEXT,
+  original_file_name TEXT,
+  canonical_name TEXT,
   file_ext TEXT,
   media_path TEXT,
+  storage_path TEXT,
+  content_ref TEXT,
   page_url TEXT,
   route TEXT,
   project TEXT,
@@ -512,6 +516,14 @@ CREATE TABLE IF NOT EXISTS session_handoff (
 );
 CREATE INDEX IF NOT EXISTS idx_handoff_agent_project ON session_handoff(agent_name, project, created_at DESC);
 `);
+  try {
+    const mediaCols = db.prepare("PRAGMA table_info(media_asset)").all().map((c) => c.name);
+    if (!mediaCols.includes("original_file_name")) db.exec("ALTER TABLE media_asset ADD COLUMN original_file_name TEXT");
+    if (!mediaCols.includes("canonical_name")) db.exec("ALTER TABLE media_asset ADD COLUMN canonical_name TEXT");
+    if (!mediaCols.includes("storage_path")) db.exec("ALTER TABLE media_asset ADD COLUMN storage_path TEXT");
+    if (!mediaCols.includes("content_ref")) db.exec("ALTER TABLE media_asset ADD COLUMN content_ref TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_media_canonical ON media_asset(canonical_name)");
+  } catch {}
   ensureTeamQualityTables(db);
 }
 
