@@ -122,8 +122,8 @@ test("missing routes block instead of allowing improvisation", () => {
 test("preflight falls back to global route when requested scope misses", () => {
   const db = setupDb();
   upsertAccessRoute(db, {
-    scope: "blun",
-    system_name: "65er root ssh",
+    scope: "example",
+    system_name: "example root ssh",
     access_kind: "ssh",
     entrypoint: "root@example.org",
     route_kind: "direct",
@@ -134,14 +134,38 @@ test("preflight falls back to global route when requested scope misses", () => {
 
   const resolved = resolveAccessRoute(db, {
     scope: "default",
-    system_name: "65er root ssh",
+    system_name: "example root ssh",
     access_kind: "ssh",
     agent_name: "agent-a",
   });
 
   assert.strictEqual(resolved.ok, true);
   assert.strictEqual(resolved.scope_fallback, true);
-  assert.strictEqual(resolved.route.scope, "blun");
+  assert.strictEqual(resolved.route.scope, "example");
+});
+
+test("listAccessRoutes falls back across scopes and searches entrypoint", () => {
+  const db = setupDb();
+  upsertAccessRoute(db, {
+    scope: "example",
+    system_name: "example root ssh",
+    access_kind: "ssh",
+    entrypoint: "root@example.org",
+    route_kind: "direct",
+    direct_allowed: true,
+    canonical_command: "ssh -i ~/.ssh/example_key root@example.org",
+    updated_by: "agent-a",
+  });
+
+  const listed = listAccessRoutes(db, {
+    scope: "default",
+    system_name: "example.org",
+    access_kind: "ssh",
+  });
+
+  assert.strictEqual(listed.count, 1);
+  assert.strictEqual(listed.scope_fallback, true);
+  assert.strictEqual(listed.access[0].system_name, "example root ssh");
 });
 
 test("listAccessRoutes returns route policy fields", () => {

@@ -325,7 +325,7 @@ mem_auth_contract_check({ project: "Example Project" })
 Hard source of truth for portal UI consistency. Reads `project_rules.design_rules`
 plus `canonical_nav` and checks that linked portals inherit the same header
 structure, button system, font system, logo assets, logo sizing, and light/dark
-behavior from `blun.ai`.
+behavior from the configured canonical brand surface.
 
 Use this before header, menu, button, theme, logo, or general frontend changes.
 If it blocks, agents must not improvise a new visual variant.

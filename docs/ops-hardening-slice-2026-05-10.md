@@ -68,7 +68,7 @@ Each evidence row should contain:
 ## Example Calls
 
 ```json
-mem_status_board({ "projects": ["BLUN Main"] })
+mem_status_board({ "projects": ["Example Main"] })
 ```
 
 ```json
@@ -77,7 +77,7 @@ mem_search_reindex({ "scopes": ["transcript", "brief"], "limit": 5000, "reset": 
 
 ```json
 mem_maintenance_window_upsert({
-  "project": "BLUN Main",
+  "project": "Example Main",
   "title": "Auth rollout window",
   "starts_at": "2026-05-10T20:00:00.000Z",
   "ends_at": "2026-05-10T22:00:00.000Z",
@@ -88,7 +88,7 @@ mem_maintenance_window_upsert({
 
 ```json
 mem_freeze_set({
-  "project": "BLUN Main",
+  "project": "Example Main",
   "reason": "Shared auth migration in progress",
   "approved_by": "dieter"
 })
@@ -97,11 +97,11 @@ mem_freeze_set({
 ```json
 mem_session_handoff({
   "agent_name": "alfred",
-  "project": "BLUN Main",
+  "project": "Example Main",
   "summary": "Verified login shell route",
   "evidence": [
     {
-      "url": "https://blun.ai/login",
+      "url": "https://example.org/login",
       "test_step": "GET /login",
       "result": "200 ok",
       "timestamp": "2026-05-10T20:00:00.000Z"
@@ -114,7 +114,7 @@ mem_session_handoff({
 
 - `node --check packages/core/mcp.js`
 - `node --check packages/core/daemon.js`
-- `mem_status_board({ "projects": ["BLUN Main"] })` -> ok
+- `mem_status_board({ "projects": ["Example Main"] })` -> ok
 - `mem_search_reindex({ "scopes": ["transcript"], "limit": 50, "reset": true })` -> ok
 - `mem_session_handoff(...)` without evidence -> `evidence_required`
 - `mem_session_handoff(...)` with evidence -> ok

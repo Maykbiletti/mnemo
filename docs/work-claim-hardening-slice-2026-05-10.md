@@ -49,7 +49,7 @@ Old file-path claims remain valid. Existing rows are backfilled to:
 
 ```json
 mem_work_claim({
-  "project": "BLUN Account",
+  "project": "Example Account",
   "file_path": "src/routes/auth.js",
   "agent_name": "otto",
   "summary": "auth refactor",
@@ -59,7 +59,7 @@ mem_work_claim({
 
 ```json
 mem_work_claim({
-  "project": "BLUN Account",
+  "project": "Example Account",
   "claim_kind": "route",
   "scope_value": "/account/login",
   "agent_name": "alfred",
@@ -70,7 +70,7 @@ mem_work_claim({
 
 ```json
 mem_work_heartbeat({
-  "project": "BLUN Account",
+  "project": "Example Account",
   "claim_kind": "route",
   "scope_value": "/account/login",
   "agent_name": "alfred",
@@ -80,7 +80,7 @@ mem_work_heartbeat({
 
 ```json
 mem_work_claim({
-  "project": "BLUN Account",
+  "project": "Example Account",
   "claim_kind": "route",
   "scope_value": "/account/login",
   "agent_name": "otto",
@@ -91,7 +91,7 @@ mem_work_claim({
 ```json
 mem_duplicate_work_check({
   "agent_name": "otto",
-  "project": "BLUN Account",
+  "project": "Example Account",
   "task": "repair login flow",
   "files": ["src/routes/auth.js"],
   "claims": [{ "claim_kind": "route", "scope_value": "/account/login" }]

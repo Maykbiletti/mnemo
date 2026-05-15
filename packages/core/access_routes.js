@@ -344,7 +344,10 @@ function buildWhere(input = {}) {
   const params = [];
   if (input.scope) { where.push("LOWER(COALESCE(scope,''))=?"); params.push(scopeName(input.scope)); }
   if (input.project) { where.push("project=?"); params.push(input.project); }
-  if (input.system_name) { where.push("system_name LIKE ?"); params.push(`%${input.system_name}%`); }
+  if (input.system_name) {
+    where.push("(system_name LIKE ? OR entrypoint LIKE ?)");
+    params.push(`%${input.system_name}%`, `%${input.system_name}%`);
+  }
   if (input.access_kind) { where.push("access_kind=?"); params.push(input.access_kind); }
   if (input.entrypoint) { where.push("entrypoint LIKE ?"); params.push(`%${input.entrypoint}%`); }
   if (input.route_kind) { where.push("route_kind=?"); params.push(normalizeRouteKind(input.route_kind)); }
@@ -355,14 +358,28 @@ function buildWhere(input = {}) {
 
 function listAccessRoutes(db, input = {}) {
   ensureAccessRouteSchema(db);
+  let rows = queryAccessRows(db, input);
+  let usedScopeFallback = false;
+  const hasSpecificFilter = !!(input.project || input.system_name || input.access_kind || input.entrypoint || input.route_kind);
+  if (!rows.length && input.scope && hasSpecificFilter) {
+    rows = queryAccessRows(db, Object.assign({}, input, { scope: null }));
+    usedScopeFallback = rows.length > 0;
+  }
+  return {
+    count: rows.length,
+    access: rows.map(routeFromRow),
+    scope_fallback: usedScopeFallback,
+  };
+}
+
+function queryAccessRows(db, input = {}) {
   const { where, params } = buildWhere(input);
   params.push(Math.min(input.limit || 50, 300));
-  const rows = db.prepare(
+  return db.prepare(
     "SELECT * FROM access_inventory" +
     (where.length ? " WHERE " + where.join(" AND ") : "") +
     " ORDER BY COALESCE(last_verified_at, updated_at) DESC LIMIT ?"
   ).all(...params);
-  return { count: rows.length, access: rows.map(routeFromRow) };
 }
 
 function routeScore(route, input = {}) {
