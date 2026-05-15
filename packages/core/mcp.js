@@ -36,6 +36,8 @@ const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgent
 const briefCoordination = require("./brief_coordination");
 const { AGENT_MAIL_TOOL_DEFS, ensureAgentMailTables, handleAgentMailTool } = require("./agent_mail");
 const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
+const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
+const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 
 const readline = require("readline");
 
@@ -177,6 +179,9 @@ db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 ensureAgentMailTables(db);
 ensureAccessRouteSchema(db);
+ensureProtectedScopeSchema(db);
+seedDefaultProtectedScopes(db);
+ensureResourceAccessSchema(db);
 
 function ensureReminderTables() {
   db.exec(`
@@ -6899,6 +6904,8 @@ ${args.first_invocation_outcome || "(none)"}
     handler: (a = {}) => {
       ensureUniversalJournalSchema();
       const scope = scopeName(a.scope);
+      const overrideGate = validateProtectedScopeOverride(db, Object.assign({}, a, { scope }));
+      if (!overrideGate.ok) return overrideGate;
       if (a.id) {
         const current = db.prepare("SELECT id, meta_json FROM override_log WHERE id=?").get(a.id);
         if (!current) return { error: "override_not_found", id: a.id };
@@ -7610,6 +7617,7 @@ ${args.first_invocation_outcome || "(none)"}
         routes: { type: "array", items: { type: "string" } },
         domains: { type: "array", items: { type: "string" } },
         system_names: { type: "array", items: { type: "string" } },
+        resources: { type: "array", items: { type: "object" } },
         environment: { type: "string" },
         action_type: { type: "string" },
         topics: { type: "array", items: { type: "string" } },
@@ -7703,6 +7711,52 @@ ${args.first_invocation_outcome || "(none)"}
         environment: a.environment || null
       });
       checks.push({ name: "impact_map", result: "ok", summary: impact.summary || {} });
+      const protectedScopes = protectedScopeCheck(db, {
+        agent_name: a.agent_name,
+        project,
+        task: a.task,
+        summary: a.summary || a.task,
+        action_type: a.action_type || null,
+        topics: a.topics || [],
+        files,
+        urls: a.urls || [],
+        routes: a.routes || [],
+        domains: a.domains || [],
+        system_names: a.system_names || [],
+        environment: a.environment || null,
+        scope: a.scope || null
+      });
+      checks.push({
+        name: "protected_scope",
+        result: protectedScopes.status,
+        matched_count: protectedScopes.matched_count,
+        blockers: protectedScopes.blockers || [],
+        warnings: protectedScopes.warnings || [],
+        instructions: protectedScopes.instructions || []
+      });
+      blockers.push(...(protectedScopes.blockers || []));
+      const resourceAccess = resourceAccessCheck(db, {
+        agent_name: a.agent_name,
+        project,
+        task: a.task,
+        summary: a.summary || a.task,
+        action_type: a.action_type || null,
+        files,
+        urls: a.urls || [],
+        routes: a.routes || [],
+        domains: a.domains || [],
+        system_names: a.system_names || [],
+        resources: a.resources || [],
+        scope: a.scope || null
+      });
+      checks.push({
+        name: "resource_access",
+        result: resourceAccess.status,
+        resources_checked: resourceAccess.resources_checked,
+        blockers: resourceAccess.blockers || [],
+        warnings: resourceAccess.warnings || []
+      });
+      blockers.push(...(resourceAccess.blockers || []));
       const similar = [];
       const claims = [];
       for (const file of files) {
@@ -7747,6 +7801,8 @@ ${args.first_invocation_outcome || "(none)"}
         deploys: { type: "array" },
         blockers: { type: "array" },
         next_actions: { type: "array" },
+        completion_method: { type: "string" },
+        rollback_plan: { type: "string" },
         release_claims: { type: "boolean" },
         completed_brief_ids: { type: "array", items: { type: "integer" } },
         completed_task_ids: { type: "array", items: { type: "integer" } },
@@ -7791,6 +7847,14 @@ ${args.first_invocation_outcome || "(none)"}
       if (badEvidence) {
         return { error: "invalid_evidence", hint: "Each evidence row needs one target field plus test_step and result.", sample: badEvidence };
       }
+      const completionMethod = String(a.completion_method || handoffMeta.completion_method || handoffMeta.how_completed || "").trim();
+      const rollbackPlan = String(a.rollback_plan || handoffMeta.rollback_plan || handoffMeta.repair_plan || "").trim();
+      if (evidenceRequired && (!completionMethod || !rollbackPlan)) {
+        return {
+          error: "completion_protocol_required",
+          hint: "Pass completion_method plus rollback_plan so later agents know exactly what changed and how to repair or revert it."
+        };
+      }
       const passport = await tools.mem_agent_pass_get.handler({ agent_name: a.agent_name });
       const released = [];
       if (a.release_claims !== false) {
@@ -7802,11 +7866,13 @@ ${args.first_invocation_outcome || "(none)"}
       const storedMeta = Object.assign({}, handoffMeta, {
         identity_context: passport && passport.passport || null,
         evidence,
-        evidence_count: evidence.length
+        evidence_count: evidence.length,
+        completion_method: completionMethod || null,
+        rollback_plan: rollbackPlan || null
       });
       const info = db.prepare("INSERT INTO session_handoff (agent_name, project, summary, changed_files, tests, deploys, blockers, next_actions, claims_released, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?)")
         .run(a.agent_name, a.project || null, a.summary, JSON.stringify(changed), JSON.stringify(a.tests || []), JSON.stringify(a.deploys || []), JSON.stringify(a.blockers || []), JSON.stringify(a.next_actions || []), JSON.stringify(released), JSON.stringify(storedMeta));
-      const transcript = await tools.mem_transcript_log.handler({ source: "memory-frontdoor", channel: "handoff", direction: "outbound", speaker: a.agent_name, content: a.summary, ref_kind: "session_handoff", ref_id: String(info.lastInsertRowid), meta: { project: a.project || null, changed_files: changed, tests: a.tests || [], deploys: a.deploys || [], blockers: a.blockers || [], next_actions: a.next_actions || [], evidence_count: evidence.length } });
+      const transcript = await tools.mem_transcript_log.handler({ source: "memory-frontdoor", channel: "handoff", direction: "outbound", speaker: a.agent_name, content: a.summary, ref_kind: "session_handoff", ref_id: String(info.lastInsertRowid), meta: { project: a.project || null, changed_files: changed, tests: a.tests || [], deploys: a.deploys || [], blockers: a.blockers || [], next_actions: a.next_actions || [], evidence_count: evidence.length, completion_method: completionMethod || null, rollback_plan: rollbackPlan || null } });
       const completedBriefIds = uniqueIntegers([]
         .concat(Array.isArray(a.completed_brief_ids) ? a.completed_brief_ids : [])
         .concat(Array.isArray(handoffMeta.completed_brief_ids) ? handoffMeta.completed_brief_ids : [])
@@ -7854,6 +7920,86 @@ ${args.first_invocation_outcome || "(none)"}
       }
     },
     handler: (a) => workReportFeedData(db, a || {})
+  },
+  mem_protected_scope_seed: {
+    description: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_seed.description,
+    inputSchema: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_seed.inputSchema,
+    handler: (a = {}) => handleProtectedScopeTool(db, "mem_protected_scope_seed", a || {}).result,
+  },
+  mem_protected_scope_list: {
+    description: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_list.description,
+    inputSchema: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_list.inputSchema,
+    handler: (a = {}) => handleProtectedScopeTool(db, "mem_protected_scope_list", a || {}).result,
+  },
+  mem_protected_scope_check: {
+    description: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_check.description,
+    inputSchema: PROTECTED_SCOPE_TOOL_DEFS.mem_protected_scope_check.inputSchema,
+    handler: (a = {}) => handleProtectedScopeTool(db, "mem_protected_scope_check", a || {}).result,
+  },
+  mem_resource_upsert: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_upsert.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_upsert.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_upsert", a || {}).result,
+  },
+  mem_resource_list: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_list.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_list.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_list", a || {}).result,
+  },
+  mem_resource_acl_grant: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_acl_grant.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_acl_grant.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_acl_grant", a || {}).result,
+  },
+  mem_resource_acl_list: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_acl_list.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_acl_list.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_acl_list", a || {}).result,
+  },
+  mem_resource_access_check: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_access_check.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_access_check.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_access_check", a || {}).result,
+  },
+  mem_approval_request: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_request.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_request.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_approval_request", a || {}).result,
+  },
+  mem_approval_decide: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_decide.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_decide.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_approval_decide", a || {}).result,
+  },
+  mem_approval_list: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_list.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_approval_list.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_approval_list", a || {}).result,
+  },
+  mem_claim_request_access: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_request_access.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_request_access.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_claim_request_access", a || {}).result,
+  },
+  mem_claim_grant_access: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_grant_access.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_grant_access.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_claim_grant_access", a || {}).result,
+  },
+  mem_claim_deny_access: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_deny_access.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_deny_access.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_claim_deny_access", a || {}).result,
+  },
+  mem_claim_transfer: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_transfer.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_claim_transfer.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_claim_transfer", a || {}).result,
+  },
+  mem_resource_audit_list: {
+    description: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_audit_list.description,
+    inputSchema: RESOURCE_ACCESS_TOOL_DEFS.mem_resource_audit_list.inputSchema,
+    handler: (a = {}) => handleResourceAccessTool(db, "mem_resource_audit_list", a || {}).result,
   },
   mem_work_claim: {
     description: "Claim a work scope with TTL and heartbeat. Supports file, route, domain, server, task, service, or generic scope claims. Stale claims can be recovered with allow_takeover=true.",

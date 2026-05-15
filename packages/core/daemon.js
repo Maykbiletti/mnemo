@@ -61,6 +61,8 @@ const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgent
 const briefCoordination = require("./brief_coordination");
 const { ensureAgentMailTables, handleAgentMailTool, dispatchInboundBriefs } = require("./agent_mail");
 const { ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
+const { ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
+const { ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
 const FACTS_DIR = process.env.MNEMO_FACTS_DIR || path.join(__dirname, "facts");
@@ -170,6 +172,9 @@ const { ensureUniversalJournalSchema, ensureProjectRegistryTable, ensureFirmOpsT
 bootstrapBaseSchema(db, "host");
 ensureAgentMailTables(db);
 ensureAccessRouteSchema(db);
+ensureProtectedScopeSchema(db);
+seedDefaultProtectedScopes(db);
+ensureResourceAccessSchema(db);
 // Mnemo Connect schema bootstrap (idempotent)
 db.exec(`
 CREATE TABLE IF NOT EXISTS agent_brief (
@@ -391,6 +396,9 @@ function tenantDb(id) {
     bootstrapBaseSchema(tdb, "tenant:" + safe);
     ensureConnectSchema(tdb);
     ensureUniversalJournalSchema(tdb);
+    ensureProtectedScopeSchema(tdb);
+    seedDefaultProtectedScopes(tdb);
+    ensureResourceAccessSchema(tdb);
   } catch (e) { console.error("[tenant-bootstrap]", safe, e.message); }
   tenantPool.set(safe, tdb);
   return tdb;
@@ -1761,6 +1769,9 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_media_capture","mem_media_recent","mem_media_search","mem_media_get","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_route_resolve","mem_access_preflight","mem_access_event_log",
   "mem_connector_upsert","mem_connector_list","mem_agent_pass_set","mem_agent_pass_get","mem_agent_pass_list","mem_drift_check_report","mem_drift_status",
   "mem_duplicate_work_check","mem_impact_map","mem_write_gate_check",
+  "mem_protected_scope_seed","mem_protected_scope_list","mem_protected_scope_check",
+  "mem_resource_upsert","mem_resource_list","mem_resource_acl_grant","mem_resource_acl_list","mem_resource_access_check",
+  "mem_approval_request","mem_approval_decide","mem_approval_list","mem_claim_request_access","mem_claim_grant_access","mem_claim_deny_access","mem_claim_transfer","mem_resource_audit_list",
   "mem_maintenance_window_upsert","mem_maintenance_window_list","mem_maintenance_window_check",
   "mem_override_log","mem_override_list","mem_override_check",
   "mem_artifact_lock_set","mem_artifact_lock_list","mem_artifact_lock_check",
@@ -4338,6 +4349,10 @@ function handleTool(tdb, name, a) {
     const report = handleTimelineReportTool(tdb, name, a || {});
     if (report.handled) return report.result;
   }
+  const protectedScopeTool = handleProtectedScopeTool(tdb, name, a || {});
+  if (protectedScopeTool.handled) return protectedScopeTool.result;
+  const resourceAccessTool = handleResourceAccessTool(tdb, name, a || {});
+  if (resourceAccessTool.handled) return resourceAccessTool.result;
   const teamQuality = handleTeamQualityTool(tdb, name, a || {});
   if (teamQuality.handled) return teamQuality.result;
   const agentMail = handleAgentMailTool(tdb, name, a || {});
@@ -6072,6 +6087,8 @@ function handleTool(tdb, name, a) {
       if (!a.gate_kind || !a.reason) return { error: "gate_kind + reason required" };
       ensureUniversalJournalSchema(tdb);
       const scope = scopeName(a.scope);
+      const overrideGate = validateProtectedScopeOverride(tdb, Object.assign({}, a, { scope }));
+      if (!overrideGate.ok) return overrideGate;
       if (a.id) {
         const current = tdb.prepare("SELECT id, meta_json FROM override_log WHERE id=?").get(a.id);
         if (!current) return { error: "override_not_found", id: a.id };
@@ -6559,6 +6576,52 @@ function handleTool(tdb, name, a) {
         environment: a.environment || null
       });
       checks.push({ name: "impact_map", result: "ok", summary: impact.summary || {} });
+      const protectedScopes = protectedScopeCheck(tdb, {
+        agent_name: a.agent_name,
+        project,
+        task: a.task,
+        summary: a.summary || a.task,
+        action_type: a.action_type || null,
+        topics: a.topics || [],
+        files,
+        urls: a.urls || [],
+        routes: a.routes || [],
+        domains: a.domains || [],
+        system_names: a.system_names || [],
+        environment: a.environment || null,
+        scope: a.scope || null
+      });
+      checks.push({
+        name: "protected_scope",
+        result: protectedScopes.status,
+        matched_count: protectedScopes.matched_count,
+        blockers: protectedScopes.blockers || [],
+        warnings: protectedScopes.warnings || [],
+        instructions: protectedScopes.instructions || []
+      });
+      blockers.push(...(protectedScopes.blockers || []));
+      const resourceAccess = resourceAccessCheck(tdb, {
+        agent_name: a.agent_name,
+        project,
+        task: a.task,
+        summary: a.summary || a.task,
+        action_type: a.action_type || null,
+        files,
+        urls: a.urls || [],
+        routes: a.routes || [],
+        domains: a.domains || [],
+        system_names: a.system_names || [],
+        resources: a.resources || [],
+        scope: a.scope || null
+      });
+      checks.push({
+        name: "resource_access",
+        result: resourceAccess.status,
+        resources_checked: resourceAccess.resources_checked,
+        blockers: resourceAccess.blockers || [],
+        warnings: resourceAccess.warnings || []
+      });
+      blockers.push(...(resourceAccess.blockers || []));
       const similar = [];
       const claims = [];
       for (const file of files) {
@@ -6597,6 +6660,14 @@ function handleTool(tdb, name, a) {
         return !target || !row.test_step || !row.result;
       });
       if (badEvidence) return { error: "invalid_evidence", hint: "Each evidence row needs one target field plus test_step and result.", sample: badEvidence };
+      const completionMethod = String(a.completion_method || handoffMeta.completion_method || handoffMeta.how_completed || "").trim();
+      const rollbackPlan = String(a.rollback_plan || handoffMeta.rollback_plan || handoffMeta.repair_plan || "").trim();
+      if (evidenceRequired && (!completionMethod || !rollbackPlan)) {
+        return {
+          error: "completion_protocol_required",
+          hint: "Pass completion_method plus rollback_plan so later agents know exactly what changed and how to repair or revert it."
+        };
+      }
       const passport = handleTool(tdb, "mem_agent_pass_get", { agent_name: a.agent_name });
       const released = [];
       if (a.release_claims !== false) {
@@ -6608,11 +6679,13 @@ function handleTool(tdb, name, a) {
       const storedMeta = Object.assign({}, handoffMeta, {
         identity_context: passport && passport.passport || null,
         evidence,
-        evidence_count: evidence.length
+        evidence_count: evidence.length,
+        completion_method: completionMethod || null,
+        rollback_plan: rollbackPlan || null
       });
       const info = tdb.prepare("INSERT INTO session_handoff (agent_name, project, summary, changed_files, tests, deploys, blockers, next_actions, claims_released, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?)")
         .run(a.agent_name, a.project || null, a.summary, JSON.stringify(changed), JSON.stringify(a.tests || []), JSON.stringify(a.deploys || []), JSON.stringify(a.blockers || []), JSON.stringify(a.next_actions || []), JSON.stringify(released), JSON.stringify(storedMeta));
-      const transcript = handleTool(tdb, "mem_transcript_log", { source: "memory-frontdoor", channel: "handoff", direction: "outbound", speaker: a.agent_name, content: a.summary, ref_kind: "session_handoff", ref_id: String(info.lastInsertRowid), meta: { project: a.project || null, changed_files: changed, tests: a.tests || [], deploys: a.deploys || [], blockers: a.blockers || [], next_actions: a.next_actions || [], evidence_count: evidence.length } });
+      const transcript = handleTool(tdb, "mem_transcript_log", { source: "memory-frontdoor", channel: "handoff", direction: "outbound", speaker: a.agent_name, content: a.summary, ref_kind: "session_handoff", ref_id: String(info.lastInsertRowid), meta: { project: a.project || null, changed_files: changed, tests: a.tests || [], deploys: a.deploys || [], blockers: a.blockers || [], next_actions: a.next_actions || [], evidence_count: evidence.length, completion_method: completionMethod || null, rollback_plan: rollbackPlan || null } });
       const completedBriefIds = uniqueIntegers([]
         .concat(Array.isArray(a.completed_brief_ids) ? a.completed_brief_ids : [])
         .concat(Array.isArray(handoffMeta.completed_brief_ids) ? handoffMeta.completed_brief_ids : [])

@@ -74,6 +74,16 @@ can prove what changed, who did it, or which project gates are still open.
   `mem_access_route_resolve` make agents resolve SSH/API/admin/database routes
   before access. Jump/proxy routes can set `direct_allowed=false`, returning the
   required canonical command instead of letting agents try direct access first.
+- **Agent Company Organization.** `mem_resource_upsert`,
+  `mem_resource_acl_grant`, `mem_approval_request`, and
+  `mem_claim_request_access` add owned resources, ACLs, approval queues,
+  claim-access grants/transfers, and audit logs. `mem_agent_preflight` now blocks
+  write/deploy work on managed resources unless the agent is owner, has ACL, or
+  has approval.
+- **Protected Scope Gates.** `mem_protected_scope_check` protects auth, billing,
+  production infra, final artifacts, shared portal design, translations, chat
+  runtime, and Mnemo coordination surfaces. Owner approval and active claims are
+  enforced before write/deploy actions.
 - **Memory Frontdoor.** Hub deployments can expose `POST /mnemo/memory-tool`
   for file-like memory reads such as `/memories/top.md`, `/memories/today.md`,
   and project registry views, while keeping private facts outside the public
@@ -146,6 +156,32 @@ curl -s https://your-mnemo.example/mnemo/memory-tool \
 ```
 
 See [`docs/hub-operations.md`](docs/hub-operations.md).
+
+## Agent Company Controls
+
+Mnemo's hard organization layer models work like a company:
+
+- `org_resource`: canonical files, routes, domains, systems, services, and
+  project surfaces with owners and departments.
+- `resource_acl`: explicit read/write/execute/deploy/approve/own grants.
+- `approval_request`: owner-routed approval inbox.
+- `resource_audit_log`: durable record of access changes, decisions, claim
+  grants, and transfers.
+- `protected_scope_rule`: high-risk or shared surfaces that require owner/claim
+  gates before edits.
+
+Useful calls:
+
+```text
+mem_resource_upsert({project:"account", resource_kind:"file", resource_key:"packages/account/auth.js", owner_agent:"alfred"})
+mem_resource_acl_grant({project:"account", resource_kind:"file", resource_key:"packages/account/auth.js", agent_name:"otto", permission:"write", granted_by:"alfred", reason:"handoff"})
+mem_approval_request({project:"account", resource_kind:"route", resource_key:"/auth/google/callback", requester_agent:"otto", permission:"write", reason:"chat login crossover"})
+mem_claim_request_access({claim_id:17, requester_agent:"alfred", reason:"auth crossover repair"})
+mem_resource_audit_list({project:"account"})
+```
+
+See [`docs/agent-company-organization.md`](docs/agent-company-organization.md)
+and [`docs/protected-scope-gates.md`](docs/protected-scope-gates.md).
 
 ## Start An Agent Loop
 

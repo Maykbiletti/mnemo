@@ -76,6 +76,45 @@ schema/migration, docs, tests/smokes, project truth, connector/access records,
 locks/claims, and handoff. If one of those cannot be updated, mark the task
 blocked with evidence instead of reporting done.
 
+## Agent Company Permissions
+
+Agents are company workers with assigned resources, not free-floating editors.
+Before touching another lane's surface, the agent must have one of:
+
+- ownership of the resource
+- an active `resource_acl` grant
+- an approved `approval_request`
+- an explicit claim-access grant from the current claim owner
+- a transferred claim
+
+Resources are canonical company objects: files, routes, domains, systems,
+services, projects, protected scopes, and external connectors. Register them
+with `mem_resource_upsert` and keep the owner current.
+
+The runtime preflight checks resource ACLs automatically. For write/deploy-like
+work on managed resources, Mnemo blocks when the agent is not the owner and has
+no active grant or approval. If another agent holds an active work claim, Mnemo
+blocks until that claim owner grants access with `mem_claim_grant_access` or
+transfers the claim with `mem_claim_transfer`.
+
+Protected scopes are stricter. Auth/login, billing, production infra, final
+artifacts, shared portal design, translations, chat runtime, and Mnemo
+coordination have `protected_scope_rule` entries. A non-owner cannot approve an
+exception for those scopes. Use `mem_protected_scope_list` to see owners and
+`mem_protected_scope_check` before risky work.
+
+Correct conflict flow:
+
+1. Stop editing when preflight blocks.
+2. Request access with `mem_approval_request` or `mem_claim_request_access`.
+3. Wait for the assigned owner to approve, deny, or transfer.
+4. Resume only after the gate returns `ok`.
+5. Finish with `mem_session_handoff` including evidence, `completion_method`,
+   and `rollback_plan`.
+
+Every grant, denial, transfer, approval, and resource owner change must be in
+Mnemo. Use `mem_resource_audit_list` to reconstruct what happened.
+
 ## Autonomous Backlog Routing
 
 Agents do not wait for the owner to notice open work. When an inbox is empty,
@@ -602,6 +641,12 @@ The public repository must stay reusable by other teams.
 | `mem_project_registry_upsert/get/list` | domains, repos, servers, deploy state, live gates |
 | `mem_quality_finding_report/list/resolve` | durable defect register |
 | `mem_work_claim` / `mem_work_active` | file/module ownership |
+| `mem_resource_upsert/list` | canonical company resources and owners |
+| `mem_resource_acl_grant/list` | explicit resource permissions |
+| `mem_approval_request/decide/list` | owner-routed approval queue |
+| `mem_claim_request_access/grant_access/deny_access/transfer` | active-claim access and handoff |
+| `mem_protected_scope_list/check` | high-risk shared-surface gates |
+| `mem_resource_audit_list` | durable permission and claim-access audit trail |
 | `mem_file_echo` / `mem_file_owner_set/get` | pre-read context and edit history |
 | `mem_company_fact_get/set` / `mem_pre_action_check` | private canonical facts |
 | `mem_firm_readiness_board` | readiness overview across projects |
