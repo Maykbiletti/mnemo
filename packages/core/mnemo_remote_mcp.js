@@ -24,6 +24,7 @@ const PORT = parseInt(process.env.MNEMO_REMOTE_MCP_PORT || "7120", 10);
 const MNEMO_URL = (process.env.MNEMO_URL || "http://127.0.0.1:7117").replace(/\/$/, "");
 const TOKEN = process.env.MNEMO_REMOTE_TOKEN || "";
 const { readBody } = require("./http_utils");
+const { ACCESS_ROUTE_TOOL_DEFS } = require("./access_routes");
 
 const TOOLS = [
   { name: "mem_recall", description: "Search Mnemo memory by text query.", schema: { type: "object", properties: { q: { type: "string" }, limit: { type: "integer", default: 20 } }, required: ["q"] } },
@@ -33,6 +34,11 @@ const TOOLS = [
   { name: "mem_media_search", description: "Search captured Mnemo media assets.", schema: { type: "object", properties: { query: { type: "string" }, project: { type: "string" }, media_kind: { type: "string" }, limit: { type: "integer" } }, required: ["query"] } },
   { name: "mem_health", description: "Get Mnemo daemon health.", schema: { type: "object", properties: {} } },
   { name: "mem_agent_memory_health", description: "Get per-agent memory hook health for Mission Control.", schema: { type: "object", properties: { agent_name: { type: "string" }, stale_minutes: { type: "integer" }, window_minutes: { type: "integer" } } } },
+  ...Object.entries(ACCESS_ROUTE_TOOL_DEFS).map(([name, def]) => ({
+    name,
+    description: def.description,
+    schema: def.inputSchema,
+  })),
 ];
 
 
@@ -104,6 +110,8 @@ const server = http.createServer(async (req, res) => {
         r = await callMnemo("GET", "/health", null);
       } else if (name === "mem_agent_memory_health") {
         r = await callMnemo("POST", "/tool/mem_agent_memory_health", args);
+      } else if (ACCESS_ROUTE_TOOL_DEFS[name]) {
+        r = await callMnemo("POST", "/tool/" + name, args);
       } else {
         return respond(res, 404, { error: "unknown_tool", name });
       }
