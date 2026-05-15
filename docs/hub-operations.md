@@ -115,6 +115,21 @@ Hook output should stay compact. Large hook payloads are written to a rotating,
 ASCII-safe JSONL queue and the injected context stays focused on critical
 items, brief previews, and the selected memory frontdoor paths.
 
+Dispatched briefs are not allowed to hang forever. The daemon requeues briefs
+that are still `dispatched` after 30 minutes when the target agent is offline,
+unregistered, or has not heartbeated recently. `mem_brief_pull` and
+`mem_connect_list` run the same sweep opportunistically; use
+`mem_brief_requeue_stale({dry_run:true})` to inspect candidates.
+
+Channel lists include subscriber heartbeat state. Operators should look at
+`active_subscribers`, `offline_subscribers`, and `subscribers_detail` before
+assuming a channel post will be seen.
+
+Autonomy task updates accept either `autonomy_task.id` or a linked
+`agent_brief.id`. Mnemo resolves direct task IDs, brief meta/content task
+references, `source_id`, and reverse `brief_id` links before returning
+`task not found`.
+
 ## Smoke Checks
 
 After a hub deploy or proxy change, run:
@@ -133,6 +148,14 @@ curl -s https://your-mnemo.example/mnemo/tool/mem_project_registry_list \
   -d '{"limit":5}'
 
 curl -s https://your-mnemo.example/mnemo/health
+
+curl -s https://your-mnemo.example/mnemo/tool/mem_brief_requeue_stale \
+  -H 'content-type: application/json' \
+  -d '{"older_than_minutes":30,"dry_run":true}'
+
+curl -s https://your-mnemo.example/mnemo/tool/mem_connect_channel_list \
+  -H 'content-type: application/json' \
+  -d '{"include_subscribers":true}'
 ```
 
 A good result is not only HTTP 200. Confirm that the response contains current

@@ -96,6 +96,9 @@ For off-machine backups: pipe through SSH to a remote storage box.
 | `MNEMO_CODE_MAX_UNFOLD_LINES` | `500` | max lines returned by code unfold |
 | `MNEMO_REQUIRE_SMART_CODE_READ` | `1` | block direct full reads of large source files in the runtime hook |
 | `MNEMO_SMART_CODE_READ_MIN_BYTES` | `20000` | source-file size where direct full reads must switch to outline/unfold |
+| `MNEMO_BRIEF_AUTO_REQUEUE` | `1` | daemon auto-requeues stale dispatched briefs for offline agents |
+| `MNEMO_BRIEF_REQUEUE_MIN` | `30` | minutes before a dispatched brief can be auto-requeued |
+| `MNEMO_AGENT_OFFLINE_SEC` | `300` | heartbeat age before an agent is treated as offline |
 | `EXTERNAL_AGENT_BIN` | `assistant` | binary used by `AGENT_ENGINE=print-cli` |
 | `EXTERNAL_AGENT_MAX_TURNS` | `40` | max turns passed to a print-mode external CLI |
 | `TELEGRAM_BOT_TOKEN` | _(none)_ | enables Telegram poller + send |

@@ -65,6 +65,11 @@ can prove what changed, who did it, or which project gates are still open.
   concrete blocker reason and batch position, autonomy task updates can resolve
   linked brief IDs, recall has a fuzzy fallback when exact search misses, and
   hook queue output is rotated into ASCII-safe JSONL.
+- **Brief Coordination Hardening.** Dispatched briefs assigned to offline or
+  non-heartbeating agents are auto-requeued after a configurable timeout,
+  channel lists expose active/offline subscriber heartbeat state, and autonomy
+  task updates can resolve linked brief IDs through meta, content, source, and
+  reverse-link records.
 - **Memory Frontdoor.** Hub deployments can expose `POST /mnemo/memory-tool`
   for file-like memory reads such as `/memories/top.md`, `/memories/today.md`,
   and project registry views, while keeping private facts outside the public

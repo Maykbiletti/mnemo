@@ -34,15 +34,40 @@ mem_recall({ query: "auth bug", mode: "fts", kind: "scar" })
 
 ### `mem_autonomy_task_update(id, status, [...])`
 
-Update an autonomy task. The `id` can be the autonomy task ID or a linked brief
-ID when Mnemo can resolve the relationship. If the new status is `blocked`, the
-update must include a concrete blocker reason in `notes`,
+Update an autonomy task. The `id` can be the autonomy task ID or a linked
+`agent_brief.id` when Mnemo can resolve the relationship. Resolution checks
+brief meta, brief content, autonomy task `source_id`, task meta brief links,
+checklist links, and memory meta/text references. If the new status is
+`blocked`, the update must include a concrete blocker reason in `notes`,
 `blocked_reason`, or `meta.blocked_reason`.
 
 ```ts
 mem_autonomy_task_update({ id: 188, status: "blocked", notes: "blocked: missing API key reference" })
 mem_autonomy_task_update({ id: 188, status: "done", evidence: [{ test_step: "smoke", result: "pass" }] })
 ```
+
+### `mem_brief_requeue_stale([older_than_minutes, agent_stale_sec, dry_run])`
+
+Requeue dispatched briefs that were pulled but never completed because the
+target agent is offline, unregistered, or has not heartbeated recently. The
+default threshold is 30 minutes for dispatched briefs and 5 minutes for agent
+heartbeat staleness.
+
+```ts
+mem_brief_requeue_stale({ older_than_minutes: 30, dry_run: true })
+mem_brief_requeue_stale({ older_than_minutes: 30 })
+```
+
+`mem_brief_pull` and `mem_connect_list` also run this sweep unless
+`auto_requeue:false` is passed.
+
+### `mem_connect_channel_list([include_subscribers, active_window_sec])`
+
+List channels with subscriber counts plus live subscriber details. Each
+subscriber row includes status, `last_seen_at`, `last_seen_age_sec`, active
+boolean, pending/dispatched brief counts, and skills. This removes blind
+channel fanout where a channel looks populated but no subscribed agent is
+actually alive.
 
 ### `mem_project_registry_list([project, limit])`
 

@@ -58,6 +58,7 @@ const QUIET_START = parseInt(process.env.MNEMO_QUIET_START || "23", 10);
 const QUIET_END = parseInt(process.env.MNEMO_QUIET_END || "7", 10);
 const { collectBody } = require("./http_utils");
 const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow } = require("./shared_utils");
+const briefCoordination = require("./brief_coordination");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
 const FACTS_DIR = process.env.MNEMO_FACTS_DIR || path.join(__dirname, "facts");
@@ -4318,10 +4319,12 @@ function handleTool(tdb, name, a) {
       return { agent_name: agentName, updated: r.changes > 0 };
     }
     case "mem_connect_list": {
-      tdb.prepare(
-        "UPDATE agent_registry SET status='offline' " +
-        "WHERE status<>'offline' AND (julianday('now') - julianday(last_seen_at)) * 86400 > 300"
-      ).run();
+      const marked_offline = briefCoordination.markStaleAgentsOffline(tdb, a.agent_stale_sec || 300);
+      const auto_requeue = a.auto_requeue === false ? null : briefCoordination.requeueStaleDispatchedBriefs(tdb, {
+        older_than_minutes: a.requeue_after_minutes || process.env.MNEMO_BRIEF_REQUEUE_MIN || 30,
+        agent_stale_sec: a.agent_stale_sec || 300,
+        limit: a.requeue_limit || 100
+      });
       const where = a.only_online ? "WHERE status='online'" : "";
       const rows = tdb.prepare(
         "SELECT agent_name, display_name, host, pid, status, registered_at, last_seen_at, skills_json, meta_json " +
@@ -4329,6 +4332,8 @@ function handleTool(tdb, name, a) {
       ).all();
       return {
         count: rows.length,
+        marked_offline,
+        auto_requeue,
         agents: rows.map(r => Object.assign({}, r, {
           skills: r.skills_json ? JSON.parse(r.skills_json) : [],
           meta: r.meta_json ? JSON.parse(r.meta_json) : null,
@@ -4380,15 +4385,14 @@ function handleTool(tdb, name, a) {
         try { fireBriefHook(tdb, info.lastInsertRowid, "channel_post", { agent_name: s.agent_name, channel: a.channel, source: a.source_agent || null }); } catch (e) {}
         try { ftsIndex(tdb, "brief", info.lastInsertRowid, s.agent_name, a.source_agent || "", normalized.content); } catch (e) {}
       }
-      return { channel: a.channel, fanout: subs.length, brief_ids: ids };
+      const channelState = (briefCoordination.channelListWithSubscribers(tdb, { active_window_sec: a.active_window_sec || 300 }).channels || []).find((row) => row.name === a.channel) || null;
+      return { channel: a.channel, fanout: subs.length, brief_ids: ids, channel_state: channelState };
     }
     case "mem_connect_channel_list": {
-      const rows = tdb.prepare(
-        "SELECT c.name, c.description, c.created_at, " +
-        "(SELECT COUNT(*) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
-        "FROM channel c ORDER BY c.created_at ASC"
-      ).all();
-      return { count: rows.length, channels: rows };
+      return briefCoordination.channelListWithSubscribers(tdb, a || {});
+    }
+    case "mem_brief_requeue_stale": {
+      return briefCoordination.requeueStaleDispatchedBriefs(tdb, a || {});
     }
     case "mem_brief_drop": {
       const normalized = normalizeBriefContent(a.content, a.meta, { source_channel: a.channel || null });
@@ -4465,6 +4469,11 @@ function handleTool(tdb, name, a) {
     }
     case "mem_brief_pull": {
       const targetAgent = normalizeAgentName(a.agent_name);
+      const auto_requeue = a.auto_requeue === false ? null : briefCoordination.requeueStaleDispatchedBriefs(tdb, {
+        older_than_minutes: a.requeue_after_minutes || process.env.MNEMO_BRIEF_REQUEUE_MIN || 30,
+        agent_stale_sec: a.agent_stale_sec || 300,
+        limit: a.requeue_limit || 100
+      });
       const rows = tdb.prepare(
         "SELECT id, agent_name, source_agent, content, channel, created_at, meta_json FROM agent_brief " +
         "WHERE lower(agent_name)=lower(?) AND status='pending' ORDER BY CASE WHEN lower(COALESCE(meta_json,'')) LIKE '%mission-control-agent-console%' OR lower(COALESCE(meta_json,'')) LIKE '%mission_agent_console%' THEN 0 ELSE 1 END, created_at ASC LIMIT ?"
@@ -4474,7 +4483,7 @@ function handleTool(tdb, name, a) {
         const now = new Date().toISOString();
         for (const r of rows) upd.run(now, r.id);
       }
-      return { count: rows.length, briefs: rows };
+      return { count: rows.length, briefs: rows, auto_requeue };
     }
     case "mem_brief_done": {
       const brief = tdb.prepare("SELECT id, agent_name, channel, meta_json FROM agent_brief WHERE id=?").get(a.id) || null;
@@ -6158,13 +6167,13 @@ function handleTool(tdb, name, a) {
     case "mem_autonomy_task_update": {
       if (!a.id) return { error: "id required" };
       ensureAutonomyTables(tdb);
-      const resolved = resolveAutonomyTaskUpdateId(tdb, a.id);
+      const resolved = briefCoordination.resolveAutonomyTaskUpdateId(tdb, a.id);
       if (resolved.error) {
         return {
           error: resolved.error,
           id: a.id,
           candidates: resolved.candidates || [],
-          hint: "Use autonomy_task.id. If you copied an agent_brief id, this tool now tries to resolve agent_brief.meta.autonomy_task_id / blocked_autonomy_task_id; if no candidate appears, pull/list the brief with include_content=true."
+          hint: "Use autonomy_task.id or the linked agent_brief.id. This tool resolves direct task IDs, brief meta/content task references, source_id links, and meta brief_id links."
         };
       }
       const taskId = resolved.id;
@@ -7626,6 +7635,26 @@ async function autoReflectCycle() {
   } catch (e) { console.error("[auto-reflect]", e.message); }
 }
 setInterval(() => { autoReflectCycle().catch(() => {}); }, 10 * 60 * 1000);
+
+function briefAutoRequeueCycle() {
+  if (process.env.MNEMO_BRIEF_AUTO_REQUEUE === "0") return;
+  try {
+    const result = briefCoordination.requeueStaleDispatchedBriefs(db, {
+      older_than_minutes: process.env.MNEMO_BRIEF_REQUEUE_MIN || 30,
+      agent_stale_sec: process.env.MNEMO_AGENT_OFFLINE_SEC || 300,
+      limit: process.env.MNEMO_BRIEF_REQUEUE_LIMIT || 100
+    });
+    if (result && result.requeued) {
+      try { recordWrite("brief_auto_requeue", result.requeued, "alive"); } catch {}
+      console.log("[brief-auto-requeue] requeued " + result.requeued + " stale dispatched brief(s)");
+    }
+  } catch (e) {
+    try { recordWrite("brief_auto_requeue", 0, "error: " + e.message); } catch {}
+    console.error("[brief-auto-requeue]", e.message);
+  }
+}
+setInterval(briefAutoRequeueCycle, 60 * 1000);
+setTimeout(briefAutoRequeueCycle, 12000);
 
 function gracefulShutdown(signal) {
   console.log(`[mnemo-daemon] ${signal} received, shutting down…`);

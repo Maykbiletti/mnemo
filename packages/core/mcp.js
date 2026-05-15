@@ -33,6 +33,7 @@ const { LOOP_DOCTOR_TOOL_DEFS, handleLoopDoctorTool } = require("./loop_doctor_t
 const { TIMELINE_REPORT_TOOL_DEFS, handleTimelineReportTool } = require("./timeline_report_tools");
 const { memoryHealth } = require("./memory_health_tools");
 const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow } = require("./shared_utils");
+const briefCoordination = require("./brief_coordination");
 
 const readline = require("readline");
 
@@ -66,6 +67,9 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_autonomy_sweep",
   "mem_autonomy_next",
   "mem_autonomy_task_update",
+  "mem_brief_requeue_stale",
+  "mem_connect_channel_list",
+  "mem_connect_list",
   "mem_firm_readiness_board",
   "mem_project_registry_upsert",
   "mem_project_registry_get",
@@ -4866,11 +4870,18 @@ ${args.first_invocation_outcome || "(none)"}
         agent_name: { type: "string" },
         limit: { type: "integer", default: 5, minimum: 1, maximum: 50 },
         peek: { type: "boolean", description: "if true, do not mark as dispatched" },
+        auto_requeue: { type: "boolean", description: "if false, skip the stale dispatched brief requeue sweep" },
+        requeue_after_minutes: { type: "integer", description: "minutes before dispatched briefs for offline agents are requeued" },
       },
       required: ["agent_name"],
     },
-    handler: async ({ agent_name, limit = 5, peek = false }) => {
+    handler: async ({ agent_name, limit = 5, peek = false, auto_requeue = true, requeue_after_minutes }) => {
       const targetAgent = normalizeAgentName(agent_name);
+      const requeueResult = auto_requeue === false ? null : briefCoordination.requeueStaleDispatchedBriefs(db, {
+        older_than_minutes: requeue_after_minutes || process.env.MNEMO_BRIEF_REQUEUE_MIN || 30,
+        agent_stale_sec: process.env.MNEMO_AGENT_OFFLINE_SEC || 300,
+        limit: 100
+      });
       // For local agents on this PC, merge hub + local results so cross-machine
       // briefs (other agents dropping on hub) become visible alongside the local queue.
       const localRows = db.prepare(
@@ -4896,7 +4907,7 @@ ${args.first_invocation_outcome || "(none)"}
       const all = [...hubRows, ...localRows.map((r) => ({ ...r, _src: "local" }))]
         .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
         .slice(0, limit);
-      return { count: all.length, briefs: all };
+      return { count: all.length, briefs: all, auto_requeue: requeueResult };
     },
   },
 
@@ -5025,13 +5036,15 @@ ${args.first_invocation_outcome || "(none)"}
 
   mem_connect_list: {
     description: "List agents registered with Mnemo Connect. Stale agents (>5min) auto-marked offline.",
-    inputSchema: { type: "object", properties: { only_online: { type: "boolean" } } },
+    inputSchema: { type: "object", properties: { only_online: { type: "boolean" }, auto_requeue: { type: "boolean" }, requeue_after_minutes: { type: "integer" }, agent_stale_sec: { type: "integer" } } },
     handler: (args) => {
       const only_online = !!(args && args.only_online);
-      db.prepare(
-        "UPDATE agent_registry SET status='offline' " +
-        "WHERE status<>'offline' AND (julianday('now') - julianday(last_seen_at)) * 86400 > 300"
-      ).run();
+      const marked_offline = briefCoordination.markStaleAgentsOffline(db, args && args.agent_stale_sec || 300);
+      const auto_requeue = args && args.auto_requeue === false ? null : briefCoordination.requeueStaleDispatchedBriefs(db, {
+        older_than_minutes: args && args.requeue_after_minutes || process.env.MNEMO_BRIEF_REQUEUE_MIN || 30,
+        agent_stale_sec: args && args.agent_stale_sec || 300,
+        limit: args && args.requeue_limit || 100
+      });
       const where = only_online ? "WHERE status='online'" : "";
       const rows = db.prepare(
         "SELECT agent_name, display_name, host, pid, status, registered_at, last_seen_at, skills_json, meta_json " +
@@ -5039,6 +5052,8 @@ ${args.first_invocation_outcome || "(none)"}
       ).all();
       return {
         count: rows.length,
+        marked_offline,
+        auto_requeue,
         agents: rows.map(r => ({
           ...r,
           skills: r.skills_json ? JSON.parse(r.skills_json) : [],
@@ -5117,21 +5132,20 @@ ${args.first_invocation_outcome || "(none)"}
                              normalized.meta ? JSON.stringify(normalized.meta) : null);
         ids.push(info.lastInsertRowid);
       }
-      return { channel, fanout: subs.length, brief_ids: ids };
+      const channelState = (briefCoordination.channelListWithSubscribers(db, { active_window_sec: 300 }).channels || []).find((row) => row.name === channel) || null;
+      return { channel, fanout: subs.length, brief_ids: ids, channel_state: channelState };
     },
   },
 
   mem_connect_channel_list: {
-    description: "List Mnemo Connect channels with subscriber counts.",
-    inputSchema: { type: "object", properties: {} },
-    handler: () => {
-      const rows = db.prepare(
-        "SELECT c.name, c.description, c.created_at, " +
-        "(SELECT COUNT(*) FROM channel_subscription s WHERE s.channel_name = c.name) AS subscribers " +
-        "FROM channel c ORDER BY c.created_at ASC"
-      ).all();
-      return { count: rows.length, channels: rows };
-    },
+    description: "List Mnemo Connect channels with subscriber counts and live heartbeat status for each subscribed agent.",
+    inputSchema: { type: "object", properties: { include_subscribers: { type: "boolean" }, active_window_sec: { type: "integer" } } },
+    handler: (args = {}) => briefCoordination.channelListWithSubscribers(db, args),
+  },
+  mem_brief_requeue_stale: {
+    description: "Requeue dispatched briefs that are older than the threshold and assigned to offline or non-heartbeating agents.",
+    inputSchema: { type: "object", properties: { older_than_minutes: { type: "integer" }, agent_stale_sec: { type: "integer" }, limit: { type: "integer" }, dry_run: { type: "boolean" } } },
+    handler: (args = {}) => briefCoordination.requeueStaleDispatchedBriefs(db, args),
   },
   mem_brief_status: {
     description: "Full status of a brief by id (status, timestamps, supersedes-chain, parent_id, reactions).",
@@ -7118,7 +7132,7 @@ ${args.first_invocation_outcome || "(none)"}
     },
   },
   mem_autonomy_task_update: {
-    description: "Update an autonomy task after work, review, blocker, or completion. Completion should include verification notes.",
+    description: "Update an autonomy task after work, review, blocker, or completion. Accepts autonomy_task.id or a linked agent_brief.id when resolvable.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "integer" }, status: { type: "string" }, assigned_agent: { type: "string" }, reviewer_agent: { type: "string" }, notes: { type: "string" }, meta: { type: "object" } },
@@ -7126,13 +7140,13 @@ ${args.first_invocation_outcome || "(none)"}
     },
     handler: (a) => {
       ensureAutonomyTables(db);
-      const resolved = resolveAutonomyTaskUpdateId(db, a.id);
+      const resolved = briefCoordination.resolveAutonomyTaskUpdateId(db, a.id);
       if (resolved.error) {
         return {
           error: resolved.error,
           id: a.id,
           candidates: resolved.candidates || [],
-          hint: "Use autonomy_task.id. If you copied an agent_brief id, this tool now tries to resolve agent_brief.meta.autonomy_task_id / blocked_autonomy_task_id; if no candidate appears, pull/list the brief with include_content=true."
+          hint: "Use autonomy_task.id or the linked agent_brief.id. This tool resolves direct task IDs, brief meta/content task references, source_id links, and meta brief_id links."
         };
       }
       const taskId = resolved.id;
