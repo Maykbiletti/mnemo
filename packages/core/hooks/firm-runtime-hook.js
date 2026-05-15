@@ -10,6 +10,7 @@ const { stripPrivate } = require("../shared_utils");
 const { enqueueToolCall, flushQueue, queueStats } = require("./hook_queue");
 
 const EVENT = String(process.argv[2] || process.env.MNEMO_HOOK_EVENT || "pre-tool").toLowerCase();
+const HOOK_DISABLED = process.env.MNEMO_HOOK_DISABLE === "1" || process.env.MNEMO_HOOK_DISABLED === "1";
 const BASE_URL = String(process.env.MNEMO_HUB_URL || process.env.MNEMO_HOST || "http://127.0.0.1:7117").replace(/\/+$/, "");
 const BLOCK_ON_PREFLIGHT = process.env.MNEMO_HOOK_BLOCK !== "0";
 const STRICT = process.env.MNEMO_HOOK_STRICT === "1";
@@ -1752,6 +1753,7 @@ async function sessionEnd(input) {
 
 async function main() {
   const input = readStdin();
+  if (HOOK_DISABLED) return print({ ok: true, event: EVENT, skipped: "disabled_by_env" });
   if (EVENT === "session-start" || EVENT === "sessionstart" || EVENT === "start") return sessionStart(input);
   if (EVENT === "user-prompt" || EVENT === "userpromptsubmit" || EVENT === "prompt") return userPromptSubmit(input);
   if (EVENT === "pre-compact" || EVENT === "precompact" || EVENT === "compact") return preCompact(input);

@@ -40,6 +40,18 @@ const PORT = parseInt(process.env.MNEMO_HTTP_PORT || "7117", 10);
 const HOST = process.env.MNEMO_HTTP_HOST || "127.0.0.1";
 const TELEGRAM_BOT_TOKEN_FILE = process.env.TELEGRAM_BOT_TOKEN_FILE || "";
 const TELEGRAM_POLL_ENABLED = process.env.MNEMO_TELEGRAM_POLL_ENABLED !== "0";
+const BACKGROUND_JOBS_ENABLED = process.env.MNEMO_BACKGROUND_JOBS !== "0";
+
+function scheduleBackgroundInterval(fn, ms) {
+  if (!BACKGROUND_JOBS_ENABLED) return null;
+  return setInterval(fn, ms);
+}
+
+function scheduleBackgroundTimeout(fn, ms) {
+  if (!BACKGROUND_JOBS_ENABLED) return null;
+  return setTimeout(fn, ms);
+}
+
 function readSecretFile(file) {
   if (!file) return "";
   try {
@@ -4200,6 +4212,7 @@ function recallMemories(tdb, a) {
   const query = String(a.query || "").trim();
   if (!query) return [];
   const limit = clampLimit(a.limit, 20, 200);
+  const allowLikeFallback = a.like_fallback === true || process.env.MNEMO_RECALL_LIKE_FALLBACK === "1";
   const journalInput = {
     include_journal: a.include_journal !== false,
     journal_scopes: a.journal_scopes,
@@ -4219,8 +4232,8 @@ function recallMemories(tdb, a) {
         : [];
       fallbackRows = dedupeRecallRows([
         ...fuzzyRows,
-        ...memoryLikeRecallRows(tdb, baseInput, limit * 2, query),
-        ...journalLikeRecallRows(tdb, journalInput, limit * 2, query)
+        ...(allowLikeFallback ? memoryLikeRecallRows(tdb, baseInput, limit * 2, query) : []),
+        ...(allowLikeFallback ? journalLikeRecallRows(tdb, journalInput, limit * 2, query) : [])
       ]);
     }
     if (a.mode === "fts") {
@@ -7066,6 +7079,7 @@ server.on("error", (err) => {
 });
 server.listen(PORT, HOST, () => {
   console.log(`[mnemo-daemon] HTTP on ${HOST}:${PORT}`);
+  if (!BACKGROUND_JOBS_ENABLED) console.log("[mnemo-daemon] background jobs disabled by MNEMO_BACKGROUND_JOBS=0");
   recordWrite("daemon_boot", 0, "alive");
 });
 
@@ -7413,8 +7427,8 @@ function autoScarSweep() {
     recordWrite("auto_scar_scanner", 0, "error: " + String(e.message).slice(0,100));
   }
 }
-setInterval(autoScarSweep, 30 * 1000);
-setTimeout(autoScarSweep, 7000);
+scheduleBackgroundInterval(autoScarSweep, 30 * 1000);
+scheduleBackgroundTimeout(autoScarSweep, 7000);
 
 // ---------- Sleep-Protect outbound queue flusher ----------
 function isInQuietHours() {
@@ -7454,7 +7468,7 @@ async function flushOutboundQueue() {
     if (sent || failed) recordWrite("outbound_flusher", sent, failed > 0 ? `partial:${failed}_failed` : "alive");
   } catch (e) {}
 }
-setInterval(() => { flushOutboundQueue().catch(() => {}); }, 60 * 1000);
+scheduleBackgroundInterval(() => { flushOutboundQueue().catch(() => {}); }, 60 * 1000);
 
 // ---------- Reminder dispatcher ----------
 function reminderDispatchCycle() {
@@ -7488,8 +7502,8 @@ function reminderDispatchCycle() {
     recordWrite("reminder_dispatch", 0, "error: " + String(e.message || e).slice(0, 120));
   }
 }
-setInterval(reminderDispatchCycle, 60 * 1000);
-setTimeout(reminderDispatchCycle, 10 * 1000);
+scheduleBackgroundInterval(reminderDispatchCycle, 60 * 1000);
+scheduleBackgroundTimeout(reminderDispatchCycle, 10 * 1000);
 
 // ---------- Agent mail inbox dispatcher ----------
 // The email gateway fetches mail into agent_mail_message; this loop turns new
@@ -7503,8 +7517,8 @@ function agentMailDispatchCycle() {
     recordWrite("agent_mail_dispatch", 0, "error: " + String(e.message || e).slice(0, 120));
   }
 }
-setInterval(agentMailDispatchCycle, parseInt(process.env.MNEMO_AGENT_MAIL_DISPATCH_MS || "60000", 10));
-setTimeout(agentMailDispatchCycle, 15 * 1000);
+scheduleBackgroundInterval(agentMailDispatchCycle, parseInt(process.env.MNEMO_AGENT_MAIL_DISPATCH_MS || "60000", 10));
+scheduleBackgroundTimeout(agentMailDispatchCycle, 15 * 1000);
 
 // ---------- Daily reflection cron ----------
 function maybeRunDailyReflection() {
@@ -7588,9 +7602,9 @@ async function urlSweep() {
   }
   recordWrite("url_watcher", urls.length, "alive");
 }
-setInterval(() => { urlSweep().catch(() => {}); }, 5 * 60 * 1000);
+scheduleBackgroundInterval(() => { urlSweep().catch(() => {}); }, 5 * 60 * 1000);
 // Immediate first sweep
-setTimeout(() => { urlSweep().catch(() => {}); }, 5000);
+scheduleBackgroundTimeout(() => { urlSweep().catch(() => {}); }, 5000);
 
 // ---------- Health-checker every 5 min ----------
 function healthSweep() {
@@ -7607,8 +7621,8 @@ function healthSweep() {
   }
 }
 
-setInterval(healthSweep, 5 * 60 * 1000);
-setInterval(maybeRunDailyReflection, 60 * 1000);
+scheduleBackgroundInterval(healthSweep, 5 * 60 * 1000);
+scheduleBackgroundInterval(maybeRunDailyReflection, 60 * 1000);
 
 // #9 TTL job + #10 action-log rollup
 const BRIEF_TTL_HOURS = parseInt(process.env.BRIEF_TTL_HOURS || "168", 10);
@@ -7634,8 +7648,8 @@ function runMaintenanceCycle() {
     }
   } catch (e) { console.error("[rollup]", e.message); }
 }
-setTimeout(runMaintenanceCycle, 30 * 1000);
-setInterval(runMaintenanceCycle, 60 * 60 * 1000);
+scheduleBackgroundTimeout(runMaintenanceCycle, 30 * 1000);
+scheduleBackgroundInterval(runMaintenanceCycle, 60 * 60 * 1000);
 
 // Phase 7 Sprint 0: anti-loop detector — every 30 min scan repeat failures
 async function antiLoopCycle() {
@@ -7652,7 +7666,7 @@ async function antiLoopCycle() {
     }
   } catch (e) { console.error("[anti-loop]", e.message); }
 }
-setInterval(() => { antiLoopCycle().catch(() => {}); }, 30 * 60 * 1000);
+scheduleBackgroundInterval(() => { antiLoopCycle().catch(() => {}); }, 30 * 60 * 1000);
 
 // Phase 6 Sprint 2: watchdog runner — 5 min cycle, http checks
 async function watchdogCycle() {
@@ -7690,7 +7704,7 @@ async function watchdogCycle() {
     }
   } catch (e) { console.error("[watchdog]", e.message); }
 }
-setInterval(() => { watchdogCycle().catch(() => {}); }, 5 * 60 * 1000);
+scheduleBackgroundInterval(() => { watchdogCycle().catch(() => {}); }, 5 * 60 * 1000);
 
 // Phase 3+4: idle_loop driver + daily digest cron
 async function idleLoopCycle() {
@@ -7714,7 +7728,7 @@ async function idleLoopCycle() {
     }
   } catch (e) { console.error("[idle-loop]", e.message); }
 }
-setInterval(() => { idleLoopCycle().catch(() => {}); }, 60 * 1000);
+scheduleBackgroundInterval(() => { idleLoopCycle().catch(() => {}); }, 60 * 1000);
 
 // ============================================================
 // Hub→Local brief sync — the autonomous core.
@@ -7783,9 +7797,9 @@ async function hubSyncCycle() {
     }
   }
 }
-setInterval(() => { hubSyncCycle().catch(() => {}); }, HUB_SYNC_INTERVAL_SEC * 1000);
+scheduleBackgroundInterval(() => { hubSyncCycle().catch(() => {}); }, HUB_SYNC_INTERVAL_SEC * 1000);
 // Run once shortly after boot so sync starts without waiting a full interval.
-setTimeout(() => { hubSyncCycle().catch(() => {}); }, 8000);
+scheduleBackgroundTimeout(() => { hubSyncCycle().catch(() => {}); }, 8000);
 
 async function dailyDigestCycle() {
   try {
@@ -7818,7 +7832,7 @@ async function dailyDigestCycle() {
     }
   } catch (e) { console.error("[digest]", e.message); }
 }
-setInterval(() => { dailyDigestCycle().catch(() => {}); }, 60 * 1000);
+scheduleBackgroundInterval(() => { dailyDigestCycle().catch(() => {}); }, 60 * 1000);
 
 // #16 auto-reflect: every 10 min, check each registered agent, trigger reflect if nudge says so
 async function autoReflectCycle() {
@@ -7836,7 +7850,7 @@ async function autoReflectCycle() {
     }
   } catch (e) { console.error("[auto-reflect]", e.message); }
 }
-setInterval(() => { autoReflectCycle().catch(() => {}); }, 10 * 60 * 1000);
+scheduleBackgroundInterval(() => { autoReflectCycle().catch(() => {}); }, 10 * 60 * 1000);
 
 function briefAutoRequeueCycle() {
   if (process.env.MNEMO_BRIEF_AUTO_REQUEUE === "0") return;
@@ -7855,8 +7869,8 @@ function briefAutoRequeueCycle() {
     console.error("[brief-auto-requeue]", e.message);
   }
 }
-setInterval(briefAutoRequeueCycle, 60 * 1000);
-setTimeout(briefAutoRequeueCycle, 12000);
+scheduleBackgroundInterval(briefAutoRequeueCycle, 60 * 1000);
+scheduleBackgroundTimeout(briefAutoRequeueCycle, 12000);
 
 function gracefulShutdown(signal) {
   console.log(`[mnemo-daemon] ${signal} received, shutting down…`);
