@@ -420,7 +420,12 @@ function resolveAccessRoute(db, input = {}) {
     };
   }
 
-  const candidates = selectCandidateRoutes(db, input);
+  let candidates = selectCandidateRoutes(db, input);
+  let usedScopeFallback = false;
+  if (!candidates.length && input.scope) {
+    candidates = selectCandidateRoutes(db, Object.assign({}, input, { scope: null }));
+    usedScopeFallback = candidates.length > 0;
+  }
   if (!candidates.length) {
     return {
       ok: false,
@@ -447,6 +452,7 @@ function resolveAccessRoute(db, input = {}) {
       error: "agent_not_allowed_for_access_route",
       message: `${agent} is not listed in allowed_agents for this access route.`,
       route,
+      scope_fallback: usedScopeFallback,
       allowed_agents: route.allowed_agents,
     };
   }
@@ -458,6 +464,7 @@ function resolveAccessRoute(db, input = {}) {
       error: "direct_access_blocked_use_canonical_route",
       message: "This target is reachable only through the canonical stored route. Do not try direct access first.",
       route,
+      scope_fallback: usedScopeFallback,
       must_use: {
         route_kind: route.route_kind,
         direct_allowed: route.direct_allowed,
@@ -472,6 +479,7 @@ function resolveAccessRoute(db, input = {}) {
     status: "ok",
     route,
     candidates: candidates.slice(0, 5),
+    scope_fallback: usedScopeFallback,
     must_use: {
       route_kind: route.route_kind,
       direct_allowed: route.direct_allowed,

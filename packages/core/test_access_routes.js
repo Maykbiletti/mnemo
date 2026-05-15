@@ -119,6 +119,31 @@ test("missing routes block instead of allowing improvisation", () => {
   assert.ok(missing.next_step.includes("mem_access_upsert"));
 });
 
+test("preflight falls back to global route when requested scope misses", () => {
+  const db = setupDb();
+  upsertAccessRoute(db, {
+    scope: "blun",
+    system_name: "65er root ssh",
+    access_kind: "ssh",
+    entrypoint: "root@example.org",
+    route_kind: "direct",
+    direct_allowed: true,
+    canonical_command: "ssh -i ~/.ssh/example_key root@example.org",
+    updated_by: "agent-a",
+  });
+
+  const resolved = resolveAccessRoute(db, {
+    scope: "default",
+    system_name: "65er root ssh",
+    access_kind: "ssh",
+    agent_name: "agent-a",
+  });
+
+  assert.strictEqual(resolved.ok, true);
+  assert.strictEqual(resolved.scope_fallback, true);
+  assert.strictEqual(resolved.route.scope, "blun");
+});
+
 test("listAccessRoutes returns route policy fields", () => {
   const db = setupDb();
   upsertAccessRoute(db, {
@@ -138,15 +163,15 @@ test("listAccessRoutes returns route policy fields", () => {
 test("full ssh command entrypoints are not prefixed twice", () => {
   const db = setupDb();
   const created = upsertAccessRoute(db, {
-    system_name: "prod-176",
+    system_name: "example-prod",
     access_kind: "ssh",
-    entrypoint: "ssh -i ~/.ssh/id_ed25519_alfred root@176.9.158.30",
+    entrypoint: "ssh -i ~/.ssh/example_key root@example.org",
     route_kind: "direct",
     direct_allowed: true,
-    updated_by: "alfred",
+    updated_by: "agent-a",
   });
 
-  assert.strictEqual(created.route.canonical_command, "ssh -i ~/.ssh/id_ed25519_alfred root@176.9.158.30");
+  assert.strictEqual(created.route.canonical_command, "ssh -i ~/.ssh/example_key root@example.org");
 });
 
 test("legacy updates do not erase stored jump policy", () => {
