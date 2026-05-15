@@ -76,6 +76,13 @@ function respond(res, code, body) {
   res.end(JSON.stringify(body));
 }
 
+function unwrapMnemoToolResponse(body) {
+  if (body && typeof body === "object" && !Array.isArray(body) && "tool" in body && "result" in body) {
+    return body.result;
+  }
+  return body;
+}
+
 const server = http.createServer(async (req, res) => {
   const parsed = new URL(req.url, `http://localhost:${PORT}`);
   if (parsed.pathname === "/healthz") return respond(res, 200, { ok: true, mcp_remote: true, port: PORT, tools: TOOLS.length, auth: TOKEN ? "bearer" : "open" });
@@ -115,7 +122,7 @@ const server = http.createServer(async (req, res) => {
       } else {
         return respond(res, 404, { error: "unknown_tool", name });
       }
-      return respond(res, 200, { ok: true, name, result: r.body });
+      return respond(res, 200, { ok: true, name, result: unwrapMnemoToolResponse(r.body) });
     } catch (e) {
       return respond(res, 500, { error: "tool_error", message: e.message });
     }
