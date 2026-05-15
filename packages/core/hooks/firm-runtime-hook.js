@@ -43,6 +43,7 @@ const TRANSCRIPT_SYNC_LINES = Math.max(20, Number(process.env.MNEMO_TRANSCRIPT_S
 const TRANSCRIPT_TAIL_BYTES = Math.max(65536, Number(process.env.MNEMO_TRANSCRIPT_TAIL_BYTES || 1048576));
 const MAX_CAPTURE_TEXT_CHARS = Math.max(500, Number(process.env.MNEMO_MAX_CAPTURE_TEXT_CHARS || 8000));
 const MAX_INJECTED_CONTEXT_CHARS = Math.max(1000, Number(process.env.MNEMO_MAX_INJECTED_CONTEXT_CHARS || 5500));
+const MAX_OUTPUT_CONTEXT_PREVIEW_CHARS = Math.max(500, Number(process.env.MNEMO_MAX_OUTPUT_CONTEXT_PREVIEW_CHARS || 1400));
 const HOOK_QUEUE_ON_FAILURE = process.env.MNEMO_HOOK_QUEUE_ON_FAILURE !== "0";
 const HOOK_FLUSH_ON_EVENT = process.env.MNEMO_HOOK_FLUSH_ON_EVENT !== "0";
 
@@ -656,6 +657,14 @@ async function safeTool(name, args) {
   }
 }
 
+async function readTool(name, args) {
+  try {
+    return { ok: true, result: await callTool(name, args) };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 async function flushHookQueue() {
   if (!HOOK_FLUSH_ON_EVENT) return { enabled: false, stats: queueStats() };
   try {
@@ -685,6 +694,18 @@ function memorySafeJson(value, maxChars) {
   } catch {
     return truncateText(memorySafeText(String(value || "")), maxChars || 6000);
   }
+}
+
+function compactToolResult(result) {
+  if (!result || typeof result !== "object") return result;
+  const out = {};
+  for (const key of ["ok", "accepted", "inserted", "duplicate", "duplicates", "count", "flushed", "remaining", "id", "hash"]) {
+    if (result[key] != null) out[key] = result[key];
+  }
+  if (Array.isArray(result.results)) out.results_count = result.results.length;
+  if (Array.isArray(result.errors)) out.errors_count = result.errors.length;
+  if (result.error) out.error = String(result.error).slice(0, 240);
+  return Object.keys(out).length ? out : { summary: truncateText(JSON.stringify(result), 400) };
 }
 
 function hookSessionId(input) {
@@ -845,7 +866,7 @@ async function capturePromptSubmit(input, agent, project, prompt) {
       warnings: ["user prompt capture failed: " + error]
     };
   }
-  return { enabled: true, ok: true, result: result.result };
+  return { enabled: true, ok: true, result: compactToolResult(result.result) };
 }
 
 async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
@@ -910,7 +931,7 @@ async function syncTranscriptTail(input, agent, project, reason, lineLimit) {
       count: items.length,
       transcript_path: tail.transcript_path,
       scanned_lines: tail.lines.length,
-      result: batch.result
+      result: compactToolResult(batch.result)
     };
   }
 
@@ -1150,6 +1171,42 @@ async function priorContextCheck(input, project, topics, prompt) {
   }
 }
 
+async function pendingBriefContext(agent) {
+  const pulled = await readTool("mem_brief_pull", { agent_name: agent, peek: true, limit: 5 });
+  if (!pulled.ok || (pulled.result && pulled.result.error)) {
+    return { ok: false, count: 0, briefs: [], error: pulled.error || pulled.result.error };
+  }
+  const briefs = Array.isArray(pulled.result && pulled.result.briefs) ? pulled.result.briefs : [];
+  return {
+    ok: true,
+    count: Number((pulled.result && pulled.result.count) || briefs.length || 0),
+    briefs: briefs.slice(0, 5).map((brief) => ({
+      id: brief.id || null,
+      source_agent: brief.source_agent || null,
+      created_at: brief.created_at || null,
+      preview: truncateText(brief.content || brief.preview || "", 280)
+    }))
+  };
+}
+
+function contextOutputPreview(context) {
+  return truncateText(context, MAX_OUTPUT_CONTEXT_PREVIEW_CHARS);
+}
+
+function hookCriticalSummary(data) {
+  const pending = data.pending_briefs || {};
+  const prior = data.prior_context || {};
+  const blockers = asArray(data.blockers);
+  const warnings = asArray(data.warnings);
+  return {
+    pending_briefs: Number(pending.count || 0),
+    pending_brief_ids: (pending.briefs || []).map((brief) => brief.id).filter(Boolean),
+    prior_hits: Number(prior.count || 0),
+    blockers: blockers.slice(0, 5),
+    warnings: warnings.slice(0, 5)
+  };
+}
+
 function injectedContextText(kind, data) {
   const lines = [
     "MNEMO AUTO-CONTEXT",
@@ -1163,6 +1220,15 @@ function injectedContextText(kind, data) {
     "- If the task touches auth, billing, live infra, design lock, or protected pages, run the matching Mnemo preflight/claims before edits.",
     "- Keep identity from Mnemo/session brief; do not rewrite your role from compacted chat noise."
   ];
+
+  if (data.pending_briefs && data.pending_briefs.ok) {
+    lines.push("", `Pending briefs: ${data.pending_briefs.count || 0}`);
+    for (const brief of (data.pending_briefs.briefs || []).slice(0, 5)) {
+      lines.push(`- #${brief.id || "?"} from ${brief.source_agent || "?"}: ${brief.preview || ""}`.trim());
+    }
+  } else if (data.pending_briefs && !data.pending_briefs.ok) {
+    lines.push("", "Pending brief check failed: " + data.pending_briefs.error);
+  }
 
   if (data.session_start && data.session_start.ok) {
     lines.push("", "Session bundle:");
@@ -1320,23 +1386,27 @@ async function sessionStart(input) {
   });
   const transcript_sync = await syncTranscriptTail(input, agent, project, "session-start", Math.max(80, TRANSCRIPT_SYNC_LINES));
   const prior_context = await priorContextCheck(input, project, inferTopics(input), promptText(input) || taskText(input));
-  const context = injectedContextText("SessionStart", { project_info, session_start: result, transcript_sync, prior_context });
+  const pending_briefs = await pendingBriefContext(agent);
+  const context = injectedContextText("SessionStart", { project_info, session_start: result, transcript_sync, prior_context, pending_briefs });
   const ok = result.ok && transcript_sync.ok && prior_context.ok;
-  const hook_status = await logHookStatus(input, agent, project, "SessionStart", ok, { result, transcript_sync, prior_context, queue_flush });
+  const hook_status = await logHookStatus(input, agent, project, "SessionStart", ok, { result, transcript_sync, prior_context, pending_briefs, queue_flush });
   print({
     ok,
     event: "session-start",
+    critical_context: hookCriticalSummary({ pending_briefs, prior_context }),
     project_info,
-    result: result.ok ? result.result : { error: result.error },
+    result: result.ok ? compactToolResult(result.result) : { error: result.error },
     transcript_sync,
     prior_context,
+    pending_briefs,
     queue_flush,
     hook_status,
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext: context
     },
-    additional_context: context
+    additional_context: contextOutputPreview(context),
+    additional_context_chars: context.length
   });
 }
 
@@ -1351,6 +1421,7 @@ async function userPromptSubmit(input) {
   const transcript_sync = await syncTranscriptTail(input, agent, project, "user-prompt", TRANSCRIPT_SYNC_LINES);
   const prior_context = await priorContextCheck(input, project, topics, prompt);
   const session_start = await safeTool("mem_session_start", { agent_name: agent, project, task: prompt || taskText(input) });
+  const pending_briefs = await pendingBriefContext(agent);
   const blockers = [
     ...((prompt_capture && prompt_capture.blockers) || []),
     ...((transcript_sync && transcript_sync.blockers) || []),
@@ -1361,49 +1432,56 @@ async function userPromptSubmit(input) {
     session_start,
     prompt_capture,
     transcript_sync,
-    prior_context
+    prior_context,
+    pending_briefs
   });
 
   if (blockers.length && BLOCK_ON_PREFLIGHT) {
     const reason = blockers.join("; ");
-    const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", false, { prompt_capture, transcript_sync, prior_context, queue_flush, blockers });
+    const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", false, { prompt_capture, transcript_sync, prior_context, pending_briefs, queue_flush, blockers });
     print({
       ok: false,
       event: "user-prompt",
       decision: "block",
       reason,
+      critical_context: hookCriticalSummary({ pending_briefs, prior_context, blockers }),
       project_info,
       prompt_capture,
       transcript_sync,
       prior_context,
+      pending_briefs,
       queue_flush,
       hook_status,
       hookSpecificOutput: {
         hookEventName: "UserPromptSubmit",
         additionalContext: context
       },
-      additional_context: context
+      additional_context: contextOutputPreview(context),
+      additional_context_chars: context.length
     });
     process.exitCode = 2;
     return;
   }
 
   const ok = prompt_capture.ok && transcript_sync.ok && prior_context.ok;
-  const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", ok, { prompt_capture, transcript_sync, prior_context, session_start, queue_flush });
+  const hook_status = await logHookStatus(input, agent, project, "UserPromptSubmit", ok, { prompt_capture, transcript_sync, prior_context, pending_briefs, session_start, queue_flush });
   print({
     ok,
     event: "user-prompt",
+    critical_context: hookCriticalSummary({ pending_briefs, prior_context }),
     project_info,
     prompt_capture,
     transcript_sync,
     prior_context,
+    pending_briefs,
     queue_flush,
     hook_status,
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: context
     },
-    additional_context: context
+    additional_context: contextOutputPreview(context),
+    additional_context_chars: context.length
   });
 }
 
@@ -1440,13 +1518,14 @@ async function preCompact(input) {
       project_info,
       transcript_sync,
       queue_flush,
-      snapshot,
+      snapshot: snapshot.ok ? compactToolResult(snapshot.result) : snapshot,
       hook_status,
       hookSpecificOutput: {
         hookEventName: "PreCompact",
         additionalContext: context
       },
-      additional_context: context
+      additional_context: contextOutputPreview(context),
+      additional_context_chars: context.length
     });
     process.exitCode = 2;
     return;
@@ -1459,13 +1538,14 @@ async function preCompact(input) {
     project_info,
     transcript_sync,
     queue_flush,
-    snapshot: snapshot.ok ? snapshot.result : { error: snapshot.error },
+    snapshot: snapshot.ok ? compactToolResult(snapshot.result) : { error: snapshot.error },
     hook_status,
     hookSpecificOutput: {
       hookEventName: "PreCompact",
       additionalContext: context
     },
-    additional_context: context
+    additional_context: contextOutputPreview(context),
+    additional_context_chars: context.length
   });
 }
 

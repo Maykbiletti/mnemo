@@ -1233,12 +1233,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(400); return res.end(JSON.stringify({ error: "q required" }));
     }
     try {
-      const rows = tdb.prepare(`
-        SELECT m.id, m.kind, m.actor, m.occurred_at, substr(m.text,1,300) preview, bm25(memory_fts) rank
-        FROM memory_fts JOIN memory m ON m.id=memory_fts.rowid
-        WHERE memory_fts MATCH ?
-        ORDER BY rank ASC LIMIT ?
-      `).all(sanitizeFtsQuery(q), limit);
+      const rows = recallMemories(tdb, { query: q, limit, mode: "hybrid", include_journal: true });
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify(rows));
     } catch (e) {
@@ -1343,6 +1338,7 @@ const server = http.createServer((req, res) => {
         if (p === "/memories" || p === "/memories/") {
           const lines = [
             "/memories",
+            "  top.md",
             "  today.md",
             "  inbox.md",
             "  identity.md",
@@ -1376,6 +1372,21 @@ const server = http.createServer((req, res) => {
         if (p === "/memories/today.md") {
           const t = handleTool(tdb, "mem_today_view", {});
           return ok(`# Today (${t.date})\n\nactions: ${t.actions?.count} | briefs: ${t.briefs?.count} | decisions: ${t.decisions?.count} | wishes: ${t.wishes?.count} | file_edits: ${t.file_edits?.count}\n\n## Recent decisions\n` + (t.decisions?.items||[]).map(d=>`- ${d.title} (${d.decided_by})`).join("\n"));
+        }
+        if (p === "/memories/top.md") {
+          const session = handleTool(tdb, "mem_session_brief", { agent_name: agent, project: a.project, task: a.task || "current work", token_budget: 900 });
+          const recall = recallMemories(tdb, {
+            query: [agent, a.project, "rules decisions blockers no-touch current work"].filter(Boolean).join(" "),
+            limit: Math.min(a.limit || 12, 30),
+            include_journal: true
+          });
+          const lines = ["# Top Mnemo Context", "", "Weighted context for hooks and agents. Use this instead of reading a huge raw MEMORY.md tail."];
+          lines.push("", "## Session brief", renderJson(session));
+          lines.push("", "## Top recall hits");
+          for (const row of Array.isArray(recall) ? recall : []) {
+            lines.push(`- ${row.surface || "memory"}:${row.ref_id || row.id} ${row.kind || ""} ${row.actor || ""} @ ${row.occurred_at || ""} — ${String(row.preview || "").replace(/\s+/g, " ").slice(0, 220)}`);
+          }
+          return ok(lines.join("\n"));
         }
         if (p === "/memories/inbox.md") {
           const r = handleTool(tdb, "mem_brief_pull", { agent_name: a.agent || DEFAULT_AGENT, peek: true, limit: 10 });
@@ -3486,14 +3497,25 @@ function preflightDepartmentOwnership(tdb, agentName, task, topics, files) {
   return { team, target_departments: targetDepartments, blockers };
 }
 
+function autonomyTaskResult(row, action) {
+  if (!row) return null;
+  return Object.assign({}, row, {
+    action,
+    department: row.department_name,
+    checklist: parseMaybeJson(row.checklist_json, null),
+    meta: parseMaybeJson(row.meta_json, null),
+  });
+}
+
 function insertAutonomyTask(tdb, task) {
   ensureAutonomyTables(tdb);
   const assignee = task.assigned_agent ? { assigned_agent: task.assigned_agent, reviewer_agent: task.reviewer_agent || taskAssignee(tdb, task.department_name).reviewer_agent } : taskAssignee(tdb, task.department_name);
   const existing = tdb.prepare("SELECT * FROM autonomy_task WHERE project=? AND department_name=? AND title=?").get(task.project, task.department_name, task.title);
-  if (existing) return { action: "kept", id: existing.id, status: existing.status, assigned_agent: existing.assigned_agent, reviewer_agent: existing.reviewer_agent };
+  if (existing) return autonomyTaskResult(existing, "kept");
   const info = tdb.prepare("INSERT INTO autonomy_task (project, department_name, title, category, severity, assigned_agent, reviewer_agent, source_kind, source_id, checklist_json, notes, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
     .run(task.project, task.department_name, task.title, task.category || "coordination", task.severity || "M", assignee.assigned_agent || null, assignee.reviewer_agent || null, task.source_kind || null, task.source_id != null ? String(task.source_id) : null, task.checklist ? JSON.stringify(task.checklist) : null, task.notes || null, task.meta ? JSON.stringify(task.meta) : null);
-  return { action: "created", id: info.lastInsertRowid, status: "open", assigned_agent: assignee.assigned_agent || null, reviewer_agent: assignee.reviewer_agent || null };
+  const row = tdb.prepare("SELECT * FROM autonomy_task WHERE id=?").get(info.lastInsertRowid);
+  return autonomyTaskResult(row, "created");
 }
 
 function recentAutonomyBriefExists(tdb, agent, taskId, minutes = 30) {
@@ -3518,10 +3540,24 @@ function recentAutonomyBriefExists(tdb, agent, taskId, minutes = 30) {
   }
 }
 
-function autonomyBriefContent(t, agent) {
+function autonomySweepBatchLines(batchInfo) {
+  if (!batchInfo || !batchInfo.total_available) return [];
+  const lines = [
+    "## Sweep batch",
+    "- Brief: " + batchInfo.index + " of " + batchInfo.total_available + " eligible tasks in this sweep",
+    "- Batch limit: " + batchInfo.batch_limit
+  ];
+  if (batchInfo.remaining > 0) lines.push("- Remaining after this brief: " + batchInfo.remaining);
+  return lines;
+}
+
+function autonomyBriefContent(t, agent, batchInfo) {
+  const batchLines = autonomySweepBatchLines(batchInfo);
   return [
     "# Autonomy task #" + t.id,
     "",
+    ...batchLines,
+    ...(batchLines.length ? [""] : []),
     "- Project: " + t.project,
     "- Department: " + t.department,
     "- Title: " + t.title,
@@ -3535,10 +3571,61 @@ function autonomyBriefContent(t, agent) {
   ].join("\n");
 }
 
-function blockedAutonomyReviewContent(t, agent) {
+function compactReason(value, max = 260) {
+  if (value == null) return "";
+  if (Array.isArray(value)) value = value.filter(Boolean).join("; ");
+  else if (typeof value === "object") value = JSON.stringify(value);
+  value = String(value || "").replace(/\s+/g, " ").trim();
+  return value.length > max ? value.slice(0, max - 3) + "..." : value;
+}
+
+function firstReasonObject(obj, keys) {
+  if (!obj || typeof obj !== "object") return "";
+  for (const key of keys) {
+    const text = compactReason(obj[key]);
+    if (text) return text;
+  }
+  return "";
+}
+
+function autonomyBlockedReasonLines(tdb, t) {
+  const lines = [];
+  const checklist = t.checklist || parseMaybeJson(t.checklist_json, null) || {};
+  const meta = t.meta || parseMaybeJson(t.meta_json, null) || {};
+  const notes = compactReason(t.notes, 360);
+  if (notes) lines.push("- Blocker notes: " + notes);
+  const checklistReason = firstReasonObject(checklist, ["blocked_reason", "blocker", "blockers", "missing", "reason", "next_action"]);
+  if (checklistReason) lines.push("- Checklist blocker: " + checklistReason);
+  const metaReason = firstReasonObject(meta, ["blocked_reason", "blocker", "blockers", "missing", "missing_blocks", "reason", "next_action", "source"]);
+  if (metaReason) lines.push("- Meta blocker: " + metaReason);
+  const sourceKind = t.source_kind || meta.source_kind || "";
+  const sourceId = t.source_id || meta.source_id || (checklist && checklist.finding_id) || "";
+  if (String(sourceKind) === "quality_finding" || sourceId) {
+    try {
+      const f = tdb.prepare("SELECT id, project, category, severity, title, url, expected, actual, status FROM quality_finding WHERE id=?").get(String(sourceId));
+      if (f) {
+        lines.push("- Source finding: #" + f.id + " [" + (f.severity || "M") + "/" + (f.status || "open") + "] " + compactReason(f.title, 220));
+        if (f.url) lines.push("- URL: " + f.url);
+        if (f.expected) lines.push("- Expected: " + compactReason(f.expected, 220));
+        if (f.actual) lines.push("- Actual: " + compactReason(f.actual, 260));
+      }
+    } catch {}
+  }
+  if (!lines.length) {
+    lines.push("- Blocker reason: not recorded on the autonomy task yet.");
+    lines.push("- First unblock step: inspect source_kind/source_id, then update the task with notes or meta.blocked_reason so the next reviewer does not restart from zero.");
+  }
+  return lines;
+}
+
+function blockedAutonomyReviewContent(t, agent, tdb, batchInfo) {
+  const blockerLines = autonomyBlockedReasonLines(tdb, t);
+  const batchLines = autonomySweepBatchLines(batchInfo);
   return [
     "# Blocked autonomy review #" + t.id,
     "",
+    ...batchLines,
+    ...(batchLines.length ? [""] : []),
     "- Project: " + t.project,
     "- Department: " + t.department,
     "- Status: " + (t.status || "blocked"),
@@ -3546,11 +3633,62 @@ function blockedAutonomyReviewContent(t, agent) {
     "- Assigned agent: " + (t.assigned_agent || "unassigned"),
     "- Reviewer: " + (t.reviewer_agent || agent || "strategy-review"),
     "",
+    "## Why this is blocked",
+    blockerLines.join("\n"),
+    "",
     "This is an execution brief, not a status ping and not a passive autonomy pointer.",
     "Read the task/finding/handoff, identify the exact unblock step, and act.",
     "If you can safely fix it, fix it and verify it. If another lane owns it, brief that agent with exact URL/file/evidence. If only owner/server access can unblock it, write one precise blocker with the exact access or decision needed.",
     "After acting, update the task with mem_autonomy_task_update so the blocked state cannot silently stay stale."
   ].join("\n");
+}
+
+function resolveAutonomyTaskUpdateId(tdb, inputId) {
+  const raw = parseInt(inputId, 10);
+  if (!Number.isFinite(raw)) return { id: inputId, error: "invalid id" };
+  const direct = tdb.prepare("SELECT id, meta_json FROM autonomy_task WHERE id=?").get(raw);
+  if (direct) return { id: raw, resolved_from: "autonomy_task.id" };
+  const candidates = [];
+  try {
+    const brief = tdb.prepare("SELECT id, content, meta_json FROM agent_brief WHERE id=?").get(raw);
+    if (brief) {
+      const meta = parseMaybeJson(brief.meta_json, {}) || {};
+      ["autonomy_task_id", "blocked_autonomy_task_id", "task_id"].forEach((key) => {
+        const value = parseInt(meta[key], 10);
+        if (Number.isFinite(value)) candidates.push({ id: value, source: "agent_brief.meta." + key });
+      });
+      const re = /(?:Autonomy task|Blocked autonomy review)\s*#(\d+)/gi;
+      let match;
+      while ((match = re.exec(String(brief.content || "")))) {
+        const value = parseInt(match[1], 10);
+        if (Number.isFinite(value)) candidates.push({ id: value, source: "agent_brief.content" });
+      }
+    }
+  } catch {}
+  try {
+    const mem = tdb.prepare("SELECT id, text, meta_json FROM memory WHERE id=?").get(raw);
+    if (mem) {
+      const meta = parseMaybeJson(mem.meta_json, {}) || {};
+      ["autonomy_task_id", "blocked_autonomy_task_id", "task_id"].forEach((key) => {
+        const value = parseInt(meta[key], 10);
+        if (Number.isFinite(value)) candidates.push({ id: value, source: "memory.meta." + key });
+      });
+      const re = /(?:Autonomy task|Blocked autonomy review)\s*#(\d+)/gi;
+      let match;
+      while ((match = re.exec(String(mem.text || "")))) {
+        const value = parseInt(match[1], 10);
+        if (Number.isFinite(value)) candidates.push({ id: value, source: "memory.text" });
+      }
+    }
+  } catch {}
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate.id)) continue;
+    seen.add(candidate.id);
+    const row = tdb.prepare("SELECT id FROM autonomy_task WHERE id=?").get(candidate.id);
+    if (row) return { id: candidate.id, resolved_from: candidate.source, input_id: raw };
+  }
+  return { id: raw, error: "task not found", candidates };
 }
 
 function qualityFindingExists(tdb, project, title) {
@@ -3693,6 +3831,7 @@ function runAutonomySweep(tdb, a) {
     const briefed = new Set();
     const briefLimit = Math.max(1, Math.min(parseInt(a.brief_limit || 25, 10) || 25, 200));
     const briefable = tasks.filter(t => t.action === "created" || t.status === "open" || t.status === "claimed" || t.status === "blocked" || t.status === "review");
+    const eligible = [];
     for (const t of briefable) {
       if (briefedTasks.length >= briefLimit) break;
       const reviewRequired = t.status === "blocked" || t.status === "review";
@@ -3700,17 +3839,28 @@ function runAutonomySweep(tdb, a) {
       if (!agent || briefed.has(agent + ":" + t.id)) continue;
       if (t.action !== "created" && recentAutonomyBriefExists(tdb, agent, t.id, reviewRequired ? Math.max(30, a.blocked_rebrief_minutes || 120) : 30)) continue;
       briefed.add(agent + ":" + t.id);
-      const content = reviewRequired ? blockedAutonomyReviewContent(t, agent) : autonomyBriefContent(t, agent);
+      eligible.push({ t, agent, reviewRequired });
+    }
+    const totalAvailable = eligible.length;
+    for (let i = 0; i < Math.min(totalAvailable, briefLimit); i++) {
+      const { t, agent, reviewRequired } = eligible[i];
+      const batchInfo = {
+        index: i + 1,
+        total_available: totalAvailable,
+        batch_limit: briefLimit,
+        remaining: Math.max(0, totalAvailable - i - 1)
+      };
+      const content = reviewRequired ? blockedAutonomyReviewContent(t, agent, tdb, batchInfo) : autonomyBriefContent(t, agent, batchInfo);
       const meta = reviewRequired
-        ? { type: "blocked_autonomy_review", blocked_autonomy_task_id: t.id, department: t.department, project: t.project, task_status: t.status, execution_required: true }
-        : { autonomy_task_id: t.id, department: t.department, project: t.project };
+        ? { type: "blocked_autonomy_review", blocked_autonomy_task_id: t.id, department: t.department, project: t.project, task_status: t.status, execution_required: true, sweep_batch: batchInfo }
+        : { autonomy_task_id: t.id, department: t.department, project: t.project, sweep_batch: batchInfo };
       try {
         tdb.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)").run(agent, a.agent_name || "autonomy-sweep", content, JSON.stringify(meta));
-        briefedTasks.push({ id: t.id, agent, project: t.project, department: t.department, status: t.status, review_required: reviewRequired });
+        briefedTasks.push({ id: t.id, agent, project: t.project, department: t.department, status: t.status, review_required: reviewRequired, sweep_batch: batchInfo });
       } catch {}
     }
   }
-  try { tdb.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'autonomy_sweep', ?, 'done', ?, 'autonomy')").run(a.agent_name || "autonomy-sweep", scope, JSON.stringify({ tasks: tasks.length, created: created.length, briefed: briefedTasks.length, board: board.summary })); } catch {}
+  try { tdb.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'autonomy_sweep', ?, 'done', ?, 'autonomy')").run(a.agent_name || "autonomy-sweep", scope, JSON.stringify({ tasks: tasks.length, created: created.length, briefed: briefedTasks.length, brief_limit: a.drop_briefs ? Math.max(1, Math.min(parseInt(a.brief_limit || 25, 10) || 25, 200)) : 0, board: board.summary })); } catch {}
   return { ok: true, scope, board: board.summary, tasks_count: tasks.length, created_count: created.length, briefed_count: briefedTasks.length, briefed: briefedTasks, tasks };
 }
 
@@ -3800,6 +3950,136 @@ function buildFirmReadinessBoard(tdb, a) {
   return { summary, projects, doc: lines.join("\n") };
 }
 
+const RECALL_STOPWORDS = new Set([
+  "der", "die", "das", "den", "dem", "und", "oder", "aber", "mit", "fuer", "für", "von", "vom", "zur", "zum", "ist", "sind", "war", "was", "wie", "ich", "du", "wir", "ihr", "sie", "ein", "eine", "einer", "einen", "nicht", "noch", "auch", "auf", "aus", "bei", "nach", "dass", "the", "and", "or", "for", "with", "from", "that", "this", "what", "when", "where", "why", "how"
+]);
+
+function recallSearchTokens(query) {
+  const raw = String(query || "").toLowerCase();
+  const folded = raw.normalize ? raw.normalize("NFKD").replace(/[\u0300-\u036f]/g, "") : raw;
+  const seen = new Set();
+  const out = [];
+  for (const token of (raw + " " + folded).match(/[\p{L}\p{N}_]{3,}/gu) || []) {
+    if (RECALL_STOPWORDS.has(token) || seen.has(token)) continue;
+    seen.add(token);
+    out.push(token.slice(0, 48));
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+function fuzzyFtsQuery(query) {
+  const tokens = recallSearchTokens(query).slice(0, 8);
+  if (!tokens.length) return "";
+  return tokens.map((token) => token + "*").join(" OR ");
+}
+
+function memoryFtsRecallRows(tdb, input = {}, limit = 20, ftsQuery = "", matchMode = "fts") {
+  if (!ftsQuery) return [];
+  try {
+    const where = ["memory_fts MATCH ?"];
+    const params = [ftsQuery];
+    if (input.since) { where.push("m.occurred_at >= ?"); params.push(input.since); }
+    if (input.kind) { where.push("m.kind = ?"); params.push(input.kind); }
+    if (input.actor) { where.push("m.actor = ?"); params.push(input.actor); }
+    const rows = tdb.prepare(`
+      SELECT m.id, m.kind, m.actor, m.occurred_at, m.topic, m.importance,
+             substr(m.text, 1, 400) AS preview,
+             bm25(memory_fts) AS bm25
+      FROM memory_fts
+      JOIN memory m ON m.id = memory_fts.rowid
+      WHERE ${where.join(" AND ")}
+      ORDER BY bm25 ASC, m.occurred_at DESC
+      LIMIT ?
+    `).all(...params, Math.max(1, limit));
+    return rows.map((row) => Object.assign({ surface: "memory", ref_id: String(row.id), match_mode: matchMode }, row));
+  } catch {
+    return [];
+  }
+}
+
+function memoryLikeRecallRows(tdb, input = {}, limit = 20, queryText = "") {
+  const tokens = recallSearchTokens(queryText);
+  const phrase = String(queryText || "").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 160);
+  const terms = Array.from(new Set([phrase, ...tokens].filter((term) => term && term.length >= 3))).slice(0, 9);
+  if (!terms.length) return [];
+  try {
+    const where = [];
+    const params = [];
+    const clauses = [];
+    for (const term of terms) {
+      clauses.push("(lower(m.text) LIKE ? OR lower(COALESCE(m.topic,'')) LIKE ? OR lower(COALESCE(m.actor,'')) LIKE ?)");
+      params.push("%" + term + "%", "%" + term + "%", "%" + term + "%");
+    }
+    where.push("(" + clauses.join(" OR ") + ")");
+    if (input.since) { where.push("m.occurred_at >= ?"); params.push(input.since); }
+    if (input.kind) { where.push("m.kind = ?"); params.push(input.kind); }
+    if (input.actor) { where.push("m.actor = ?"); params.push(input.actor); }
+    params.push(Math.max(1, limit));
+    return tdb.prepare(`
+      SELECT m.id, m.kind, m.actor, m.occurred_at, m.topic, m.importance,
+             substr(m.text, 1, 400) AS preview,
+             999.0 AS bm25
+      FROM memory m
+      WHERE ${where.join(" AND ")}
+      ORDER BY m.importance DESC, m.occurred_at DESC
+      LIMIT ?
+    `).all(...params).map((row) => Object.assign({ surface: "memory", ref_id: String(row.id), match_mode: "like" }, row));
+  } catch {
+    return [];
+  }
+}
+
+function journalLikeRecallRows(tdb, input = {}, limit = 20, queryText = "") {
+  if (input.include_journal === false) return [];
+  const scopes = Array.isArray(input.journal_scopes) && input.journal_scopes.length ? input.journal_scopes : ["transcript", "brief", "event"];
+  const allowed = scopes.filter((s) => ["transcript", "brief", "event"].includes(s));
+  if (!allowed.length) return [];
+  const tokens = recallSearchTokens(queryText);
+  const phrase = String(queryText || "").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 160);
+  const terms = Array.from(new Set([phrase, ...tokens].filter((term) => term && term.length >= 3))).slice(0, 9);
+  if (!terms.length) return [];
+  try {
+    const placeholders = allowed.map(() => "?").join(",");
+    const params = [...allowed];
+    const clauses = [];
+    for (const term of terms) {
+      clauses.push("(lower(COALESCE(content,'')) LIKE ? OR lower(COALESCE(summary,'')) LIKE ? OR lower(COALESCE(agent_name,'')) LIKE ?)");
+      params.push("%" + term + "%", "%" + term + "%", "%" + term + "%");
+    }
+    if (input.actor) {
+      clauses.push("lower(COALESCE(agent_name,'')) LIKE ?");
+      params.push("%" + String(input.actor).toLowerCase() + "%");
+    }
+    params.push(Math.max(1, limit));
+    return tdb.prepare(`
+      SELECT scope AS kind, scope AS surface, ref_id, agent_name AS actor,
+             COALESCE(summary, '') AS topic,
+             substr(COALESCE(content, summary, ''), 1, 400) AS preview,
+             999.0 AS bm25,
+             'journal_like' AS match_mode
+      FROM mnemo_search_fts
+      WHERE scope IN (${placeholders}) AND (${clauses.join(" OR ")})
+      LIMIT ?
+    `).all(...params);
+  } catch {
+    return [];
+  }
+}
+
+function dedupeRecallRows(rows, limit) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows || []) {
+    const key = `${row.surface || "memory"}:${row.ref_id || row.id}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (limit && out.length >= limit) break;
+  }
+  return out;
+}
+
 function approxTokens(text) {
   return Math.ceil(String(text || "").length / 4);
 }
@@ -3820,25 +4100,25 @@ function recallMemories(tdb, a) {
     since: a.since,
     actor: a.actor,
   };
-  const where = ["memory_fts MATCH ?"];
-  const params = [sanitizeFtsQuery(query)];
-  if (a.since) { where.push("m.occurred_at >= ?"); params.push(a.since); }
-  if (a.kind) { where.push("m.kind = ?"); params.push(a.kind); }
-  if (a.actor) { where.push("m.actor = ?"); params.push(a.actor); }
   try {
-    const memoryRows = tdb.prepare(`
-      SELECT m.id, m.kind, m.actor, m.occurred_at, m.topic, m.importance,
-             substr(m.text, 1, 400) AS preview,
-             bm25(memory_fts) AS bm25
-      FROM memory_fts
-      JOIN memory m ON m.id = memory_fts.rowid
-      WHERE ${where.join(" AND ")}
-      ORDER BY bm25 ASC, m.occurred_at DESC
-      LIMIT ?
-    `).all(...params, limit * 2).map((row) => Object.assign({ surface: "memory", ref_id: String(row.id) }, row));
-    const journalRows = a.mode === "semantic" ? [] : searchJournalRecallRows(tdb, journalInput, limit * 2, sanitizeFtsQuery(query));
+    const baseInput = { since: a.since, kind: a.kind, actor: a.actor };
+    const exactQuery = sanitizeFtsQuery(query);
+    const memoryRows = memoryFtsRecallRows(tdb, baseInput, limit * 2, exactQuery, "fts");
+    const journalRows = a.mode === "semantic" ? [] : searchJournalRecallRows(tdb, journalInput, limit * 2, exactQuery);
+    let fallbackRows = [];
+    if (a.mode !== "semantic" && (memoryRows.length + journalRows.length) < Math.min(limit, 5)) {
+      const fuzzyQuery = fuzzyFtsQuery(query);
+      const fuzzyRows = fuzzyQuery && fuzzyQuery !== exactQuery
+        ? memoryFtsRecallRows(tdb, baseInput, limit * 2, fuzzyQuery, "fuzzy_fts")
+        : [];
+      fallbackRows = dedupeRecallRows([
+        ...fuzzyRows,
+        ...memoryLikeRecallRows(tdb, baseInput, limit * 2, query),
+        ...journalLikeRecallRows(tdb, journalInput, limit * 2, query)
+      ]);
+    }
     if (a.mode === "fts") {
-      return [...memoryRows, ...journalRows]
+      return dedupeRecallRows([...memoryRows, ...journalRows, ...fallbackRows])
         .sort((x, y) => (Number(x.bm25 ?? Number.POSITIVE_INFINITY) - Number(y.bm25 ?? Number.POSITIVE_INFINITY)) || String(y.occurred_at || "").localeCompare(String(x.occurred_at || "")))
         .slice(0, limit);
     }
@@ -3849,7 +4129,7 @@ function recallMemories(tdb, a) {
     const score = new Map();
     const meta = new Map();
     const rowKey = (row) => `${row.surface || "memory"}:${row.ref_id || row.id}`;
-    [...memoryRows, ...journalRows].forEach((row, i) => {
+    [...memoryRows, ...journalRows, ...fallbackRows].forEach((row, i) => {
       const key = rowKey(row);
       score.set(key, (score.get(key) || 0) + 1 / (RRF_K + i + 1));
       meta.set(key, row);
@@ -5259,7 +5539,33 @@ function handleTool(tdb, name, a) {
       if (a.live_status) { where.push("live_status=?"); params.push(a.live_status); }
       params.push(Math.min(a.limit || 50, 200));
       const rows = tdb.prepare("SELECT name, domain, server, live_status, live_url, vat_status, updated_at FROM project_registry" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY updated_at DESC LIMIT ?").all(...params);
-      return { count: rows.length, projects: rows };
+      if (rows.length) return { count: rows.length, projects: rows };
+      const candidates = [];
+      try {
+        for (const r of tdb.prepare("SELECT project AS name, updated_at FROM project_rules ORDER BY updated_at DESC LIMIT ?").all(Math.min(a.limit || 50, 200))) {
+          if (r && r.name) candidates.push({ name: r.name, source: "project_rules", updated_at: r.updated_at || null });
+        }
+      } catch {}
+      try {
+        for (const r of tdb.prepare("SELECT name, owner_agent, status, last_active_at FROM agent_project ORDER BY last_active_at DESC LIMIT ?").all(Math.min(a.limit || 50, 200))) {
+          if (r && r.name && !candidates.some((c) => c.name === r.name)) candidates.push({ name: r.name, source: "agent_project", owner_agent: r.owner_agent || null, status: r.status || null, updated_at: r.last_active_at || null });
+        }
+      } catch {}
+      try {
+        const seed = loadProjectRuleDefaults("blun");
+        for (const p of seed.projects || []) {
+          if (p && p.name && !candidates.some((c) => c.name === p.name)) candidates.push({ name: p.name, source: "facts/blun-project-rules.json" });
+        }
+      } catch {}
+      return {
+        count: 0,
+        projects: [],
+        candidates_count: candidates.length,
+        candidates,
+        hint: candidates.length
+          ? "No structured project_registry rows matched, but project candidates exist in rules/facts. Upsert them with mem_project_registry_upsert so live URLs, repos, servers and gates are queryable."
+          : "No structured project_registry rows matched."
+      };
     }
     case "mem_file_echo": {
       if (!a.file_path) return { error: "file_path required" };
@@ -5852,13 +6158,34 @@ function handleTool(tdb, name, a) {
     case "mem_autonomy_task_update": {
       if (!a.id) return { error: "id required" };
       ensureAutonomyTables(tdb);
-      const current = tdb.prepare("SELECT meta_json FROM autonomy_task WHERE id=?").get(a.id);
-      if (!current) return { error: "task not found", id: a.id };
+      const resolved = resolveAutonomyTaskUpdateId(tdb, a.id);
+      if (resolved.error) {
+        return {
+          error: resolved.error,
+          id: a.id,
+          candidates: resolved.candidates || [],
+          hint: "Use autonomy_task.id. If you copied an agent_brief id, this tool now tries to resolve agent_brief.meta.autonomy_task_id / blocked_autonomy_task_id; if no candidate appears, pull/list the brief with include_content=true."
+        };
+      }
+      const taskId = resolved.id;
+      const current = tdb.prepare("SELECT meta_json FROM autonomy_task WHERE id=?").get(taskId);
+      if (!current) return { error: "task not found", id: a.id, resolved_id: taskId };
+      if (String(a.status || "").toLowerCase() === "blocked") {
+        const metaBlocker = firstReasonObject(a.meta || {}, ["blocked_reason", "blocker", "blockers", "missing", "missing_blocks", "reason", "next_action"]);
+        if (!compactReason(a.notes) && !metaBlocker) {
+          return {
+            error: "blocked update requires blocker reason",
+            id: a.id,
+            resolved_id: taskId,
+            hint: "Set notes='blocked because ...' or meta.blocked_reason/meta.blockers so future blocked-review briefs include the reason."
+          };
+        }
+      }
       const meta = a.meta ? JSON.stringify(deepMergePlain(parseMaybeJson(current.meta_json, {}) || {}, a.meta)) : current.meta_json;
       const doneExpr = a.status === "done" || a.status === "reviewed" || a.status === "approved" ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')" : "done_at";
       const sql = "UPDATE autonomy_task SET status=COALESCE(?, status), assigned_agent=COALESCE(?, assigned_agent), reviewer_agent=COALESCE(?, reviewer_agent), notes=COALESCE(?, notes), meta_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_at=" + doneExpr + " WHERE id=?";
-      const info = tdb.prepare(sql).run(a.status || null, a.assigned_agent || null, a.reviewer_agent || null, a.notes || null, meta, a.id);
-      return { ok: info.changes > 0, id: a.id, status: a.status || "unchanged" };
+      const info = tdb.prepare(sql).run(a.status || null, a.assigned_agent || null, a.reviewer_agent || null, a.notes || null, meta, taskId);
+      return { ok: info.changes > 0, id: taskId, input_id: a.id, resolved_from: resolved.resolved_from, status: a.status || "unchanged" };
     }
     case "mem_project_rules_set": {
       if (!a.project) return { error: "project required" };
@@ -5963,7 +6290,26 @@ function handleTool(tdb, name, a) {
       const sql = "SELECT id, project, category, severity, title, url, status, source_agent, created_at, updated_at FROM quality_finding" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'H' THEN 1 WHEN 'M' THEN 2 ELSE 3 END, created_at DESC LIMIT ?";
       params.push(Math.min(a.limit || 100, 500));
       const rows = tdb.prepare(sql).all(...params);
-      return { count: rows.length, findings: rows };
+      if (rows.length) return { count: rows.length, findings: rows };
+      let memoryCandidates = [];
+      try {
+        const q = a.project ? "%" + a.project + "%" : "%finding%";
+        memoryCandidates = tdb.prepare(
+          "SELECT id, kind, actor, topic, substr(text,1,360) AS snippet, occurred_at FROM memory " +
+          "WHERE (lower(text) LIKE '%finding%' OR lower(topic) LIKE '%finding%' OR text LIKE '%#%') " +
+          (a.project ? "AND (text LIKE ? OR topic LIKE ?) " : "") +
+          "ORDER BY id DESC LIMIT ?"
+        ).all(...(a.project ? [q, q, Math.min(a.limit || 25, 100)] : [Math.min(a.limit || 25, 100)]));
+      } catch {}
+      return {
+        count: 0,
+        findings: [],
+        memory_candidates_count: memoryCandidates.length,
+        memory_candidates: memoryCandidates,
+        hint: memoryCandidates.length
+          ? "No structured quality_finding rows matched, but memory rows mention findings. Backfill or report them with mem_quality_finding_report so list/update/resolve can track them structurally."
+          : "No structured quality_finding rows matched."
+      };
     }
     case "mem_quality_finding_resolve": {
       if (!a.id) return { error: "id required" };
@@ -5994,7 +6340,7 @@ function handleTool(tdb, name, a) {
         project,
         task: a.task || null,
         protocol: ["view memory first", "read project rules", "check active claims", "think/preflight before edits", "claim files", "verify end-to-end", "handoff before stop"].concat((rules && rules.top_directives) || []),
-        memory_paths: project ? ["/memories/today.md", "/memories/agents/" + agent + "/status.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/registry.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/rules.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/live-check.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/findings.md"] : ["/memories/today.md", "/memories/agents/" + agent + "/status.md"],
+        memory_paths: project ? ["/memories/top.md", "/memories/today.md", "/memories/agents/" + agent + "/status.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/registry.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/rules.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/live-check.md", "/memories/projects/" + project.replace(/\s+/g, "_") + "/findings.md"] : ["/memories/top.md", "/memories/today.md", "/memories/agents/" + agent + "/status.md"],
         focus,
         status,
         today,
