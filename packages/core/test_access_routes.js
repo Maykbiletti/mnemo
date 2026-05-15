@@ -184,6 +184,31 @@ test("listAccessRoutes returns route policy fields", () => {
   assert.strictEqual(listed.access[0].direct_allowed, true);
 });
 
+test("listAccessRoutes hides blocked routes unless requested", () => {
+  const db = setupDb();
+  upsertAccessRoute(db, {
+    system_name: "example-prod",
+    access_kind: "ssh",
+    entrypoint: "root@example.org",
+    status: "active",
+    updated_by: "agent-a",
+  });
+  upsertAccessRoute(db, {
+    system_name: "example-prod",
+    access_kind: "ssh",
+    entrypoint: "root@blocked.example.org",
+    status: "blocked",
+    updated_by: "agent-a",
+  });
+
+  const available = listAccessRoutes(db, { system_name: "example-prod" });
+  const all = listAccessRoutes(db, { system_name: "example-prod", include_inactive: true });
+
+  assert.strictEqual(available.count, 1);
+  assert.strictEqual(available.access[0].status, "active");
+  assert.strictEqual(all.count, 2);
+});
+
 test("full ssh command entrypoints are not prefixed twice", () => {
   const db = setupDb();
   const created = upsertAccessRoute(db, {

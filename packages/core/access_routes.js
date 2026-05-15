@@ -353,6 +353,7 @@ function buildWhere(input = {}) {
   if (input.route_kind) { where.push("route_kind=?"); params.push(normalizeRouteKind(input.route_kind)); }
   if (input.direct_allowed !== undefined) { where.push("direct_allowed=?"); params.push(boolFlag(input.direct_allowed, false) ? 1 : 0); }
   if (input.status) { where.push("status=?"); params.push(input.status); }
+  else if (!input.include_inactive) { where.push("status IN ('active','verified','ok','fresh','observed')"); }
   return { where, params };
 }
 
