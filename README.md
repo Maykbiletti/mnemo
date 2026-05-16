@@ -322,6 +322,7 @@ The repo includes `packages/core/facts/example.json` and
 - [`docs/hub-operations.md`](docs/hub-operations.md) - hub routes, memory frontdoor, ops hardening
 - [`docs/agent-operating-dna.md`](docs/agent-operating-dna.md) - where agents read and store operational truth
 - [`docs/external-runtime-governance.md`](docs/external-runtime-governance.md) - OpenClaw-style runtime bindings and tool receipts
+- [`docs/runtime-guard-integration.md`](docs/runtime-guard-integration.md) - mandatory adapter-side guard contract for CodexLink/OpenClaw/Claude tool execution
 - [`docs/mcp-tools.md`](docs/mcp-tools.md) - tool surface
 - [`docs/universal-capture.md`](docs/universal-capture.md) - capture and backfill
 - [`docs/public-release-hygiene.md`](docs/public-release-hygiene.md) - keeping private data out of the public repo

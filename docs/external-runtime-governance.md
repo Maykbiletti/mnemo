@@ -17,6 +17,11 @@ External runtimes act as transport and execution layers. Every meaningful
 runtime toolrun should create a Mnemo receipt before execution and finish that
 same receipt with evidence or an error.
 
+For the adapter-side enforcement contract, see
+[`runtime-guard-integration.md`](runtime-guard-integration.md). Runtime
+adapters must block risky tool calls unless Mnemo grants the Work Order /
+Capability Token gate.
+
 ## Runtime Bindings
 
 A binding maps one external runtime/session/channel to the Mnemo company model.
