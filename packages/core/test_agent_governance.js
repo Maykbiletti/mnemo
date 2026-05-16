@@ -172,13 +172,64 @@ let workOrderId;
   });
   assert.strictEqual(incomplete.error, "evidence_required");
 
+  const weakEvidence = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    completion_summary: "done",
+    evidence: [{ test_step: "node test_agent_governance.js" }],
+  });
+  assert.strictEqual(weakEvidence.error, "evidence_invalid");
+
+  const missingRequired = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    completion_summary: "done",
+    evidence: [{ check: "lint", command: "node -c agent_governance.js", exit_code: 0, result: "pass" }],
+  });
+  assert.strictEqual(missingRequired.error, "evidence_missing_required");
+  assert.deepStrictEqual(missingRequired.missing_required, ["unit tests"]);
+
+  const needsReview = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    status: "needs_review",
+    completion_summary: "patched but not verified",
+  });
+  assert.strictEqual(needsReview.ok, true);
+  assert.strictEqual(needsReview.work_order.status, "needs_review");
+
   const complete = tool("mem_work_order_complete", {
     work_order_id: workOrderId,
     completion_summary: "token gate implemented",
-    evidence: [{ test_step: "node test_agent_governance.js", result: "pass" }],
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass", files: ["packages/core/test_agent_governance.js"] }],
   });
   assert.strictEqual(complete.ok, true);
   assert.strictEqual(complete.work_order.status, "done");
+  assert.strictEqual(complete.evidence_check.ok, true);
+}
+
+{
+  const noRequired = tool("mem_work_order_create", {
+    project: "mnemo",
+    title: "Docs note",
+    objective: "Write a small documentation note.",
+    department_name: "backend",
+    assigned_agent: "alfred",
+    owner_agent: "alfred",
+    risk_class: "low",
+    action_type: "write",
+    files: ["docs/*"],
+    ttl_minutes: 60,
+    created_by: "alfred",
+  });
+  const noEvidenceDone = tool("mem_work_order_complete", {
+    work_order_id: noRequired.work_order.id,
+    completion_summary: "done",
+  });
+  assert.strictEqual(noEvidenceDone.error, "evidence_required");
+  const okDone = tool("mem_work_order_complete", {
+    work_order_id: noRequired.work_order.id,
+    completion_summary: "docs note written",
+    evidence: [{ check: "diff reviewed", file_path: "docs/work-orders-capability-tokens.md", result: "pass" }],
+  });
+  assert.strictEqual(okDone.ok, true);
 }
 
 {

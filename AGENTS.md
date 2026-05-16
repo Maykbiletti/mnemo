@@ -171,6 +171,10 @@ evidence and handoff through `mem_work_order_complete` and
 `mem_session_handoff`. Durable facts, rules, and decisions still go through the
 proper Mnemo promotion, decision, project-rule, access, or connector tools.
 
+`mem_work_order_complete` with `status:"done"` requires concrete evidence:
+command/test/check/file/url plus result/status/exit_code. `handoff_id` alone is
+not done. Use `needs_review` or `blocked` when verification is missing.
+
 Department charters define standing responsibilities and boundaries with
 `mem_department_charter_set`, but they do not bypass risky-action tokens.
 Use `mem_intent_route` when an agent needs access, decision, review, handoff, or

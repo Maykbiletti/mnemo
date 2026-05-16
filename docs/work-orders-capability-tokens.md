@@ -31,8 +31,8 @@ capture hooks.
    - `audit_id`
 4. Tool wrappers such as CodexLink, OpenClaw, or Claude sidecars must execute
    risky tool calls only when the token check grants the action.
-5. Completion uses `mem_work_order_complete` and must attach evidence or a
-   handoff id when evidence is required.
+5. Completion uses `mem_work_order_complete` and must attach concrete evidence.
+   A handoff id alone is not enough for `done`.
 6. Trust/autonomy is updated from facts with `mem_autonomy_score_report`.
 
 ## Token Is Not Truth
@@ -42,6 +42,43 @@ decision, project rule, or access route true.
 
 Truth is written only through evidence-backed completion, handoff, approval, or
 promotion into the correct Mnemo ledger/tool.
+
+## Definition Of Done
+
+`done` is a Mnemo state, not an agent opinion.
+
+`mem_work_order_complete({status:"done"})` requires evidence even when the Work
+Order did not list `required_evidence`. If an agent cannot verify the result, it
+must use `status:"needs_review"` or `status:"blocked"` instead of `done`.
+
+Evidence objects must be concrete. They need an outcome field such as `result`,
+`status`, or `exit_code`, plus a real check or target such as `command`,
+`test_step`, `check`, `file_path`, `url`, `files`, `urls`, `output_ref`, or
+`receipt_id`. Command evidence must include `exit_code`.
+
+When `required_evidence` is set, each required item must be explicitly covered
+by at least one evidence object. Use `check`, `name`, or `label` to make the
+match deterministic.
+
+Valid evidence examples:
+
+```json
+{"check":"unit tests","command":"npm test","exit_code":0,"result":"pass","files":["packages/core/agent_governance.js"]}
+```
+
+```json
+{"check":"login smoke","test_step":"Login with existing account","url":"https://account.blun.ai/login","result":"pass"}
+```
+
+Not done:
+
+```json
+{"status":"needs_review","completion_summary":"Patch applied; browser smoke still missing."}
+```
+
+```json
+{"status":"blocked","completion_summary":"VAT key missing; cannot verify billing checkout."}
+```
 
 ## Department Charters
 
@@ -67,7 +104,7 @@ default coordinator, and can optionally create a brief.
 ```
 
 ```json
-{"tool":"mem_work_order_complete","args":{"work_order_id":42,"completion_summary":"Login loop fixed.","evidence":[{"test_step":"login smoke","result":"pass","url":"https://account.blun.ai/login"}]}}
+{"tool":"mem_work_order_complete","args":{"work_order_id":42,"completion_summary":"Login loop fixed.","evidence":[{"check":"login smoke","test_step":"Login with existing account","result":"pass","url":"https://account.blun.ai/login"},{"check":"unit tests","command":"npm test","exit_code":0,"result":"pass","files":["packages/core/auth.js"]}]}}
 ```
 
 ```json

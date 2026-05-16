@@ -578,8 +578,13 @@ brief inbox.
 
 Structured work contracts. A Work Order stores objective, owner, department,
 assigned agent, scope, risk, allowed tools/resources, done criteria, evidence
-requirements, and deadline. Completion requires evidence when the Work Order
-requires it.
+requirements, and deadline. `complete` only accepts `status:"done"` with
+concrete evidence. Evidence must include an outcome (`result`, `status`, or
+`exit_code`) plus a real check or target (`command`, `test_step`, `check`,
+`file_path`, `url`, `files`, `urls`, `output_ref`, or `receipt_id`). Command
+evidence must include `exit_code`. If required evidence is listed, every item
+must be explicitly covered. Without verification, use `status:"needs_review"` or
+`status:"blocked"` instead of `done`.
 
 ### `mem_capability_token_issue/check/revoke`
 

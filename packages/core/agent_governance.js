@@ -455,6 +455,109 @@ function workOrderList(db, input = {}) {
   return { ok: true, count: rows.length, work_orders: rows };
 }
 
+function normalizeEvidenceText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function evidenceText(item) {
+  if (!item || typeof item !== "object") return "";
+  const parts = [
+    item.check,
+    item.name,
+    item.label,
+    item.test_step,
+    item.command,
+    item.result,
+    item.status,
+    item.summary,
+    item.file_path,
+    item.url,
+    item.output_ref,
+    item.receipt_id,
+  ];
+  for (const field of ["files", "urls", "artifacts", "screenshots", "required_evidence"]) {
+    if (Array.isArray(item[field])) parts.push(...item[field]);
+  }
+  return normalizeEvidenceText(parts.filter(Boolean).join(" "));
+}
+
+function evidenceMatchesRequirement(item, requirement) {
+  const req = normalizeEvidenceText(requirement);
+  if (!req) return true;
+  const text = evidenceText(item);
+  if (!text) return false;
+  if (text.includes(req)) return true;
+  const tokens = req.split(" ").filter((token) => token.length > 2);
+  return tokens.length > 0 && tokens.every((token) => text.includes(token));
+}
+
+function validateEvidenceItem(item, index) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return "evidence[" + index + "] must be an object";
+  }
+  const hasOutcome = item.result != null || item.status != null || item.exit_code != null || item.exitCode != null;
+  const hasCheck = !!textOrNull(item.check || item.name || item.label || item.test_step || item.command, 2000);
+  const hasTarget = !!textOrNull(item.file_path || item.url || item.output_ref || item.receipt_id || item.screenshot_path || item.media_id, 2000)
+    || ["files", "urls", "artifacts", "screenshots"].some((field) => Array.isArray(item[field]) && item[field].length > 0);
+  if (!hasOutcome) {
+    return "evidence[" + index + "] needs result/status/exit_code";
+  }
+  if (!hasCheck && !hasTarget) {
+    return "evidence[" + index + "] needs command/test_step/check or file/url/artifact reference";
+  }
+  if (item.command && item.exit_code == null && item.exitCode == null) {
+    return "evidence[" + index + "] command evidence needs exit_code";
+  }
+  return null;
+}
+
+function validateWorkOrderCompletionEvidence(order, input = {}, evidence = []) {
+  const status = String(input.status || "done").toLowerCase();
+  if (status !== "done") {
+    return { ok: true, status, missing_required: [], invalid: [], required_evidence: order.required_evidence || [] };
+  }
+  if (!evidence.length) {
+    return {
+      ok: false,
+      error: "evidence_required",
+      status,
+      missing_required: order.required_evidence || [],
+      invalid: [],
+      required_evidence: order.required_evidence || [],
+      hint: "done requires concrete evidence. Use status needs_review or blocked when verification is not available.",
+    };
+  }
+  const invalid = evidence.map(validateEvidenceItem).filter(Boolean);
+  if (invalid.length) {
+    return {
+      ok: false,
+      error: "evidence_invalid",
+      status,
+      missing_required: [],
+      invalid,
+      required_evidence: order.required_evidence || [],
+      hint: "Evidence must include concrete checks with result/status/exit_code and relevant command/file/url/artifact references.",
+    };
+  }
+  const missing = (order.required_evidence || []).filter((requirement) => !evidence.some((item) => evidenceMatchesRequirement(item, requirement)));
+  if (missing.length) {
+    return {
+      ok: false,
+      error: "evidence_missing_required",
+      status,
+      missing_required: missing,
+      invalid: [],
+      required_evidence: order.required_evidence || [],
+      hint: "Each required_evidence item must be explicitly covered by at least one evidence object, preferably with check/name/label.",
+    };
+  }
+  return { ok: true, status, missing_required: [], invalid: [], required_evidence: order.required_evidence || [] };
+}
+
 function workOrderComplete(db, input = {}) {
   ensureAgentGovernanceSchema(db);
   const id = parseInt(input.id || input.work_order_id, 10);
@@ -463,21 +566,26 @@ function workOrderComplete(db, input = {}) {
   if (!row) return { error: "work_order_not_found", work_order_id: id };
   const order = rowToWorkOrder(row);
   const evidence = Array.isArray(input.evidence) ? input.evidence : [];
-  if ((order.required_evidence || []).length && !evidence.length && !input.handoff_id) {
-    return { error: "evidence_required", work_order_id: id, required_evidence: order.required_evidence };
+  const evidenceCheck = validateWorkOrderCompletionEvidence(order, input, evidence);
+  if (!evidenceCheck.ok) {
+    return Object.assign({ work_order_id: id }, evidenceCheck);
   }
+  const status = evidenceCheck.status || "done";
+  const completedAtSql = status === "done" || status === "cancelled"
+    ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    : "completed_at";
   db.prepare(`
     UPDATE work_order
-    SET status=?, completion_summary=?, handoff_id=?, evidence_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    SET status=?, completion_summary=?, handoff_id=?, evidence_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), completed_at=${completedAtSql}
     WHERE id=?
   `).run(
-    input.status || "done",
+    status,
     textOrNull(input.completion_summary || input.summary || input.result, 8000),
     input.handoff_id || null,
     safeJson(evidence, []),
     id
   );
-  return { ok: true, work_order: rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(id)) };
+  return { ok: true, status, evidence_check: evidenceCheck, work_order: rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(id)) };
 }
 
 function capabilityTokenIssue(db, input = {}) {
