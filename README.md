@@ -91,6 +91,11 @@ can prove what changed, who did it, or which project gates are still open.
   `mem_agent_sleep_note_add`, `mem_memory_promotion_propose/decide`, and
   `mem_company_rem_brief`. REM produces reviewable proposals; it does not
   silently rewrite company truth.
+- **Work Orders And Capability Tokens.** Risky work is no longer just a prompt
+  instruction. `mem_work_order_create` defines the assignment and
+  `mem_capability_token_check` deterministically gates write/exec/deploy/auth/
+  billing/external-send actions by agent, scope, tools, expiry, approvals, and
+  evidence requirements.
 - **Protected Scope Gates.** `mem_protected_scope_check` protects auth, billing,
   production infra, final artifacts, shared portal design, translations, chat
   runtime, and Mnemo coordination surfaces. Owner approval and active claims are
@@ -187,9 +192,15 @@ Mnemo's hard organization layer models work like a company:
   `memory_promotion_proposal`: REM memory layers for department diaries,
   personal agent sleep notes, draft consolidation, and explicit promotion
   review.
+- `work_order`, `capability_token`, `capability_token_audit`,
+  `department_charter`, `intent_route`, and `autonomy_score_snapshot`: company
+  operations contracts, temporary execution rights, deterministic token audits,
+  department rules, intent routing, and fact-based autonomy scoring.
 
 See [`docs/memory-consolidation.md`](docs/memory-consolidation.md) for the
 Company Ledger / Department Journal / Agent Sleep Notes model.
+See [`docs/work-orders-capability-tokens.md`](docs/work-orders-capability-tokens.md)
+for the Work Order / Capability Token gate.
 
 Useful calls:
 

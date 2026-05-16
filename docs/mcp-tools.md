@@ -574,6 +574,40 @@ pending promotion proposals, active/stale claims, pending approvals, and REM
 state. With `write_brief:true`, it writes the brief to the coordinator's Mnemo
 brief inbox.
 
+### `mem_work_order_create/list/complete`
+
+Structured work contracts. A Work Order stores objective, owner, department,
+assigned agent, scope, risk, allowed tools/resources, done criteria, evidence
+requirements, and deadline. Completion requires evidence when the Work Order
+requires it.
+
+### `mem_capability_token_issue/check/revoke`
+
+Temporary execution permission for one agent and Work Order. `check` returns
+`granted`, `reason`, `matched_scope`, `missing_approval`, `required_evidence`,
+`expires_at`, and `audit_id`. Risky write/exec/deploy/auth/billing/
+external-send work must not run without a granted check. The token is permission
+only; it is not company truth.
+
+### `mem_department_charter_set/get/list`
+
+Department constitution: mission, responsibilities, boundaries, standing
+permissions, allowed resources, escalation rules, autonomy bounds, lead, and
+reviewer. Charters help route normal work but do not bypass capability tokens
+for risky work.
+
+### `mem_intent_route({ intent_kind, agent_name?, project?, resource_kind?, resource_key?, summary?, write_brief? })`
+
+Routes access requests, decisions, reviews, handoffs, and incidents to the
+resource owner, department lead, or default coordinator. With
+`write_brief:true`, creates an agent brief.
+
+### `mem_autonomy_score_report({ agent_name, window_days? })`
+
+Fact-based autonomy/trust report built from actions, pending/done briefs,
+quality findings, and capability-token audit results. It suggests an autonomy
+level but does not grant permanent rights.
+
 ### `mem_access_preflight({ system_name?, project?, access_kind?, intended_command?, intended_entrypoint?, agent_name? })`
 
 Mandatory gate before touching SSH, dashboards, APIs, databases, providers, or

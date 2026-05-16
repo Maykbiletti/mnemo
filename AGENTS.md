@@ -148,6 +148,34 @@ department journals, sleep notes, pending promotion proposals, active claims,
 pending approvals, and REM status. This brief guides decisions; it does not
 change truth by itself.
 
+## Work Orders And Capability Tokens
+
+Risky work is not governed by memory or prompt wording. It is governed by a
+Work Order plus a Capability Token.
+
+Risky work includes write, edit, delete, move, deploy, migration, billing, auth,
+production, or external-send actions. For those actions, the agent or wrapper
+must have:
+
+- a structured `work_order`
+- a valid `capability_token`
+- a passing `mem_capability_token_check`
+
+The token check returns `granted`, `reason`, `matched_scope`,
+`missing_approval`, `required_evidence`, `expires_at`, and `audit_id`. If it
+does not grant the action, the action does not run. Without a valid Mnemo token,
+an agent may do safe read-only work or create/request a Work Order.
+
+Tokens are not truth. They are temporary permission only. Completion still needs
+evidence and handoff through `mem_work_order_complete` and
+`mem_session_handoff`. Durable facts, rules, and decisions still go through the
+proper Mnemo promotion, decision, project-rule, access, or connector tools.
+
+Department charters define standing responsibilities and boundaries with
+`mem_department_charter_set`, but they do not bypass risky-action tokens.
+Use `mem_intent_route` when an agent needs access, decision, review, handoff, or
+incident routing.
+
 ## Autonomous Backlog Routing
 
 Agents do not wait for the owner to notice open work. When an inbox is empty,

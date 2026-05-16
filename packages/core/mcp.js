@@ -40,6 +40,7 @@ const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtec
 const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool, runtimeToolReceiptStart } = require("./runtime_governance");
 const { MEMORY_CONSOLIDATION_TOOL_DEFS, ensureMemoryConsolidationSchema, handleMemoryConsolidationTool } = require("./memory_consolidation");
+const { AGENT_GOVERNANCE_TOOL_DEFS, ensureAgentGovernanceSchema, handleAgentGovernanceTool, capabilityTokenCheck, requiresCapabilityToken } = require("./agent_governance");
 
 const readline = require("readline");
 
@@ -110,6 +111,17 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_memory_promotion_list",
   "mem_memory_promotion_decide",
   "mem_company_rem_brief",
+  "mem_work_order_create",
+  "mem_work_order_list",
+  "mem_work_order_complete",
+  "mem_capability_token_issue",
+  "mem_capability_token_check",
+  "mem_capability_token_revoke",
+  "mem_department_charter_set",
+  "mem_department_charter_get",
+  "mem_department_charter_list",
+  "mem_intent_route",
+  "mem_autonomy_score_report",
   "mem_media_capture",
   "mem_media_recent",
   "mem_media_search",
@@ -206,6 +218,7 @@ seedDefaultProtectedScopes(db);
 ensureResourceAccessSchema(db);
 ensureRuntimeGovernanceSchema(db);
 ensureMemoryConsolidationSchema(db);
+ensureAgentGovernanceSchema(db);
 
 function ensureReminderTables() {
   db.exec(`
@@ -7651,6 +7664,11 @@ ${args.first_invocation_outcome || "(none)"}
         block_on_high_findings: { type: "boolean" },
         auto_claim: { type: "boolean" },
         ttl_minutes: { type: "integer" },
+        token_id: { type: "string" },
+        capability_token_id: { type: "string" },
+        work_order_id: { type: "integer" },
+        tool_name: { type: "string" },
+        approval_ids: { type: "array", items: { type: "string" } },
       },
       required: ["agent_name","task"],
     },
@@ -7660,6 +7678,34 @@ ${args.first_invocation_outcome || "(none)"}
       const files = Array.isArray(a.files) ? a.files : [];
       const checks = [];
       const blockers = [];
+      const capability = capabilityTokenCheck(db, {
+        token_id: a.token_id || a.capability_token_id || null,
+        work_order_id: a.work_order_id || null,
+        agent_name: a.agent_name,
+        project,
+        task: a.task,
+        summary: a.summary || a.task,
+        action_type: a.action_type || null,
+        tool_name: a.tool_name || null,
+        files,
+        routes: a.routes || [],
+        domains: a.domains || [],
+        system_names: a.system_names || [],
+        resources: a.resources || [],
+        approval_ids: a.approval_ids || [],
+      });
+      checks.push({
+        name: "capability_token",
+        result: capability.granted ? "ok" : "block",
+        required: capability.required,
+        reason: capability.reason,
+        token_id: capability.token_id || null,
+        work_order_id: capability.work_order_id || null,
+        expires_at: capability.expires_at || null,
+        audit_id: capability.audit_id || null,
+        required_evidence: capability.required_evidence || [],
+      });
+      if (requiresCapabilityToken(a) && !capability.granted) blockers.push("capability token blocked: " + capability.reason);
       if (project) {
         const rules = await tools.mem_project_rules_get.handler({ project });
         checks.push({ name: "project_rules", result: rules.error ? "missing" : "ok" });
@@ -8598,6 +8644,16 @@ for (const [name, def] of Object.entries(MEMORY_CONSOLIDATION_TOOL_DEFS)) {
     handler: async (args) => {
       const handled = handleMemoryConsolidationTool(db, name, args || {});
       if (!handled.handled) throw new Error("unknown memory consolidation tool: " + name);
+      return handled.result;
+    },
+  });
+}
+
+for (const [name, def] of Object.entries(AGENT_GOVERNANCE_TOOL_DEFS)) {
+  tools[name] = Object.assign({}, def, {
+    handler: async (args) => {
+      const handled = handleAgentGovernanceTool(db, name, args || {});
+      if (!handled.handled) throw new Error("unknown agent governance tool: " + name);
       return handled.result;
     },
   });
