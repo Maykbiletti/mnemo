@@ -38,6 +38,7 @@ const { AGENT_MAIL_TOOL_DEFS, ensureAgentMailTables, handleAgentMailTool } = req
 const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
 const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
+const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool, runtimeToolReceiptStart } = require("./runtime_governance");
 
 const readline = require("readline");
 
@@ -88,6 +89,14 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_access_route_resolve",
   "mem_access_preflight",
   "mem_access_event_log",
+  "mem_runtime_binding_upsert",
+  "mem_runtime_binding_list",
+  "mem_runtime_capability_upsert",
+  "mem_runtime_capability_list",
+  "mem_runtime_capability_check",
+  "mem_runtime_tool_receipt_start",
+  "mem_runtime_tool_receipt_finish",
+  "mem_runtime_tool_receipt_list",
   "mem_media_capture",
   "mem_media_recent",
   "mem_media_search",
@@ -182,6 +191,7 @@ ensureAccessRouteSchema(db);
 ensureProtectedScopeSchema(db);
 seedDefaultProtectedScopes(db);
 ensureResourceAccessSchema(db);
+ensureRuntimeGovernanceSchema(db);
 
 function ensureReminderTables() {
   db.exec(`
@@ -7770,15 +7780,18 @@ ${args.first_invocation_outcome || "(none)"}
       }
       checks.push({ name: "work_claims", files: files.length, claimed: claims.length });
       const status = blockers.length ? "block" : "ok";
+      let preflightActionId = null;
       try {
-        db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'agent_preflight', ?, ?, ?, 'agent_preflight')")
+        const actionInfo = db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'agent_preflight', ?, ?, ?, 'agent_preflight')")
           .run(a.agent_name, project || a.task, status, JSON.stringify({ task: a.task, files, blockers, checks }));
+        preflightActionId = actionInfo.lastInsertRowid || null;
       } catch {}
       return {
         status,
         agent_name: a.agent_name,
         project,
         task: a.task,
+        preflight_action_id: preflightActionId,
         blockers,
         checks,
         similar,
@@ -8524,6 +8537,43 @@ for (const [name, def] of Object.entries(ACCESS_ROUTE_TOOL_DEFS)) {
     handler: async (args) => {
       const handled = handleAccessRouteTool(db, name, args || {});
       if (!handled.handled) throw new Error("unknown access route tool: " + name);
+      return handled.result;
+    },
+  });
+}
+
+for (const [name, def] of Object.entries(RUNTIME_GOVERNANCE_TOOL_DEFS)) {
+  tools[name] = Object.assign({}, def, {
+    handler: async (args) => {
+      const input = args || {};
+      if (name === "mem_runtime_tool_receipt_start") {
+        let preflight = null;
+        if (input.preflight_required !== false) {
+          preflight = await tools.mem_agent_preflight.handler({
+            agent_name: input.agent_name,
+            project: input.project || null,
+            task: input.task || input.summary || `runtime toolrun ${input.tool_name || "tool"}`,
+            summary: input.summary || input.task || `runtime toolrun ${input.tool_name || "tool"}`,
+            action_type: input.action_type || null,
+            files: input.files || [],
+            urls: input.urls || [],
+            routes: input.routes || [],
+            domains: input.domains || [],
+            system_names: input.system_names || [],
+            resources: input.resources || [],
+            scope: input.scope || null,
+            topics: input.topics || [],
+            environment: input.environment || null,
+            require_project_rules: input.require_project_rules,
+            block_on_high_findings: input.block_on_high_findings,
+            auto_claim: input.auto_claim,
+            ttl_minutes: input.ttl_minutes,
+          });
+        }
+        return runtimeToolReceiptStart(db, input, { preflight });
+      }
+      const handled = handleRuntimeGovernanceTool(db, name, input);
+      if (!handled.handled) throw new Error("unknown runtime governance tool: " + name);
       return handled.result;
     },
   });

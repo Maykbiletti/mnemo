@@ -1,0 +1,635 @@
+"use strict";
+
+const crypto = require("crypto");
+const {
+  boolFlag,
+  cleanScope,
+  compactContent,
+  jsonSafe,
+  parseMaybeJson,
+  uniqueAgentNames,
+  uniqueStrings,
+  normalizeAgentName,
+} = require("./shared_utils");
+
+const DEFAULT_SCOPE = "default";
+
+function scopeName(scope) {
+  return cleanScope(scope || DEFAULT_SCOPE);
+}
+
+function normalizeRuntimeName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "runtime";
+}
+
+function normalizeCapabilityKind(value) {
+  return String(value || "tool")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "tool";
+}
+
+function normalizeKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) return uniqueStrings(value.map((item) => String(item || "").trim()).filter(Boolean));
+  const parsed = parseMaybeJson(value, null);
+  if (Array.isArray(parsed)) return uniqueStrings(parsed.map((item) => String(item || "").trim()).filter(Boolean));
+  return uniqueStrings(String(value || "").split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean));
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function sha(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function normalizeBindingKey(input = {}) {
+  const explicit = String(input.binding_key || "").trim();
+  if (explicit) return explicit.toLowerCase();
+  const parts = [
+    input.agent_name || "",
+    input.session_key || "",
+    input.channel || "",
+    input.account_id || "",
+    input.peer_kind || "",
+    input.peer_id || "",
+    input.workspace || "",
+  ].map((part) => String(part || "").trim()).filter(Boolean);
+  if (parts.length) return parts.join("|").toLowerCase();
+  return "binding:" + sha(JSON.stringify(input || {})).slice(0, 16);
+}
+
+function normalizeCapabilityRef(input = {}) {
+  const explicit = String(input.capability_ref || "").trim();
+  if (explicit) return explicit.toLowerCase();
+  const kind = normalizeCapabilityKind(input.capability_kind);
+  const key = normalizeKey(input.capability_key || input.tool_name || input.channel || input.capability || "*") || "*";
+  const agent = normalizeAgentName(input.agent_name || "");
+  const channel = normalizeKey(input.channel || "");
+  return [kind, key, agent || "*", channel || "*"].join("|");
+}
+
+function safeJson(value, fallback) {
+  if (value == null) return JSON.stringify(fallback);
+  return jsonSafe(value, 20000) || JSON.stringify(fallback);
+}
+
+function parseJsonField(value, fallback) {
+  return parseMaybeJson(value, fallback);
+}
+
+function ensureRuntimeGovernanceSchema(db) {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS runtime_binding (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  runtime_name TEXT NOT NULL,
+  binding_key TEXT NOT NULL,
+  agent_name TEXT,
+  project TEXT,
+  session_key TEXT,
+  channel TEXT,
+  account_id TEXT,
+  peer_kind TEXT,
+  peer_id TEXT,
+  workspace TEXT,
+  mode TEXT,
+  connector_system TEXT,
+  capabilities_json TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  source_ref TEXT,
+  meta_json TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(scope, runtime_name, binding_key)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_binding_agent ON runtime_binding(agent_name, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_binding_project ON runtime_binding(project, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_binding_session ON runtime_binding(runtime_name, session_key, status);
+
+CREATE TABLE IF NOT EXISTS runtime_capability (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  runtime_name TEXT NOT NULL,
+  capability_ref TEXT NOT NULL,
+  capability_kind TEXT NOT NULL DEFAULT 'tool',
+  capability_key TEXT NOT NULL,
+  agent_name TEXT,
+  channel TEXT,
+  permission TEXT NOT NULL DEFAULT 'allow',
+  risk_class TEXT NOT NULL DEFAULT 'normal',
+  requires_preflight INTEGER NOT NULL DEFAULT 1,
+  requires_receipt INTEGER NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  allowed_agents_json TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  notes TEXT,
+  source_ref TEXT,
+  meta_json TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(scope, runtime_name, capability_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_capability_lookup ON runtime_capability(scope, runtime_name, capability_kind, capability_key, status);
+CREATE INDEX IF NOT EXISTS idx_runtime_capability_agent ON runtime_capability(agent_name, status);
+
+CREATE TABLE IF NOT EXISTS runtime_tool_receipt (
+  receipt_id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT 'default',
+  runtime_name TEXT NOT NULL,
+  agent_name TEXT NOT NULL,
+  project TEXT,
+  task TEXT,
+  action_type TEXT,
+  tool_name TEXT NOT NULL,
+  tool_kind TEXT,
+  session_key TEXT,
+  channel TEXT,
+  request_id TEXT,
+  binding_id INTEGER,
+  connector_system TEXT,
+  status TEXT NOT NULL DEFAULT 'started',
+  allowed INTEGER NOT NULL DEFAULT 0,
+  evidence_required INTEGER NOT NULL DEFAULT 0,
+  preflight_status TEXT,
+  preflight_action_id INTEGER,
+  preflight_json TEXT,
+  capability_check_json TEXT,
+  claim_ids_json TEXT,
+  approval_ids_json TEXT,
+  resources_json TEXT,
+  tools_json TEXT,
+  evidence_json TEXT,
+  result_summary TEXT,
+  result_json TEXT,
+  error TEXT,
+  meta_json TEXT,
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_receipt_agent ON runtime_tool_receipt(agent_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_receipt_project ON runtime_tool_receipt(project, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_receipt_status ON runtime_tool_receipt(status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_receipt_runtime ON runtime_tool_receipt(runtime_name, session_key, started_at DESC);
+`);
+
+  try {
+    db.exec(`
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_runtime_binding_ai AFTER INSERT ON runtime_binding BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('runtime_binding', NEW.channel, 'internal', NEW.updated_by, 'runtime_binding_insert', 'runtime_binding', CAST(NEW.id AS TEXT), NEW.status, COALESCE(NEW.runtime_name, '') || ' ' || COALESCE(NEW.agent_name, '') || ' ' || COALESCE(NEW.session_key, ''), NULL, NEW.meta_json, NEW.updated_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_runtime_binding_au AFTER UPDATE ON runtime_binding BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('runtime_binding', NEW.channel, 'internal', NEW.updated_by, 'runtime_binding_update', 'runtime_binding', CAST(NEW.id AS TEXT), NEW.status, COALESCE(NEW.runtime_name, '') || ' ' || COALESCE(NEW.agent_name, '') || ' ' || COALESCE(NEW.session_key, ''), NULL, NEW.meta_json, NEW.updated_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_runtime_capability_ai AFTER INSERT ON runtime_capability BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('runtime_capability', NEW.channel, 'internal', NEW.updated_by, 'runtime_capability_insert', 'runtime_capability', CAST(NEW.id AS TEXT), NEW.status, COALESCE(NEW.runtime_name, '') || ' ' || COALESCE(NEW.capability_kind, '') || ':' || COALESCE(NEW.capability_key, ''), NULL, NEW.meta_json, NEW.updated_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_runtime_receipt_ai AFTER INSERT ON runtime_tool_receipt BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('runtime_tool_receipt', NEW.channel, 'internal', NEW.agent_name, 'runtime_tool_receipt_start', 'runtime_tool_receipt', NEW.receipt_id, NEW.status, COALESCE(NEW.tool_name, '') || ' ' || COALESCE(NEW.task, ''), NEW.resources_json, NEW.meta_json, NEW.started_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_runtime_receipt_au AFTER UPDATE ON runtime_tool_receipt BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('runtime_tool_receipt', NEW.channel, 'internal', NEW.agent_name, 'runtime_tool_receipt_update', 'runtime_tool_receipt', NEW.receipt_id, NEW.status, COALESCE(NEW.result_summary, NEW.error, NEW.tool_name), NEW.result_json, NEW.meta_json, COALESCE(NEW.finished_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+END;
+`);
+  } catch {}
+}
+
+function bindingUpsert(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const runtime = normalizeRuntimeName(input.runtime_name);
+  const bindingKey = normalizeBindingKey(input);
+  const agent = normalizeAgentName(input.agent_name || "");
+  const capabilities = normalizeStringList(input.capabilities);
+  db.prepare(
+    "INSERT INTO runtime_binding (scope, runtime_name, binding_key, agent_name, project, session_key, channel, account_id, peer_kind, peer_id, workspace, mode, connector_system, capabilities_json, status, source_ref, meta_json, updated_by, updated_at) " +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) " +
+    "ON CONFLICT(scope, runtime_name, binding_key) DO UPDATE SET agent_name=excluded.agent_name, project=excluded.project, session_key=excluded.session_key, channel=excluded.channel, account_id=excluded.account_id, peer_kind=excluded.peer_kind, peer_id=excluded.peer_id, workspace=excluded.workspace, mode=excluded.mode, connector_system=excluded.connector_system, capabilities_json=excluded.capabilities_json, status=excluded.status, source_ref=excluded.source_ref, meta_json=excluded.meta_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at"
+  ).run(
+    scope,
+    runtime,
+    bindingKey,
+    agent || null,
+    input.project || null,
+    input.session_key || null,
+    input.channel || null,
+    input.account_id || null,
+    input.peer_kind || null,
+    input.peer_id || null,
+    input.workspace || null,
+    input.mode || null,
+    input.connector_system || null,
+    JSON.stringify(capabilities),
+    input.status || "active",
+    input.source_ref || null,
+    safeJson(input.meta || {}, {}),
+    normalizeAgentName(input.updated_by || input.agent_name || "") || null
+  );
+  const row = db.prepare("SELECT * FROM runtime_binding WHERE scope=? AND runtime_name=? AND binding_key=?").get(scope, runtime, bindingKey);
+  return { ok: true, binding: rowToBinding(row) };
+}
+
+function rowToBinding(row) {
+  return row ? Object.assign({}, row, {
+    capabilities: parseJsonField(row.capabilities_json, []),
+    meta: parseJsonField(row.meta_json, {}),
+  }) : null;
+}
+
+function bindingList(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.runtime_name) { where.push("runtime_name=?"); params.push(normalizeRuntimeName(input.runtime_name)); }
+  if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.project) { where.push("project=?"); params.push(input.project); }
+  if (input.session_key) { where.push("session_key=?"); params.push(input.session_key); }
+  if (input.channel) { where.push("channel=?"); params.push(input.channel); }
+  if (input.status) { where.push("status=?"); params.push(input.status); }
+  else where.push("status!='deleted'");
+  params.push(Math.min(Math.max(parseInt(input.limit || 100, 10) || 100, 1), 500));
+  const rows = db.prepare("SELECT * FROM runtime_binding WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC LIMIT ?").all(...params).map(rowToBinding);
+  return { ok: true, count: rows.length, bindings: rows };
+}
+
+function capabilityUpsert(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const runtime = normalizeRuntimeName(input.runtime_name);
+  const kind = normalizeCapabilityKind(input.capability_kind || (input.tool_name ? "tool" : "capability"));
+  const key = normalizeKey(input.capability_key || input.tool_name || input.capability || "*") || "*";
+  const ref = normalizeCapabilityRef(Object.assign({}, input, { capability_kind: kind, capability_key: key }));
+  const allowedAgents = uniqueAgentNames(normalizeStringList(input.allowed_agents));
+  db.prepare(
+    "INSERT INTO runtime_capability (scope, runtime_name, capability_ref, capability_kind, capability_key, agent_name, channel, permission, risk_class, requires_preflight, requires_receipt, enabled, allowed_agents_json, status, notes, source_ref, meta_json, updated_by, updated_at) " +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) " +
+    "ON CONFLICT(scope, runtime_name, capability_ref) DO UPDATE SET capability_kind=excluded.capability_kind, capability_key=excluded.capability_key, agent_name=excluded.agent_name, channel=excluded.channel, permission=excluded.permission, risk_class=excluded.risk_class, requires_preflight=excluded.requires_preflight, requires_receipt=excluded.requires_receipt, enabled=excluded.enabled, allowed_agents_json=excluded.allowed_agents_json, status=excluded.status, notes=excluded.notes, source_ref=excluded.source_ref, meta_json=excluded.meta_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at"
+  ).run(
+    scope,
+    runtime,
+    ref,
+    kind,
+    key,
+    normalizeAgentName(input.agent_name || "") || null,
+    input.channel || null,
+    String(input.permission || "allow").toLowerCase(),
+    input.risk_class || "normal",
+    boolFlag(input.requires_preflight, true) ? 1 : 0,
+    boolFlag(input.requires_receipt, true) ? 1 : 0,
+    boolFlag(input.enabled, true) ? 1 : 0,
+    JSON.stringify(allowedAgents),
+    input.status || "active",
+    input.notes || null,
+    input.source_ref || null,
+    safeJson(input.meta || {}, {}),
+    normalizeAgentName(input.updated_by || input.agent_name || "") || null
+  );
+  const row = db.prepare("SELECT * FROM runtime_capability WHERE scope=? AND runtime_name=? AND capability_ref=?").get(scope, runtime, ref);
+  return { ok: true, capability: rowToCapability(row) };
+}
+
+function rowToCapability(row) {
+  return row ? Object.assign({}, row, {
+    requires_preflight: !!row.requires_preflight,
+    requires_receipt: !!row.requires_receipt,
+    enabled: !!row.enabled,
+    allowed_agents: parseJsonField(row.allowed_agents_json, []),
+    meta: parseJsonField(row.meta_json, {}),
+  }) : null;
+}
+
+function capabilityList(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.runtime_name) { where.push("runtime_name=?"); params.push(normalizeRuntimeName(input.runtime_name)); }
+  if (input.capability_kind) { where.push("capability_kind=?"); params.push(normalizeCapabilityKind(input.capability_kind)); }
+  if (input.capability_key) { where.push("capability_key=?"); params.push(normalizeKey(input.capability_key)); }
+  if (input.agent_name) { where.push("(agent_name=? OR agent_name IS NULL)"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.channel) { where.push("(channel=? OR channel IS NULL)"); params.push(input.channel); }
+  if (input.status) { where.push("status=?"); params.push(input.status); }
+  else where.push("status='active'");
+  params.push(Math.min(Math.max(parseInt(input.limit || 100, 10) || 100, 1), 500));
+  const rows = db.prepare("SELECT * FROM runtime_capability WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC LIMIT ?").all(...params).map(rowToCapability);
+  return { ok: true, count: rows.length, capabilities: rows };
+}
+
+function runtimeCapabilityCheck(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const runtime = normalizeRuntimeName(input.runtime_name);
+  const agent = normalizeAgentName(input.agent_name || "");
+  const channel = input.channel || null;
+  const requested = uniqueStrings([])
+    .concat(normalizeStringList(input.capabilities))
+    .concat(input.tool_name ? [String(input.tool_name)] : [])
+    .concat(input.tool_kind ? [String(input.tool_kind)] : [])
+    .map((item) => normalizeKey(item))
+    .filter(Boolean);
+  const allRows = db.prepare(
+    "SELECT * FROM runtime_capability WHERE scope IN (?, 'default') AND runtime_name IN (?, '*') AND status='active' ORDER BY updated_at DESC"
+  ).all(scope, runtime).map(rowToCapability);
+  const matched = [];
+  const blockers = [];
+  const warnings = [];
+  for (const row of allRows) {
+    const key = normalizeKey(row.capability_key);
+    const agentMatch = !row.agent_name || row.agent_name === agent;
+    const channelMatch = !row.channel || row.channel === channel;
+    const keyMatch = key === "*" || requested.includes(key);
+    if (!agentMatch || !channelMatch || !keyMatch) continue;
+    matched.push(row);
+    const allowedAgents = uniqueAgentNames(row.allowed_agents || []);
+    if (!row.enabled || ["deny", "block", "disabled"].includes(String(row.permission || "").toLowerCase())) {
+      blockers.push(`runtime capability denied: ${row.runtime_name} ${row.capability_kind}:${row.capability_key}`);
+    }
+    if (allowedAgents.length && !allowedAgents.includes(agent)) {
+      blockers.push(`runtime capability ${row.capability_key} does not allow agent ${agent}`);
+    }
+  }
+  if (!matched.length) {
+    const msg = `runtime capability not registered for ${runtime}: ${requested.join(", ") || input.tool_name || "tool"}`;
+    if (input.require_registered_capability) blockers.push(msg);
+    else warnings.push(msg);
+  }
+  return {
+    ok: blockers.length === 0,
+    status: blockers.length ? "block" : (warnings.length ? "warn" : "ok"),
+    runtime_name: runtime,
+    agent_name: agent,
+    requested,
+    blockers,
+    warnings,
+    matched_count: matched.length,
+    matched_capabilities: matched,
+    requires_preflight: matched.length ? matched.some((row) => row.requires_preflight) : true,
+    requires_receipt: matched.length ? matched.some((row) => row.requires_receipt) : true,
+  };
+}
+
+function inferActionType(input = {}) {
+  if (input.action_type) return String(input.action_type);
+  const text = [input.tool_name, input.tool_kind, input.task, input.summary].filter(Boolean).join(" ").toLowerCase();
+  if (/\b(deploy|pm2|nginx|dns|restart|ssh|scp|rsync)\b/.test(text)) return "deploy";
+  if (/\b(write|edit|patch|apply|delete|remove|move|rename|create|generate|save)\b/.test(text)) return "code_edit";
+  if (/\b(send|post|message|email|reply|webhook|api)\b/.test(text)) return "external_comm";
+  return "read";
+}
+
+function isEvidenceRequired(input = {}) {
+  if (input.evidence_required != null) return boolFlag(input.evidence_required, false);
+  const action = inferActionType(input).toLowerCase();
+  return ["deploy", "code_edit", "write", "delete", "move", "external_comm"].includes(action);
+}
+
+function resourcesFromInput(input = {}) {
+  return {
+    files: Array.isArray(input.files) ? input.files : [],
+    urls: Array.isArray(input.urls) ? input.urls : [],
+    routes: Array.isArray(input.routes) ? input.routes : [],
+    domains: Array.isArray(input.domains) ? input.domains : [],
+    system_names: Array.isArray(input.system_names) ? input.system_names : [],
+    resources: Array.isArray(input.resources) ? input.resources : [],
+  };
+}
+
+function runtimeToolReceiptStart(db, input = {}, options = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const runtime = normalizeRuntimeName(input.runtime_name);
+  const agent = normalizeAgentName(input.agent_name);
+  const toolName = String(input.tool_name || "").trim();
+  if (!agent || !toolName) return { error: "agent_name + tool_name required" };
+  const actionType = inferActionType(input);
+  const capCheck = runtimeCapabilityCheck(db, Object.assign({}, input, { action_type: actionType }));
+  const preflight = options.preflight || input.preflight || null;
+  const preflightStatus = preflight && (preflight.status || (preflight.ok ? "ok" : "block")) || (input.preflight_required === false ? "skipped" : "missing");
+  const blockers = []
+    .concat(capCheck.blockers || [])
+    .concat(preflight && Array.isArray(preflight.blockers) ? preflight.blockers : []);
+  if (input.preflight_required !== false && !preflight) blockers.push("missing Mnemo preflight result");
+  const allowed = blockers.length === 0;
+  const status = allowed ? "started" : "blocked";
+  const receiptId = input.receipt_id || "rt-" + sha([runtime, agent, toolName, input.request_id || "", nowIso(), Math.random()].join("|")).slice(0, 24);
+  const evidenceRequired = isEvidenceRequired(Object.assign({}, input, { action_type: actionType }));
+  const claims = uniqueStrings([])
+    .concat(Array.isArray(input.claim_ids) ? input.claim_ids.map(String) : [])
+    .concat(Array.isArray(preflight && preflight.claims) ? preflight.claims.map((claim) => String(claim && (claim.id || claim.claim_id) || "")).filter(Boolean) : []);
+  const approvals = uniqueStrings(Array.isArray(input.approval_ids) ? input.approval_ids.map(String) : []);
+  const toolsUsed = uniqueStrings([])
+    .concat(input.tool_name ? [input.tool_name] : [])
+    .concat(Array.isArray(input.tools_used) ? input.tools_used : []);
+  const meta = Object.assign({}, input.meta || {}, {
+    blockers,
+    capability_status: capCheck.status,
+    preflight_status: preflightStatus,
+    request_payload: input.payload || null,
+  });
+  db.prepare(
+    "INSERT INTO runtime_tool_receipt (receipt_id, scope, runtime_name, agent_name, project, task, action_type, tool_name, tool_kind, session_key, channel, request_id, binding_id, connector_system, status, allowed, evidence_required, preflight_status, preflight_action_id, preflight_json, capability_check_json, claim_ids_json, approval_ids_json, resources_json, tools_json, evidence_json, meta_json, started_at) " +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) " +
+    "ON CONFLICT(receipt_id) DO UPDATE SET status=excluded.status, allowed=excluded.allowed, preflight_status=excluded.preflight_status, preflight_action_id=excluded.preflight_action_id, preflight_json=excluded.preflight_json, capability_check_json=excluded.capability_check_json, claim_ids_json=excluded.claim_ids_json, approval_ids_json=excluded.approval_ids_json, resources_json=excluded.resources_json, tools_json=excluded.tools_json, meta_json=excluded.meta_json"
+  ).run(
+    receiptId,
+    scopeName(input.scope),
+    runtime,
+    agent,
+    input.project || null,
+    input.task || input.summary || `runtime toolrun ${toolName}`,
+    actionType,
+    toolName,
+    input.tool_kind || null,
+    input.session_key || null,
+    input.channel || null,
+    input.request_id || null,
+    input.binding_id || null,
+    input.connector_system || null,
+    status,
+    allowed ? 1 : 0,
+    evidenceRequired ? 1 : 0,
+    preflightStatus,
+    preflight && preflight.preflight_action_id || null,
+    safeJson(preflight || {}, {}),
+    safeJson(capCheck, {}),
+    JSON.stringify(claims),
+    JSON.stringify(approvals),
+    safeJson(resourcesFromInput(input), {}),
+    JSON.stringify(toolsUsed),
+    JSON.stringify([]),
+    safeJson(meta, {})
+  );
+  return {
+    ok: true,
+    receipt_id: receiptId,
+    allowed,
+    status,
+    runtime_name: runtime,
+    agent_name: agent,
+    preflight_status: preflightStatus,
+    preflight_action_id: preflight && preflight.preflight_action_id || null,
+    evidence_required: evidenceRequired,
+    blockers,
+    warnings: capCheck.warnings || [],
+    capability_check: capCheck,
+    hint: allowed ? "Toolrun may proceed. Finish this receipt with mem_runtime_tool_receipt_finish." : "Do not execute the toolrun. Resolve blockers or request approval/claim access."
+  };
+}
+
+function runtimeToolReceiptFinish(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const receiptId = String(input.receipt_id || "").trim();
+  if (!receiptId) return { error: "receipt_id required" };
+  const row = db.prepare("SELECT * FROM runtime_tool_receipt WHERE receipt_id=?").get(receiptId);
+  if (!row) return { error: "receipt_not_found", receipt_id: receiptId };
+  const status = String(input.status || "done").toLowerCase();
+  if (!["done", "failed", "blocked", "cancelled", "skipped"].includes(status)) return { error: "invalid_status", allowed: ["done", "failed", "blocked", "cancelled", "skipped"] };
+  if (status === "done" && !row.allowed) {
+    return {
+      error: "receipt_not_allowed",
+      receipt_id: receiptId,
+      hint: "A blocked receipt cannot be completed as done. Resolve the gate and open a new allowed receipt."
+    };
+  }
+  const evidence = Array.isArray(input.evidence) ? input.evidence : [];
+  if (status === "done" && !!row.evidence_required && !evidence.length && !input.handoff_id) {
+    return {
+      error: "evidence_required",
+      receipt_id: receiptId,
+      hint: "Pass evidence=[{target|url|file_path|server|screenshot_path, test_step, result, timestamp}] or link a handoff_id that contains evidence."
+    };
+  }
+  const shapedEvidence = evidence.map((item) => Object.assign({}, item, { timestamp: item && item.timestamp || nowIso() }));
+  const resultSummary = compactContent(input.result_summary || input.summary || input.result || input.error || status, 1200);
+  const meta = Object.assign(parseJsonField(row.meta_json, {}), input.meta || {}, {
+    handoff_id: input.handoff_id || null,
+    output_ref: input.output_ref || null,
+  });
+  db.prepare(
+    "UPDATE runtime_tool_receipt SET status=?, evidence_json=?, result_summary=?, result_json=?, error=?, meta_json=?, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE receipt_id=?"
+  ).run(
+    status,
+    safeJson(shapedEvidence, []),
+    resultSummary || null,
+    safeJson(input.result_json != null ? input.result_json : input.result, {}),
+    input.error || null,
+    safeJson(meta, {}),
+    receiptId
+  );
+  return { ok: true, receipt_id: receiptId, status, evidence_count: shapedEvidence.length, handoff_id: input.handoff_id || null };
+}
+
+function rowToReceipt(row) {
+  return row ? Object.assign({}, row, {
+    allowed: !!row.allowed,
+    evidence_required: !!row.evidence_required,
+    preflight: parseJsonField(row.preflight_json, {}),
+    capability_check: parseJsonField(row.capability_check_json, {}),
+    claim_ids: parseJsonField(row.claim_ids_json, []),
+    approval_ids: parseJsonField(row.approval_ids_json, []),
+    resources: parseJsonField(row.resources_json, {}),
+    tools_used: parseJsonField(row.tools_json, []),
+    evidence: parseJsonField(row.evidence_json, []),
+    result: parseJsonField(row.result_json, {}),
+    meta: parseJsonField(row.meta_json, {}),
+  }) : null;
+}
+
+function runtimeToolReceiptList(db, input = {}) {
+  ensureRuntimeGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.runtime_name) { where.push("runtime_name=?"); params.push(normalizeRuntimeName(input.runtime_name)); }
+  if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.project) { where.push("project=?"); params.push(input.project); }
+  if (input.status) { where.push("status=?"); params.push(input.status); }
+  if (input.session_key) { where.push("session_key=?"); params.push(input.session_key); }
+  if (input.tool_name) { where.push("tool_name=?"); params.push(input.tool_name); }
+  params.push(Math.min(Math.max(parseInt(input.limit || 100, 10) || 100, 1), 500));
+  const rows = db.prepare("SELECT * FROM runtime_tool_receipt WHERE " + where.join(" AND ") + " ORDER BY started_at DESC LIMIT ?").all(...params).map(rowToReceipt);
+  return { ok: true, count: rows.length, receipts: rows };
+}
+
+const RUNTIME_GOVERNANCE_TOOL_DEFS = {
+  mem_runtime_binding_upsert: {
+    description: "Register or update an external runtime/session/channel binding so OpenClaw-like gateways map to one Mnemo agent, project, connector, and capability set.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, binding_key: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, session_key: { type: "string" }, channel: { type: "string" }, account_id: { type: "string" }, peer_kind: { type: "string" }, peer_id: { type: "string" }, workspace: { type: "string" }, mode: { type: "string" }, connector_system: { type: "string" }, capabilities: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, status: { type: "string" }, source_ref: { type: "string" }, meta: { type: "object" }, updated_by: { type: "string" } }, required: ["runtime_name"] }
+  },
+  mem_runtime_binding_list: {
+    description: "List external runtime/session/channel bindings.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, session_key: { type: "string" }, channel: { type: "string" }, status: { type: "string" }, limit: { type: "integer" } } }
+  },
+  mem_runtime_capability_upsert: {
+    description: "Register a runtime, channel, or tool capability with allow/deny, agent allowlist, risk class, and receipt/preflight requirements.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, capability_ref: { type: "string" }, capability_kind: { type: "string" }, capability_key: { type: "string" }, tool_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, permission: { type: "string" }, risk_class: { type: "string" }, requires_preflight: { type: "boolean" }, requires_receipt: { type: "boolean" }, enabled: { type: "boolean" }, allowed_agents: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, status: { type: "string" }, notes: { type: "string" }, source_ref: { type: "string" }, meta: { type: "object" }, updated_by: { type: "string" } }, required: ["runtime_name"] }
+  },
+  mem_runtime_capability_list: {
+    description: "List runtime/channel/tool capabilities and their preflight/receipt requirements.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, capability_kind: { type: "string" }, capability_key: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, status: { type: "string" }, limit: { type: "integer" } } }
+  },
+  mem_runtime_capability_check: {
+    description: "Check whether an external runtime tool/capability is allowed for an agent before execution.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, tool_name: { type: "string" }, tool_kind: { type: "string" }, capabilities: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, require_registered_capability: { type: "boolean" } }, required: ["runtime_name", "agent_name"] }
+  },
+  mem_runtime_tool_receipt_start: {
+    description: "Open a Mnemo receipt for an external runtime toolrun. This must run before OpenClaw-like tool execution and stores the preflight result, capability gate, claims, approvals, resources, and receipt id.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, task: { type: "string" }, summary: { type: "string" }, action_type: { type: "string" }, tool_name: { type: "string" }, tool_kind: { type: "string" }, session_key: { type: "string" }, channel: { type: "string" }, request_id: { type: "string" }, binding_id: { type: "integer" }, connector_system: { type: "string" }, files: { type: "array", items: { type: "string" } }, urls: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, domains: { type: "array", items: { type: "string" } }, system_names: { type: "array", items: { type: "string" } }, resources: { type: "array", items: { type: "object" } }, capabilities: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, claim_ids: { type: "array", items: { type: "string" } }, approval_ids: { type: "array", items: { type: "string" } }, evidence_required: { type: "boolean" }, preflight_required: { type: "boolean" }, require_registered_capability: { type: "boolean" }, payload: { type: "object" }, meta: { type: "object" } }, required: ["runtime_name", "agent_name", "tool_name"] }
+  },
+  mem_runtime_tool_receipt_finish: {
+    description: "Finish an external runtime toolrun receipt with result, error, evidence, output reference, and optional handoff link.",
+    inputSchema: { type: "object", properties: { receipt_id: { type: "string" }, status: { type: "string" }, result_summary: { type: "string" }, summary: { type: "string" }, result: {}, result_json: { type: "object" }, error: { type: "string" }, evidence: { type: "array", items: { type: "object" } }, output_ref: { type: "string" }, handoff_id: { type: "integer" }, meta: { type: "object" } }, required: ["receipt_id"] }
+  },
+  mem_runtime_tool_receipt_list: {
+    description: "List external runtime tool receipts with preflight, capability, evidence, and result state.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, status: { type: "string" }, session_key: { type: "string" }, tool_name: { type: "string" }, limit: { type: "integer" } } }
+  }
+};
+
+function handleRuntimeGovernanceTool(db, name, input = {}) {
+  if (name === "mem_runtime_binding_upsert") return { handled: true, result: bindingUpsert(db, input || {}) };
+  if (name === "mem_runtime_binding_list") return { handled: true, result: bindingList(db, input || {}) };
+  if (name === "mem_runtime_capability_upsert") return { handled: true, result: capabilityUpsert(db, input || {}) };
+  if (name === "mem_runtime_capability_list") return { handled: true, result: capabilityList(db, input || {}) };
+  if (name === "mem_runtime_capability_check") return { handled: true, result: runtimeCapabilityCheck(db, input || {}) };
+  if (name === "mem_runtime_tool_receipt_start") return { handled: true, result: runtimeToolReceiptStart(db, input || {}) };
+  if (name === "mem_runtime_tool_receipt_finish") return { handled: true, result: runtimeToolReceiptFinish(db, input || {}) };
+  if (name === "mem_runtime_tool_receipt_list") return { handled: true, result: runtimeToolReceiptList(db, input || {}) };
+  return { handled: false };
+}
+
+module.exports = {
+  RUNTIME_GOVERNANCE_TOOL_DEFS,
+  ensureRuntimeGovernanceSchema,
+  handleRuntimeGovernanceTool,
+  runtimeToolReceiptStart,
+  runtimeToolReceiptFinish,
+  runtimeCapabilityCheck,
+};

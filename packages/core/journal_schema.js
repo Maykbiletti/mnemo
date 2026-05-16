@@ -7,6 +7,7 @@
  */
 
 const { ensureTeamQualityTables } = require("./team_quality_ops");
+const { ensureRuntimeGovernanceSchema } = require("./runtime_governance");
 
 function ensureUniversalJournalSchema(db) {
   db.exec(`
@@ -554,6 +555,7 @@ CREATE INDEX IF NOT EXISTS idx_handoff_agent_project ON session_handoff(agent_na
     db.exec("CREATE INDEX IF NOT EXISTS idx_media_canonical ON media_asset(canonical_name)");
   } catch {}
   ensureTeamQualityTables(db);
+  ensureRuntimeGovernanceSchema(db);
 }
 
 module.exports = { ensureUniversalJournalSchema, ensureProjectRegistryTable, ensureFirmOpsTables };

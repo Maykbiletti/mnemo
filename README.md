@@ -80,6 +80,11 @@ can prove what changed, who did it, or which project gates are still open.
   claim-access grants/transfers, and audit logs. `mem_agent_preflight` now blocks
   write/deploy work on managed resources unless the agent is owner, has ACL, or
   has approval.
+- **External Runtime Governance.** OpenClaw-like gateways can register runtime
+  bindings, channel/tool capabilities, and per-tool receipts through
+  `mem_runtime_binding_upsert`, `mem_runtime_capability_upsert`, and
+  `mem_runtime_tool_receipt_start/finish`. Mnemo remains the source of truth for
+  identity, preflight, claims, approvals, and evidence.
 - **Protected Scope Gates.** `mem_protected_scope_check` protects auth, billing,
   production infra, final artifacts, shared portal design, translations, chat
   runtime, and Mnemo coordination surfaces. Owner approval and active claims are
@@ -169,6 +174,9 @@ Mnemo's hard organization layer models work like a company:
   grants, and transfers.
 - `protected_scope_rule`: high-risk or shared surfaces that require owner/claim
   gates before edits.
+- `runtime_binding`, `runtime_capability`, and `runtime_tool_receipt`: external
+  runtime/session/channel mappings plus toolrun receipts that link preflight,
+  claims, approvals, and evidence.
 
 Useful calls:
 
@@ -177,11 +185,13 @@ mem_resource_upsert({project:"account", resource_kind:"file", resource_key:"pack
 mem_resource_acl_grant({project:"account", resource_kind:"file", resource_key:"packages/account/auth.js", agent_name:"otto", permission:"write", granted_by:"alfred", reason:"handoff"})
 mem_approval_request({project:"account", resource_kind:"route", resource_key:"/auth/google/callback", requester_agent:"otto", permission:"write", reason:"chat login crossover"})
 mem_claim_request_access({claim_id:17, requester_agent:"alfred", reason:"auth crossover repair"})
+mem_runtime_tool_receipt_start({runtime_name:"openclaw", agent_name:"alfred", project:"chat", task:"check settings popup", tool_name:"browser.click", urls:["https://chat.example"]})
 mem_resource_audit_list({project:"account"})
 ```
 
-See [`docs/agent-company-organization.md`](docs/agent-company-organization.md)
-and [`docs/protected-scope-gates.md`](docs/protected-scope-gates.md).
+See [`docs/agent-company-organization.md`](docs/agent-company-organization.md),
+[`docs/protected-scope-gates.md`](docs/protected-scope-gates.md), and
+[`docs/external-runtime-governance.md`](docs/external-runtime-governance.md).
 
 ## Start An Agent Loop
 
@@ -287,6 +297,7 @@ The repo includes `packages/core/facts/example.json` and
 - [`docs/deployment.md`](docs/deployment.md) - server, PM2, env, proxy
 - [`docs/hub-operations.md`](docs/hub-operations.md) - hub routes, memory frontdoor, ops hardening
 - [`docs/agent-operating-dna.md`](docs/agent-operating-dna.md) - where agents read and store operational truth
+- [`docs/external-runtime-governance.md`](docs/external-runtime-governance.md) - OpenClaw-style runtime bindings and tool receipts
 - [`docs/mcp-tools.md`](docs/mcp-tools.md) - tool surface
 - [`docs/universal-capture.md`](docs/universal-capture.md) - capture and backfill
 - [`docs/public-release-hygiene.md`](docs/public-release-hygiene.md) - keeping private data out of the public repo

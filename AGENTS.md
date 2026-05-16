@@ -115,6 +115,15 @@ Correct conflict flow:
 Every grant, denial, transfer, approval, and resource owner change must be in
 Mnemo. Use `mem_resource_audit_list` to reconstruct what happened.
 
+External runtimes such as OpenClaw, browser runners, Telegram bridges, or
+custom tool gateways are not a second authority. Register their session/channel
+mapping with `mem_runtime_binding_upsert`, register tool/channel permissions
+with `mem_runtime_capability_upsert`, and open
+`mem_runtime_tool_receipt_start` before the runtime executes a tool. If the
+receipt returns `allowed:false`, do not execute the tool. Finish the receipt
+with `mem_runtime_tool_receipt_finish` and evidence, then write the normal
+handoff for the completed work.
+
 ## Autonomous Backlog Routing
 
 Agents do not wait for the owner to notice open work. When an inbox is empty,

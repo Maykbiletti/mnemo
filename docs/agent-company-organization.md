@@ -167,6 +167,39 @@ Blocked means stop. The correct next action is one of:
 - ask the claim owner for `mem_claim_transfer`
 - hand off the task
 
+## External Runtimes
+
+OpenClaw-style runtimes should not carry their own truth about who may do what.
+They register bindings and capabilities in Mnemo, then open a receipt before
+each toolrun.
+
+```text
+mem_runtime_binding_upsert({
+  runtime_name:"openclaw",
+  agent_name:"alfred",
+  project:"chat",
+  session_key:"openclaw:telegram:-1001:alfred",
+  channel:"telegram",
+  connector_system:"telegram"
+})
+
+mem_runtime_tool_receipt_start({
+  runtime_name:"openclaw",
+  agent_name:"alfred",
+  project:"chat",
+  task:"Check settings popup",
+  action_type:"code_edit",
+  tool_name:"browser.click",
+  urls:["https://chat.example"]
+})
+```
+
+The receipt links the external action to Mnemo preflight, resource gates,
+claims, approvals, capability checks, and evidence. If the receipt says
+`allowed:false`, the external runtime must not execute the tool.
+
+See [`external-runtime-governance.md`](external-runtime-governance.md).
+
 ## Completion Contract
 
 Finished work must include:

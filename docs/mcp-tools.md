@@ -164,6 +164,73 @@ runtime preflight state reported by each loop. Invalid registry rows such as
 blank names or path-shaped names are excluded from the agent totals and counted
 as `summary.invalid_registry_rows`; pass `include_invalid: true` to inspect them.
 
+### External runtime governance
+
+Use these tools when a gateway such as OpenClaw, CodexLink, a browser runtime,
+or another local agent runner executes work on behalf of a Mnemo agent.
+
+`mem_runtime_binding_upsert/list` maps external sessions and channels to one
+Mnemo agent/project/connector:
+
+```ts
+mem_runtime_binding_upsert({
+  runtime_name: "openclaw",
+  agent_name: "agent-a",
+  project: "example-project",
+  session_key: "openclaw:telegram:-1001:agent-a",
+  channel: "telegram",
+  connector_system: "telegram",
+  capabilities: ["browser", "toolrun"]
+})
+```
+
+`mem_runtime_capability_upsert/list/check` registers channel and tool
+capabilities with allow/deny, agent allowlists, and preflight/receipt
+requirements:
+
+```ts
+mem_runtime_capability_upsert({
+  runtime_name: "openclaw",
+  capability_kind: "tool",
+  capability_key: "browser.click",
+  allowed_agents: ["agent-a"],
+  requires_preflight: true,
+  requires_receipt: true
+})
+```
+
+`mem_runtime_tool_receipt_start` opens a receipt before execution. It calls
+`mem_agent_preflight` by default and stores the preflight action id, capability
+gate, resources, claims, approvals, and whether evidence is required.
+
+```ts
+mem_runtime_tool_receipt_start({
+  runtime_name: "openclaw",
+  agent_name: "agent-a",
+  project: "example-project",
+  task: "check settings popup",
+  action_type: "code_edit",
+  tool_name: "browser.click",
+  urls: ["https://app.example.com"],
+  files: ["public/index.html"]
+})
+```
+
+If the response has `allowed:false`, the runtime must not execute the tool.
+Finish the same receipt after execution:
+
+```ts
+mem_runtime_tool_receipt_finish({
+  receipt_id: "rt-...",
+  status: "done",
+  result_summary: "Popup checked and fixed",
+  evidence: [{ url: "https://app.example.com", test_step: "open settings", result: "pass" }]
+})
+```
+
+Write/deploy/external-communication receipts require evidence before they can
+finish as `done`.
+
 ### `mem_agent_memory_health([agent_name, stale_minutes, window_minutes])`
 
 Mission Control status for memory usage. Shows, per agent, the latest
