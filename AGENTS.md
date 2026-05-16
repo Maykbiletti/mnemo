@@ -124,6 +124,30 @@ receipt returns `allowed:false`, do not execute the tool. Finish the receipt
 with `mem_runtime_tool_receipt_finish` and evidence, then write the normal
 handoff for the completed work.
 
+## Memory Consolidation And REM
+
+Mnemo has three reviewable memory layers in addition to raw capture and semantic
+recall:
+
+- Company Ledger: official truth such as decisions, claims, approvals, evidence,
+  incidents, handoffs, owner instructions, project rules, and resource owners.
+- Department Journal: daily department progress, blockers, risks, open
+  questions, dependencies, and foreign-scope requests.
+- Agent Sleep Notes: personal agent REM notes about lessons, uncertainty,
+  repeated errors, needed context, and improvement ideas.
+
+Department journals and sleep notes are not official truth. They are raw
+material for REM. Use `mem_memory_rem_plan` to see due phases and
+`mem_memory_rem_run` to produce draft consolidation runs. If a REM finding
+should become durable truth, create a review item with
+`mem_memory_promotion_propose`; a coordinator or owner must explicitly call
+`mem_memory_promotion_decide` before it is approved or promoted.
+
+Use `mem_company_rem_brief` for the morning management view. It aggregates
+department journals, sleep notes, pending promotion proposals, active claims,
+pending approvals, and REM status. This brief guides decisions; it does not
+change truth by itself.
+
 ## Autonomous Backlog Routing
 
 Agents do not wait for the owner to notice open work. When an inbox is empty,

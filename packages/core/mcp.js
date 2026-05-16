@@ -39,6 +39,7 @@ const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool }
 const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool, runtimeToolReceiptStart } = require("./runtime_governance");
+const { MEMORY_CONSOLIDATION_TOOL_DEFS, ensureMemoryConsolidationSchema, handleMemoryConsolidationTool } = require("./memory_consolidation");
 
 const readline = require("readline");
 
@@ -97,6 +98,18 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_runtime_tool_receipt_start",
   "mem_runtime_tool_receipt_finish",
   "mem_runtime_tool_receipt_list",
+  "mem_memory_layer_status",
+  "mem_memory_rem_plan",
+  "mem_memory_rem_run",
+  "mem_memory_consolidation_list",
+  "mem_department_journal_add",
+  "mem_department_journal_list",
+  "mem_agent_sleep_note_add",
+  "mem_agent_sleep_note_list",
+  "mem_memory_promotion_propose",
+  "mem_memory_promotion_list",
+  "mem_memory_promotion_decide",
+  "mem_company_rem_brief",
   "mem_media_capture",
   "mem_media_recent",
   "mem_media_search",
@@ -192,6 +205,7 @@ ensureProtectedScopeSchema(db);
 seedDefaultProtectedScopes(db);
 ensureResourceAccessSchema(db);
 ensureRuntimeGovernanceSchema(db);
+ensureMemoryConsolidationSchema(db);
 
 function ensureReminderTables() {
   db.exec(`
@@ -8574,6 +8588,16 @@ for (const [name, def] of Object.entries(RUNTIME_GOVERNANCE_TOOL_DEFS)) {
       }
       const handled = handleRuntimeGovernanceTool(db, name, input);
       if (!handled.handled) throw new Error("unknown runtime governance tool: " + name);
+      return handled.result;
+    },
+  });
+}
+
+for (const [name, def] of Object.entries(MEMORY_CONSOLIDATION_TOOL_DEFS)) {
+  tools[name] = Object.assign({}, def, {
+    handler: async (args) => {
+      const handled = handleMemoryConsolidationTool(db, name, args || {});
+      if (!handled.handled) throw new Error("unknown memory consolidation tool: " + name);
       return handled.result;
     },
   });

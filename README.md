@@ -85,6 +85,12 @@ can prove what changed, who did it, or which project gates are still open.
   `mem_runtime_binding_upsert`, `mem_runtime_capability_upsert`, and
   `mem_runtime_tool_receipt_start/finish`. Mnemo remains the source of truth for
   identity, preflight, claims, approvals, and evidence.
+- **Memory Consolidation And REM.** OpenClaw-style daily/REM memory is now
+  represented inside Mnemo with `mem_memory_layer_status`,
+  `mem_memory_rem_plan/run`, `mem_department_journal_add`,
+  `mem_agent_sleep_note_add`, `mem_memory_promotion_propose/decide`, and
+  `mem_company_rem_brief`. REM produces reviewable proposals; it does not
+  silently rewrite company truth.
 - **Protected Scope Gates.** `mem_protected_scope_check` protects auth, billing,
   production infra, final artifacts, shared portal design, translations, chat
   runtime, and Mnemo coordination surfaces. Owner approval and active claims are
@@ -177,6 +183,13 @@ Mnemo's hard organization layer models work like a company:
 - `runtime_binding`, `runtime_capability`, and `runtime_tool_receipt`: external
   runtime/session/channel mappings plus toolrun receipts that link preflight,
   claims, approvals, and evidence.
+- `department_journal`, `agent_sleep_note`, `memory_consolidation_run`, and
+  `memory_promotion_proposal`: REM memory layers for department diaries,
+  personal agent sleep notes, draft consolidation, and explicit promotion
+  review.
+
+See [`docs/memory-consolidation.md`](docs/memory-consolidation.md) for the
+Company Ledger / Department Journal / Agent Sleep Notes model.
 
 Useful calls:
 

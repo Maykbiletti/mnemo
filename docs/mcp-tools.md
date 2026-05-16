@@ -528,6 +528,52 @@ labels, header/footer host leaks, CTA links, and CTA target status. Use
 
 Run reflection cycle for a date — counts corrections/praises in messages, generates a summary, writes `daily_reflection` row. Default date: today.
 
+### `mem_memory_layer_status({ project?, agent_name?, days? })`
+
+Shows the canonical Mnemo memory layers: company ledger, department journal,
+agent sleep notes, session layer, daily layer, long-term layer, recall layer,
+and REM layer. Use before adding any OpenClaw-like memory path so no second
+truth appears outside Mnemo.
+
+### `mem_memory_rem_plan({ project?, agent_name?, days?, date? })`
+
+Returns due consolidation phases and exact next tool calls. The phases are
+`light`, `daily`, `deep`, and `rem`. This tool is read-only.
+
+### `mem_memory_rem_run({ phase, project?, agent_name?, days?, date? })`
+
+Runs deterministic draft consolidation. It writes a
+`memory_consolidation_run` row and, by default, a semantic
+`memory_consolidation` memory row with selected source refs. It never deletes or
+rewrites old facts. Concrete truth still needs promotion or the dedicated
+project/access/rules APIs.
+
+### `mem_department_journal_add/list`
+
+Department diary for progress, blockers, risks, open questions, dependencies,
+and foreign-scope requests. Journal rows explain work history but do not become
+official truth until promoted.
+
+### `mem_agent_sleep_note_add/list`
+
+Personal REM notes per agent: lessons, uncertainty, repeated errors, needed
+context, and improvement ideas. These notes must not be treated as policy or
+project truth by themselves.
+
+### `mem_memory_promotion_propose/list/decide`
+
+Review queue for REM findings that may become official truth. Proposal kinds:
+`decision`, `rule`, `project_memory`, `risk`, `owner_question`, `scar`, and
+`runbook`. `decide` requires reviewer attribution and can approve, reject, or
+promote.
+
+### `mem_company_rem_brief({ project?, days?, write_brief?, coordinator_agent? })`
+
+Generates a coordinator morning brief from department journals, sleep notes,
+pending promotion proposals, active/stale claims, pending approvals, and REM
+state. With `write_brief:true`, it writes the brief to the coordinator's Mnemo
+brief inbox.
+
 ### `mem_access_preflight({ system_name?, project?, access_kind?, intended_command?, intended_entrypoint?, agent_name? })`
 
 Mandatory gate before touching SSH, dashboards, APIs, databases, providers, or

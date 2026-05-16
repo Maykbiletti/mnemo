@@ -44,7 +44,7 @@
     "embed": "node embedding_writer.js",
     "loops": "node loop_scanner_v2.js",
     "export": "node export_declarative.js",
-    "test": "node test_shared_utils.js && node test_http_utils.js && node test_brief_coordination.js && node test_access_routes.js && node test_protected_scope_gate.js && node test_resource_access_control.js && node test_runtime_governance.js && node test_semantic.js",
+    "test": "node test_shared_utils.js && node test_http_utils.js && node test_brief_coordination.js && node test_access_routes.js && node test_protected_scope_gate.js && node test_resource_access_control.js && node test_runtime_governance.js && node test_memory_consolidation.js && node test_semantic.js",
     "test:integration": "node test_universal_capture.js"
   },
   "dependencies": {
