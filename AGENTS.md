@@ -173,7 +173,9 @@ proper Mnemo promotion, decision, project-rule, access, or connector tools.
 
 `mem_work_order_complete` with `status:"done"` requires concrete evidence:
 command/test/check/file/url plus result/status/exit_code. `handoff_id` alone is
-not done. Use `needs_review` or `blocked` when verification is missing.
+not done. For `done`, evidence must pass: command `exit_code` is `0` and
+result/status does not say fail/error/blocked/incomplete. Use `needs_review` or
+`blocked` when verification is missing or failing.
 
 Department charters define standing responsibilities and boundaries with
 `mem_department_charter_set`, but they do not bypass risky-action tokens.

@@ -515,6 +515,21 @@ function validateEvidenceItem(item, index) {
   return null;
 }
 
+function nonPassEvidenceReason(item, index) {
+  const exitCode = item && (item.exit_code != null ? item.exit_code : item.exitCode);
+  if (exitCode != null) {
+    const n = Number(exitCode);
+    if (!Number.isFinite(n) || n !== 0) {
+      return "evidence[" + index + "] exit_code must be 0 for done";
+    }
+  }
+  const outcome = normalizeEvidenceText([item && item.result, item && item.status].filter(Boolean).join(" "));
+  if (outcome && /\b(fail|failed|failure|error|errored|exception|blocked|block|needs review|needs_review|incomplete|missing|skipped|cancelled|canceled|timeout|timed out|red|not ok|nok)\b/.test(outcome)) {
+    return "evidence[" + index + "] outcome is not passing for done";
+  }
+  return null;
+}
+
 function validateWorkOrderCompletionEvidence(order, input = {}, evidence = []) {
   const status = String(input.status || "done").toLowerCase();
   if (status !== "done") {
@@ -541,6 +556,18 @@ function validateWorkOrderCompletionEvidence(order, input = {}, evidence = []) {
       invalid,
       required_evidence: order.required_evidence || [],
       hint: "Evidence must include concrete checks with result/status/exit_code and relevant command/file/url/artifact references.",
+    };
+  }
+  const failing = evidence.map(nonPassEvidenceReason).filter(Boolean);
+  if (failing.length) {
+    return {
+      ok: false,
+      error: "evidence_not_passing",
+      status,
+      missing_required: [],
+      invalid: failing,
+      required_evidence: order.required_evidence || [],
+      hint: "done requires passing evidence. Use status needs_review or blocked for failed checks, non-zero exit codes, or incomplete verification.",
     };
   }
   const missing = (order.required_evidence || []).filter((requirement) => !evidence.some((item) => evidenceMatchesRequirement(item, requirement)));

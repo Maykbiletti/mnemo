@@ -187,10 +187,25 @@ let workOrderId;
   assert.strictEqual(missingRequired.error, "evidence_missing_required");
   assert.deepStrictEqual(missingRequired.missing_required, ["unit tests"]);
 
+  const failingExit = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    completion_summary: "done",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 1, result: "pass" }],
+  });
+  assert.strictEqual(failingExit.error, "evidence_not_passing");
+
+  const failingResult = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    completion_summary: "done",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "failed" }],
+  });
+  assert.strictEqual(failingResult.error, "evidence_not_passing");
+
   const needsReview = tool("mem_work_order_complete", {
     work_order_id: workOrderId,
     status: "needs_review",
     completion_summary: "patched but not verified",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 1, result: "failed" }],
   });
   assert.strictEqual(needsReview.ok, true);
   assert.strictEqual(needsReview.work_order.status, "needs_review");

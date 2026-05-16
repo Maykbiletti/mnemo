@@ -583,8 +583,11 @@ concrete evidence. Evidence must include an outcome (`result`, `status`, or
 `exit_code`) plus a real check or target (`command`, `test_step`, `check`,
 `file_path`, `url`, `files`, `urls`, `output_ref`, or `receipt_id`). Command
 evidence must include `exit_code`. If required evidence is listed, every item
-must be explicitly covered. Without verification, use `status:"needs_review"` or
-`status:"blocked"` instead of `done`.
+must be explicitly covered. For `done`, evidence must be passing: `exit_code`
+must be `0`, and `result`/`status` must not indicate fail, error, blocked,
+incomplete, skipped, missing, timeout, cancelled, or needs review. Without
+verification, use `status:"needs_review"` or `status:"blocked"` instead of
+`done`.
 
 ### `mem_capability_token_issue/check/revoke`
 

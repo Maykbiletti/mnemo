@@ -56,6 +56,11 @@ Evidence objects must be concrete. They need an outcome field such as `result`,
 `test_step`, `check`, `file_path`, `url`, `files`, `urls`, `output_ref`, or
 `receipt_id`. Command evidence must include `exit_code`.
 
+For `done`, evidence must be passing. `exit_code` must be `0`, and `result` or
+`status` must not say fail, error, blocked, incomplete, skipped, missing,
+timeout, cancelled, or needs review. Failed checks are useful evidence, but they
+belong to `needs_review` or `blocked`, not `done`.
+
 When `required_evidence` is set, each required item must be explicitly covered
 by at least one evidence object. Use `check`, `name`, or `label` to make the
 match deterministic.
@@ -78,6 +83,10 @@ Not done:
 
 ```json
 {"status":"blocked","completion_summary":"VAT key missing; cannot verify billing checkout."}
+```
+
+```json
+{"status":"needs_review","completion_summary":"Tests still fail.","evidence":[{"check":"unit tests","command":"npm test","exit_code":1,"result":"failed"}]}
 ```
 
 ## Department Charters
