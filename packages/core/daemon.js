@@ -7610,6 +7610,16 @@ const DREAMMODE_MINUTE = parseInt(process.env.MNEMO_DREAMMODE_MINUTE || "15", 10
 const DREAMMODE_COORDINATOR = process.env.MNEMO_DREAMMODE_COORDINATOR || "dieter";
 const DREAMMODE_WRITE_BRIEF = process.env.MNEMO_DREAMMODE_WRITE_BRIEF !== "0";
 
+function scheduleDreammodeInterval(fn, ms) {
+  if (!DREAMMODE_ENABLED) return null;
+  return setInterval(fn, ms);
+}
+
+function scheduleDreammodeTimeout(fn, ms) {
+  if (!DREAMMODE_ENABLED) return null;
+  return setTimeout(fn, ms);
+}
+
 function dreammodeLocalNow() {
   return new Date(Date.now() + TZ_OFFSET_HOURS * 3600 * 1000);
 }
@@ -7744,8 +7754,8 @@ function healthSweep() {
 
 scheduleBackgroundInterval(healthSweep, 5 * 60 * 1000);
 scheduleBackgroundInterval(maybeRunDailyReflection, 60 * 1000);
-scheduleBackgroundInterval(dreammodeCycle, 60 * 1000);
-scheduleBackgroundTimeout(dreammodeCycle, 20 * 1000);
+scheduleDreammodeInterval(dreammodeCycle, 60 * 1000);
+scheduleDreammodeTimeout(dreammodeCycle, 20 * 1000);
 
 // #9 TTL job + #10 action-log rollup
 const BRIEF_TTL_HOURS = parseInt(process.env.BRIEF_TTL_HOURS || "168", 10);
