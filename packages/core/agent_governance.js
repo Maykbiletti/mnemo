@@ -1986,12 +1986,31 @@ function insertProjectTaskIngest(db, values) {
   );
 }
 
+function markAgentBriefStatus(db, briefId, status, outcome) {
+  const clean = textOrNull(status, 80);
+  if (!clean || !briefId) return;
+  try {
+    const cols = db.prepare("PRAGMA table_info(agent_brief)").all().map((col) => col.name);
+    if (cols.includes("done_at") && ["done", "failed"].includes(clean)) {
+      if (cols.includes("outcome")) {
+        db.prepare("UPDATE agent_brief SET status=?, done_at=?, outcome=COALESCE(outcome, ?) WHERE id=?")
+          .run(clean, nowIso(), outcome || "Converted to project task.", briefId);
+      } else {
+        db.prepare("UPDATE agent_brief SET status=?, done_at=? WHERE id=?").run(clean, nowIso(), briefId);
+      }
+    } else {
+      db.prepare("UPDATE agent_brief SET status=? WHERE id=?").run(clean, briefId);
+    }
+  } catch {}
+}
+
 function ingestOneBriefAsTask(db, row, input = {}) {
   const scope = scopeName(input.scope);
   const sourceId = String(row.id);
   const existingSource = db.prepare("SELECT * FROM project_task_ingest WHERE scope=? AND source_kind='agent_brief' AND source_id=?").get(scope, sourceId);
   if (existingSource) {
     const task = db.prepare("SELECT * FROM project_task WHERE id=?").get(existingSource.task_id);
+    if (input.mark_brief_status) markAgentBriefStatus(db, row.id, input.mark_brief_status, "Already converted to project task #" + existingSource.task_id + ".");
     return { action: "source_existing", brief_id: row.id, task: rowToProjectTask(task), task_id: existingSource.task_id };
   }
 
@@ -2044,9 +2063,7 @@ function ingestOneBriefAsTask(db, row, input = {}) {
     meta: { dedupe_basis: dedupe.basis, linked_from_agent_brief: row.id },
   });
   if (input.mark_brief_status) {
-    try {
-      db.prepare("UPDATE agent_brief SET status=? WHERE id=?").run(String(input.mark_brief_status), row.id);
-    } catch {}
+    markAgentBriefStatus(db, row.id, input.mark_brief_status, "Converted to project task #" + task.id + ".");
   }
   return { action, brief_id: row.id, dedupe_key: dedupe.key, task };
 }

@@ -476,8 +476,9 @@ Generated Wizard2 output has too many header nav items and overflows the viewpor
   assert.strictEqual(duplicateIngest.linked, 1);
   assert.strictEqual(duplicateIngest.results[0].task.id, ingest.results[0].task.id);
 
-  const repeatedIngest = tool("mem_brief_task_ingest", { brief_id: firstBrief, default_project: "apps.blun.ai" });
+  const repeatedIngest = tool("mem_brief_task_ingest", { brief_id: firstBrief, default_project: "apps.blun.ai", mark_brief_status: "done" });
   assert.strictEqual(repeatedIngest.results[0].action, "source_existing");
+  assert.strictEqual(db.prepare("SELECT status FROM agent_brief WHERE id=?").get(firstBrief).status, "done");
 
   const board = tool("mem_project_board", { project: "apps.blun.ai" });
   assert.strictEqual(board.ok, true);
@@ -489,7 +490,7 @@ Generated Wizard2 output has too many header nav items and overflows the viewpor
   assert(board.tasks_by_status.open.some((task) => task.id === ingest.results[0].task.id));
   assert(!board.pending_briefs.some((brief) => brief.id === firstBrief || brief.id === duplicateBrief));
   const boardWithBriefs = tool("mem_project_board", { project: "apps.blun.ai", include_ingested_briefs: true });
-  assert(boardWithBriefs.pending_briefs.some((brief) => brief.id === firstBrief));
+  assert(boardWithBriefs.pending_briefs.some((brief) => brief.id === duplicateBrief));
   assert.strictEqual(board.channel_rule, "Telegram coordinates; Mnemo briefs assign durable work; Work Orders authorize execution; Company Ledger remains truth.");
 }
 
