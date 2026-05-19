@@ -574,6 +574,30 @@ pending promotion proposals, active/stale claims, pending approvals, and REM
 state. With `write_brief:true`, it writes the brief to the coordinator's Mnemo
 brief inbox.
 
+### `mem_work_order_template_list/upsert/create_from_template`
+
+Agent-neutral Work Order templates. These are contracts, not prompts, so Claude,
+GPT/Codex, OpenClaw, CodexLink, and future runtimes use the same shape through
+their adapters. Built-ins include `debug_investigation`, `browser_qa`,
+`ship_release`, `design_review`, `i18n_qa`, `wizard_surface_work`, and
+`context_checkpoint`. `create_from_template` merges the template defaults with
+the current objective/scope and can issue a capability token.
+
+### `mem_quality_gate_template_list/run`
+
+Agent-neutral completion gates for evidence checks. Built-ins include
+`code_change_gate`, `debug_gate`, `browser_qa_gate`, `release_gate`,
+`design_review_gate`, `i18n_gate`, `wizard_gate`, and `context_handoff_gate`.
+If `run` returns `status:"block"`, agents must not mark a Work Order done.
+
+### `mem_context_snapshot_create/restore_brief`
+
+Handoff and compaction-safe context snapshots. A snapshot stores project,
+agent/runtime, Work Order id, summary, decisions, remaining work, files, routes,
+URLs, branch, commit, and dirty state. `restore_brief` returns the latest
+snapshot as a concise resume brief. Restore briefs are context only; agents must
+still check current repo state and Mnemo gates before editing.
+
 ### `mem_work_order_create/list/complete`
 
 Structured work contracts. A Work Order stores objective, owner, department,

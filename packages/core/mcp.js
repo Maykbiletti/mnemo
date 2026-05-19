@@ -32,7 +32,7 @@ const { CONTEXT_PREVIEW_TOOL_DEFS, handleContextPreviewTool } = require("./conte
 const { LOOP_DOCTOR_TOOL_DEFS, handleLoopDoctorTool } = require("./loop_doctor_tools");
 const { TIMELINE_REPORT_TOOL_DEFS, handleTimelineReportTool } = require("./timeline_report_tools");
 const { memoryHealth } = require("./memory_health_tools");
-const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
+const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, wizardTargetGate, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
 const briefCoordination = require("./brief_coordination");
 const { AGENT_MAIL_TOOL_DEFS, ensureAgentMailTables, handleAgentMailTool } = require("./agent_mail");
 const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
@@ -111,6 +111,13 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_memory_promotion_list",
   "mem_memory_promotion_decide",
   "mem_company_rem_brief",
+  "mem_work_order_template_list",
+  "mem_work_order_template_upsert",
+  "mem_work_order_create_from_template",
+  "mem_quality_gate_template_list",
+  "mem_quality_gate_run",
+  "mem_context_snapshot_create",
+  "mem_context_restore_brief",
   "mem_work_order_create",
   "mem_work_order_list",
   "mem_work_order_complete",
@@ -7710,6 +7717,18 @@ ${args.first_invocation_outcome || "(none)"}
         const rules = await tools.mem_project_rules_get.handler({ project });
         checks.push({ name: "project_rules", result: rules.error ? "missing" : "ok" });
         if (rules.error && a.require_project_rules !== false) blockers.push("missing project rules for " + project);
+        if (!rules.error) {
+          const wizardGate = wizardTargetGate(a, rules);
+          if (wizardGate.required) {
+            checks.push({
+              name: "explicit_wizard_target",
+              result: wizardGate.status,
+              target: wizardGate.target || null,
+              reason: wizardGate.reason
+            });
+            if (wizardGate.status === "block") blockers.push("wizard target blocked: " + wizardGate.reason);
+          }
+        }
         if (authSensitiveTask(a)) {
           const authCheck = await tools.mem_auth_contract_check.handler({ project });
           checks.push({ name: "auth_contract", result: authCheck.status || (authCheck.ok ? "ok" : "block"), missing: authCheck.missing || [], mismatches: authCheck.mismatches || [] });

@@ -104,6 +104,29 @@ CREATE TABLE IF NOT EXISTS department_charter (
 );
 CREATE INDEX IF NOT EXISTS idx_department_charter_status ON department_charter(status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS work_order_template (
+  template_id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT 'default',
+  title TEXT NOT NULL,
+  description TEXT,
+  department_name TEXT,
+  risk_class TEXT NOT NULL DEFAULT 'normal',
+  action_type TEXT,
+  allowed_tools_json TEXT,
+  allowed_resources_json TEXT,
+  done_criteria_json TEXT,
+  required_evidence_json TEXT,
+  quality_gates_json TEXT,
+  runtime_contract_json TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  source TEXT NOT NULL DEFAULT 'custom',
+  meta_json TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_order_template_scope ON work_order_template(scope, status, template_id);
+
 CREATE TABLE IF NOT EXISTS work_order (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'default',
@@ -201,6 +224,50 @@ CREATE TABLE IF NOT EXISTS intent_route (
 CREATE INDEX IF NOT EXISTS idx_intent_route_agent ON intent_route(route_to_agent, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_intent_route_project ON intent_route(project, status, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS context_snapshot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  agent_name TEXT,
+  runtime_name TEXT,
+  work_order_id INTEGER,
+  title TEXT,
+  summary TEXT,
+  decisions_json TEXT,
+  remaining_work_json TEXT,
+  files_json TEXT,
+  routes_json TEXT,
+  urls_json TEXT,
+  branch TEXT,
+  commit_sha TEXT,
+  dirty INTEGER NOT NULL DEFAULT 0,
+  source_ref TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_context_snapshot_project ON context_snapshot(project, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_snapshot_agent ON context_snapshot(agent_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_snapshot_work_order ON context_snapshot(work_order_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS quality_gate_run (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  gate_id TEXT NOT NULL,
+  project TEXT,
+  work_order_id INTEGER,
+  agent_name TEXT,
+  status TEXT NOT NULL,
+  score INTEGER NOT NULL DEFAULT 0,
+  missing_json TEXT,
+  invalid_json TEXT,
+  evidence_json TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_quality_gate_run_project ON quality_gate_run(project, gate_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quality_gate_run_work_order ON quality_gate_run(work_order_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS autonomy_score_snapshot (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'default',
@@ -233,6 +300,18 @@ CREATE TRIGGER IF NOT EXISTS mnemo_journal_capability_audit_ai AFTER INSERT ON c
     (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
   VALUES
     ('capability_token_audit', NEW.project, 'internal', NEW.agent_name, 'capability_token_check', 'capability_token_audit', CAST(NEW.id AS TEXT), CASE WHEN NEW.granted=1 THEN 'granted' ELSE 'blocked' END, NEW.reason, NEW.action_payload_json, NEW.matched_scope_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_context_snapshot_ai AFTER INSERT ON context_snapshot BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('context_snapshot', NEW.project, 'internal', NEW.agent_name, 'context_snapshot_create', 'context_snapshot', CAST(NEW.id AS TEXT), NEW.status, COALESCE(NEW.title, NEW.summary, ''), NEW.remaining_work_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_quality_gate_run_ai AFTER INSERT ON quality_gate_run BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('quality_gate', NEW.project, 'internal', NEW.agent_name, 'quality_gate_run', 'quality_gate_run', CAST(NEW.id AS TEXT), NEW.status, NEW.gate_id, NEW.evidence_json, NEW.meta_json, NEW.created_at);
 END;
 `);
   } catch {}
@@ -381,6 +460,449 @@ function rowToToken(row) {
     budgets: parseJson(row.budgets_json, {}),
     meta: parseJson(row.meta_json, {}),
   }) : null;
+}
+
+const AGENT_NEUTRAL_RUNTIME_CONTRACT = Object.freeze({
+  contract_version: "mnemo-agent-neutral-v1",
+  agent_neutral: true,
+  rule: "All runtimes use the same Mnemo tools. Claude, GPT/Codex, OpenClaw, and other adapters translate their local tool names into this contract; Mnemo remains the authority.",
+  required_flow: [
+    "mem_session_start + mem_context_preview at session start",
+    "mem_work_order_create_from_template or mem_work_order_create before scoped work",
+    "mem_capability_token_check or mem_runtime_tool_receipt_start before risky non-read actions",
+    "mem_runtime_tool_receipt_finish after tool execution with concrete evidence",
+    "mem_context_snapshot_create before handoff, compaction, or long pause",
+    "mem_quality_gate_run and mem_work_order_complete before claiming done"
+  ],
+  low_risk_without_token: ["read", "inspect", "list"],
+  risky_requires_token: ["code_edit", "write", "delete", "deploy", "external_comm", "auth", "billing", "production"]
+});
+
+const BUILTIN_WORK_ORDER_TEMPLATES = [
+  {
+    template_id: "general_task",
+    title: "General scoped task",
+    description: "Run a normal scoped task with explicit objective, owner, resources, and evidence.",
+    department_name: "general",
+    risk_class: "normal",
+    action_type: "write",
+    allowed_tools: ["read", "search", "apply_patch", "test"],
+    done_criteria: ["Scope stayed within the Work Order", "Changes or findings are summarized", "Evidence covers the requested outcome"],
+    required_evidence: ["diff reviewed or finding report", "verification result"],
+    quality_gates: ["code_change_gate"],
+  },
+  {
+    template_id: "debug_investigation",
+    title: "Debug investigation",
+    description: "Investigate root cause before fixing. No symptom patch without confirmed evidence.",
+    department_name: "engineering",
+    risk_class: "normal",
+    action_type: "code_edit",
+    allowed_tools: ["read", "search", "test", "apply_patch"],
+    done_criteria: ["Root cause is stated", "Reproduction or trace is documented", "Fix addresses the root cause", "Regression or verification check passes"],
+    required_evidence: ["root cause", "reproduction or trace", "regression test or verification command", "fresh verification"],
+    quality_gates: ["debug_gate", "code_change_gate"],
+  },
+  {
+    template_id: "browser_qa",
+    title: "Browser QA",
+    description: "Test a user-facing surface in a real browser with screenshots, console checks, and route coverage.",
+    department_name: "qa",
+    risk_class: "normal",
+    action_type: "browser_qa",
+    allowed_tools: ["browser", "playwright", "read", "screenshot"],
+    done_criteria: ["Core route loads", "Console errors checked", "Interactive flow tested when relevant", "Screenshots or report attached"],
+    required_evidence: ["browser screenshot", "console check", "route or page list", "issue report or pass summary"],
+    quality_gates: ["browser_qa_gate"],
+  },
+  {
+    template_id: "ship_release",
+    title: "Ship or deploy release",
+    description: "Run release work with tests, review, deploy proof, health check, and rollback path.",
+    department_name: "deploy-ops",
+    risk_class: "production",
+    action_type: "deploy",
+    allowed_tools: ["git", "test", "deploy", "curl", "browser"],
+    done_criteria: ["Tests pass", "Diff/release reviewed", "Deployment health verified", "Rollback plan recorded"],
+    required_evidence: ["tests", "diff reviewed", "deploy or push result", "production health check", "rollback plan"],
+    quality_gates: ["release_gate"],
+  },
+  {
+    template_id: "design_review",
+    title: "Design review",
+    description: "Review a UI surface for hierarchy, layout, responsive behavior, theme consistency, and content fit.",
+    department_name: "frontend",
+    risk_class: "normal",
+    action_type: "review",
+    allowed_tools: ["browser", "screenshot", "read", "search"],
+    done_criteria: ["Desktop and mobile considered", "Theme and typography checked", "Findings are concrete and scoped"],
+    required_evidence: ["screenshot", "viewport check", "design findings or pass summary"],
+    quality_gates: ["design_review_gate"],
+  },
+  {
+    template_id: "i18n_qa",
+    title: "Language and i18n QA",
+    description: "Verify language separation and translations without mixing locales or bypassing account/browser language rules.",
+    department_name: "translations",
+    risk_class: "normal",
+    action_type: "browser_qa",
+    allowed_tools: ["browser", "search", "read", "test"],
+    done_criteria: ["Each requested locale is checked", "No mixed-language blocks remain", "Language source of truth is respected"],
+    required_evidence: ["locale matrix", "mixed-language scan", "browser or route check"],
+    quality_gates: ["i18n_gate"],
+  },
+  {
+    template_id: "wizard_surface_work",
+    title: "Wizard surface work",
+    description: "Work on a wizard surface only after the target is explicit. Wizard1 and Wizard2 must not be mixed in one task.",
+    department_name: "apps",
+    risk_class: "normal",
+    action_type: "code_edit",
+    allowed_tools: ["read", "search", "apply_patch", "test", "browser"],
+    done_criteria: ["Target explicitly names Wizard1 or Wizard2", "Builder/list/edit routes checked as applicable", "No fallback to the wrong builder", "Language separation checked"],
+    required_evidence: ["explicit wizard target", "builder route check", "browser verification", "language check"],
+    quality_gates: ["wizard_gate", "browser_qa_gate", "i18n_gate"],
+  },
+  {
+    template_id: "context_checkpoint",
+    title: "Context checkpoint",
+    description: "Save decisions, remaining work, affected files, and branch state so another agent can resume safely.",
+    department_name: "general",
+    risk_class: "low",
+    action_type: "read",
+    allowed_tools: ["read", "git", "mem_context_snapshot_create"],
+    done_criteria: ["Snapshot records current state", "Remaining work is concrete", "Uncertainty is named"],
+    required_evidence: ["context snapshot"],
+    quality_gates: ["context_handoff_gate"],
+  },
+];
+
+const QUALITY_GATE_TEMPLATES = [
+  { gate_id: "code_change_gate", title: "Code change gate", required_evidence: ["diff reviewed or finding report", "verification result"], minimum_score: 100 },
+  { gate_id: "debug_gate", title: "Debug root-cause gate", required_evidence: ["root cause", "reproduction or trace", "fresh verification"], minimum_score: 100 },
+  { gate_id: "browser_qa_gate", title: "Browser QA gate", required_evidence: ["browser screenshot", "console check", "route or page list"], minimum_score: 100 },
+  { gate_id: "release_gate", title: "Release gate", required_evidence: ["tests", "deploy or push result", "production health check", "rollback plan"], minimum_score: 100 },
+  { gate_id: "design_review_gate", title: "Design review gate", required_evidence: ["screenshot", "viewport check", "design findings or pass summary"], minimum_score: 100 },
+  { gate_id: "i18n_gate", title: "i18n gate", required_evidence: ["locale matrix", "mixed-language scan", "browser or route check"], minimum_score: 100 },
+  { gate_id: "wizard_gate", title: "Wizard target gate", required_evidence: ["explicit wizard target", "builder route check"], minimum_score: 100 },
+  { gate_id: "context_handoff_gate", title: "Context handoff gate", required_evidence: ["context snapshot"], minimum_score: 100 },
+];
+
+function normalizeTemplateId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function rowToTemplate(row) {
+  return row ? Object.assign({}, row, {
+    allowed_tools: parseJson(row.allowed_tools_json, []),
+    allowed_resources: parseJson(row.allowed_resources_json, []),
+    done_criteria: parseJson(row.done_criteria_json, []),
+    required_evidence: parseJson(row.required_evidence_json, []),
+    quality_gates: parseJson(row.quality_gates_json, []),
+    runtime_contract: parseJson(row.runtime_contract_json, AGENT_NEUTRAL_RUNTIME_CONTRACT),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function builtinTemplateRows(scope = DEFAULT_SCOPE) {
+  return BUILTIN_WORK_ORDER_TEMPLATES.map((template) => rowToTemplate({
+    template_id: template.template_id,
+    scope,
+    title: template.title,
+    description: template.description,
+    department_name: template.department_name,
+    risk_class: template.risk_class,
+    action_type: template.action_type,
+    allowed_tools_json: JSON.stringify(template.allowed_tools || []),
+    allowed_resources_json: JSON.stringify(template.allowed_resources || []),
+    done_criteria_json: JSON.stringify(template.done_criteria || []),
+    required_evidence_json: JSON.stringify(template.required_evidence || []),
+    quality_gates_json: JSON.stringify(template.quality_gates || []),
+    runtime_contract_json: JSON.stringify(AGENT_NEUTRAL_RUNTIME_CONTRACT),
+    status: "active",
+    source: "builtin",
+    meta_json: JSON.stringify({ agent_neutral: true }),
+    updated_by: "mnemo",
+    created_at: null,
+    updated_at: null,
+  }));
+}
+
+function qualityGateTemplateList(_db, input = {}) {
+  const filter = normalizeTemplateId(input.gate_id || input.id || "");
+  const gates = QUALITY_GATE_TEMPLATES
+    .filter((gate) => !filter || gate.gate_id === filter)
+    .map((gate) => Object.assign({
+      agent_neutral: true,
+      runtime_contract: AGENT_NEUTRAL_RUNTIME_CONTRACT,
+    }, gate));
+  return { ok: true, count: gates.length, gates };
+}
+
+function workOrderTemplateList(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const idFilter = normalizeTemplateId(input.template_id || input.id || "");
+  const includeInactive = input.include_inactive === true;
+  const byId = new Map();
+  for (const template of builtinTemplateRows(scope)) {
+    if (idFilter && template.template_id !== idFilter) continue;
+    byId.set(template.template_id, template);
+  }
+  const rows = db.prepare("SELECT * FROM work_order_template WHERE scope IN (?, 'default') ORDER BY updated_at DESC").all(scope).map(rowToTemplate);
+  for (const row of rows) {
+    if (!includeInactive && row.status !== "active") continue;
+    if (idFilter && row.template_id !== idFilter) continue;
+    byId.set(row.template_id, row);
+  }
+  const templates = Array.from(byId.values()).sort((a, b) => String(a.template_id).localeCompare(String(b.template_id)));
+  return { ok: true, count: templates.length, templates };
+}
+
+function workOrderTemplateUpsert(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const templateId = normalizeTemplateId(input.template_id || input.id);
+  if (!templateId) return { error: "template_id required" };
+  const title = textOrNull(input.title, 240) || templateId;
+  const scope = scopeName(input.scope);
+  db.prepare(`
+    INSERT INTO work_order_template
+      (template_id, scope, title, description, department_name, risk_class, action_type, allowed_tools_json, allowed_resources_json, done_criteria_json, required_evidence_json, quality_gates_json, runtime_contract_json, status, source, meta_json, updated_by, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    ON CONFLICT(template_id) DO UPDATE SET
+      scope=excluded.scope,
+      title=excluded.title,
+      description=excluded.description,
+      department_name=excluded.department_name,
+      risk_class=excluded.risk_class,
+      action_type=excluded.action_type,
+      allowed_tools_json=excluded.allowed_tools_json,
+      allowed_resources_json=excluded.allowed_resources_json,
+      done_criteria_json=excluded.done_criteria_json,
+      required_evidence_json=excluded.required_evidence_json,
+      quality_gates_json=excluded.quality_gates_json,
+      runtime_contract_json=excluded.runtime_contract_json,
+      status=excluded.status,
+      source=excluded.source,
+      meta_json=excluded.meta_json,
+      updated_by=excluded.updated_by,
+      updated_at=excluded.updated_at
+  `).run(
+    templateId,
+    scope,
+    title,
+    textOrNull(input.description || input.objective || input.summary, 4000),
+    input.department_name || input.department ? normalizeDepartment(input.department_name || input.department) : null,
+    normalizeRisk(input.risk_class),
+    input.action_type || null,
+    safeJson(normalizeTools(input.allowed_tools || input.tools), []),
+    safeJson(normalizeAllowedResources(input), []),
+    safeJson(listInput(input.done_criteria), []),
+    safeJson(listInput(input.required_evidence || input.evidence_required), []),
+    safeJson(listInput(input.quality_gates), []),
+    safeJson(Object.assign({}, AGENT_NEUTRAL_RUNTIME_CONTRACT, input.runtime_contract || {}), AGENT_NEUTRAL_RUNTIME_CONTRACT),
+    input.status || "active",
+    input.source || "custom",
+    safeJson(Object.assign({ agent_neutral: true }, input.meta || {}), {}),
+    normalizeAgentName(input.updated_by || input.agent_name || "") || null
+  );
+  return { ok: true, template: workOrderTemplateList(db, { scope, template_id: templateId, include_inactive: true }).templates[0] || null };
+}
+
+function getWorkOrderTemplate(db, input = {}) {
+  const templateId = normalizeTemplateId(input.template_id || input.id || input.kind || "general_task");
+  return workOrderTemplateList(db, Object.assign({}, input, { template_id: templateId, include_inactive: false })).templates[0] || null;
+}
+
+function workOrderCreateFromTemplate(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const template = getWorkOrderTemplate(db, input);
+  if (!template) return { error: "work_order_template_not_found", template_id: normalizeTemplateId(input.template_id || input.id || input.kind) };
+  const requiredEvidence = uniqueStrings([].concat(template.required_evidence || [], listInput(input.required_evidence || input.evidence_required)));
+  const doneCriteria = uniqueStrings([].concat(template.done_criteria || [], listInput(input.done_criteria)));
+  const allowedTools = uniqueStrings([].concat(template.allowed_tools || [], normalizeTools(input.allowed_tools || input.tools)));
+  const templateResources = Array.isArray(template.allowed_resources) ? template.allowed_resources : [];
+  const inputResources = normalizeAllowedResources(input);
+  const meta = Object.assign({}, template.meta || {}, input.meta || {}, {
+    template_id: template.template_id,
+    quality_gates: uniqueStrings([].concat(template.quality_gates || [], listInput(input.quality_gates))),
+    runtime_contract: Object.assign({}, AGENT_NEUTRAL_RUNTIME_CONTRACT, template.runtime_contract || {}, input.runtime_contract || {}),
+    agent_neutral: true,
+  });
+  return workOrderCreate(db, Object.assign({}, input, {
+    title: input.title || template.title,
+    objective: input.objective || input.summary || input.task || template.description,
+    department_name: input.department_name || input.department || template.department_name,
+    risk_class: input.risk_class || template.risk_class,
+    action_type: input.action_type || template.action_type,
+    allowed_tools: allowedTools,
+    resources: templateResources.concat(inputResources),
+    done_criteria: doneCriteria,
+    required_evidence: requiredEvidence,
+    meta,
+  }));
+}
+
+function rowToSnapshot(row) {
+  return row ? Object.assign({}, row, {
+    dirty: !!row.dirty,
+    decisions: parseJson(row.decisions_json, []),
+    remaining_work: parseJson(row.remaining_work_json, []),
+    files: parseJson(row.files_json, []),
+    routes: parseJson(row.routes_json, []),
+    urls: parseJson(row.urls_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function contextSnapshotCreate(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const agent = normalizeAgentName(input.agent_name || input.agent);
+  const summary = textOrNull(input.summary || input.context || input.notes, 8000);
+  if (!summary) return { error: "summary required" };
+  const info = db.prepare(`
+    INSERT INTO context_snapshot
+      (scope, project, agent_name, runtime_name, work_order_id, title, summary, decisions_json, remaining_work_json, files_json, routes_json, urls_json, branch, commit_sha, dirty, source_ref, status, meta_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    scopeName(input.scope),
+    input.project || null,
+    agent || null,
+    input.runtime_name || input.runtime || null,
+    input.work_order_id || null,
+    textOrNull(input.title, 240) || "Context snapshot",
+    summary,
+    safeJson(listInput(input.decisions), []),
+    safeJson(listInput(input.remaining_work || input.remaining || input.next_steps), []),
+    safeJson(listInput(input.files), []),
+    safeJson(listInput(input.routes), []),
+    safeJson(listInput(input.urls), []),
+    input.branch || null,
+    input.commit_sha || input.commit || null,
+    input.dirty ? 1 : 0,
+    input.source_ref || null,
+    input.status || "active",
+    safeJson(Object.assign({ agent_neutral: true }, input.meta || {}), {})
+  );
+  return { ok: true, snapshot: rowToSnapshot(db.prepare("SELECT * FROM context_snapshot WHERE id=?").get(info.lastInsertRowid)) };
+}
+
+function formatList(title, values) {
+  const list = Array.isArray(values) ? values.filter(Boolean) : [];
+  if (!list.length) return [`## ${title}`, "- (none recorded)"].join("\n");
+  return [`## ${title}`].concat(list.map((item) => "- " + String(item))).join("\n");
+}
+
+function contextRestoreBrief(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.id || input.snapshot_id) {
+    where.push("id=?");
+    params.push(parseInt(input.id || input.snapshot_id, 10));
+  } else {
+    if (input.project) { where.push("project=?"); params.push(input.project); }
+    if (input.agent_name || input.agent) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name || input.agent)); }
+    if (input.work_order_id) { where.push("work_order_id=?"); params.push(parseInt(input.work_order_id, 10)); }
+    if (input.status) { where.push("status=?"); params.push(input.status); }
+  }
+  const row = db.prepare(`SELECT * FROM context_snapshot WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT 1`).get(...params);
+  const snapshot = rowToSnapshot(row);
+  if (!snapshot) return { error: "context_snapshot_not_found" };
+  const brief = [
+    "# Mnemo Context Restore Brief",
+    "",
+    "Snapshot: #" + snapshot.id,
+    "Project: " + (snapshot.project || "unspecified"),
+    "Agent: " + (snapshot.agent_name || "unspecified"),
+    "Runtime: " + (snapshot.runtime_name || "unspecified"),
+    "Work Order: " + (snapshot.work_order_id || "none"),
+    "Branch: " + (snapshot.branch || "unknown") + (snapshot.commit_sha ? " @ " + snapshot.commit_sha : "") + (snapshot.dirty ? " (dirty)" : ""),
+    "Saved: " + snapshot.created_at,
+    "",
+    "## Summary",
+    snapshot.summary || "(none)",
+    "",
+    formatList("Decisions", snapshot.decisions),
+    "",
+    formatList("Remaining Work", snapshot.remaining_work),
+    "",
+    formatList("Files", snapshot.files),
+    "",
+    formatList("Routes", snapshot.routes),
+    "",
+    "## Resume Rule",
+    "- Treat this brief as context, not company truth.",
+    "- Check current repo state and Mnemo gates before editing.",
+    "- If target/scope changed, create or update a Work Order before work."
+  ].join("\n");
+  return { ok: true, snapshot, brief };
+}
+
+function rowToGateRun(row) {
+  return row ? Object.assign({}, row, {
+    missing: parseJson(row.missing_json, []),
+    invalid: parseJson(row.invalid_json, []),
+    evidence: parseJson(row.evidence_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function qualityGateRun(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const gateId = normalizeTemplateId(input.gate_id || input.template_id || input.gate || "code_change_gate");
+  const gate = QUALITY_GATE_TEMPLATES.find((item) => item.gate_id === gateId);
+  if (!gate) return { error: "quality_gate_template_not_found", gate_id: gateId };
+  const evidence = Array.isArray(input.evidence) ? input.evidence : [];
+  let workOrder = null;
+  if (input.work_order_id) {
+    workOrder = rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(parseInt(input.work_order_id, 10)));
+    if (!workOrder) return { error: "work_order_not_found", work_order_id: input.work_order_id };
+  }
+  const requirements = uniqueStrings([]
+    .concat(gate.required_evidence || [])
+    .concat(input.include_work_order_evidence === false ? [] : (workOrder && workOrder.required_evidence || []))
+    .concat(listInput(input.required_evidence)));
+  const invalid = evidence.map(validateEvidenceItem).filter(Boolean).concat(evidence.map(nonPassEvidenceReason).filter(Boolean));
+  const missing = requirements.filter((requirement) => !evidence.some((item) => evidenceMatchesRequirement(item, requirement)));
+  const score = Math.max(0, 100 - invalid.length * 25 - missing.length * 20);
+  const status = invalid.length || missing.length || score < (gate.minimum_score || 100) ? "block" : "pass";
+  let run = null;
+  if (input.persist !== false) {
+    const info = db.prepare(`
+      INSERT INTO quality_gate_run
+        (scope, gate_id, project, work_order_id, agent_name, status, score, missing_json, invalid_json, evidence_json, meta_json)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      scopeName(input.scope),
+      gateId,
+      input.project || (workOrder && workOrder.project) || null,
+      input.work_order_id || null,
+      normalizeAgentName(input.agent_name || input.agent || "") || null,
+      status,
+      score,
+      safeJson(missing, []),
+      safeJson(invalid, []),
+      safeJson(evidence, []),
+      safeJson(Object.assign({ agent_neutral: true }, input.meta || {}), {})
+    );
+    run = rowToGateRun(db.prepare("SELECT * FROM quality_gate_run WHERE id=?").get(info.lastInsertRowid));
+  }
+  return {
+    ok: status === "pass",
+    status,
+    score,
+    gate,
+    required_evidence: requirements,
+    missing,
+    invalid,
+    run,
+    hint: status === "pass" ? "Quality gate passed." : "Do not mark done. Add passing evidence or use needs_review/blocked.",
+  };
 }
 
 function workOrderCreate(db, input = {}) {
@@ -966,6 +1488,34 @@ function autonomyScoreReport(db, input = {}) {
 }
 
 const AGENT_GOVERNANCE_TOOL_DEFS = {
+  mem_work_order_template_list: {
+    description: "List agent-neutral Work Order templates. These are runtime-agnostic contracts for Claude, GPT/Codex, OpenClaw, and other adapters.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, template_id: { type: "string" }, id: { type: "string" }, include_inactive: { type: "boolean" } } }
+  },
+  mem_work_order_template_upsert: {
+    description: "Create/update a custom agent-neutral Work Order template. Templates are contracts; runtime adapters still execute through Mnemo gates.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, template_id: { type: "string" }, id: { type: "string" }, title: { type: "string" }, description: { type: "string" }, objective: { type: "string" }, summary: { type: "string" }, department_name: { type: "string" }, department: { type: "string" }, risk_class: { type: "string" }, action_type: { type: "string" }, allowed_tools: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, tools: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, files: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, domains: { type: "array", items: { type: "string" } }, system_names: { type: "array", items: { type: "string" } }, resources: { type: "array", items: { type: "object" } }, done_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, required_evidence: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, evidence_required: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, quality_gates: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, runtime_contract: { type: "object" }, status: { type: "string" }, source: { type: "string" }, updated_by: { type: "string" }, agent_name: { type: "string" }, meta: { type: "object" } }, required: ["template_id"] }
+  },
+  mem_work_order_create_from_template: {
+    description: "Create a Work Order from a built-in or custom template and optionally issue a capability token. Same contract for all agent runtimes.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, template_id: { type: "string" }, id: { type: "string" }, kind: { type: "string" }, project: { type: "string" }, title: { type: "string" }, objective: { type: "string" }, summary: { type: "string" }, task: { type: "string" }, department_name: { type: "string" }, department: { type: "string" }, owner_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, risk_class: { type: "string" }, action_type: { type: "string" }, allowed_tools: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, tools: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, files: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, domains: { type: "array", items: { type: "string" } }, system_names: { type: "array", items: { type: "string" } }, resources: { type: "array", items: { type: "object" } }, done_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, required_evidence: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, evidence_required: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, quality_gates: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, issue_token: { type: "boolean" }, ttl_minutes: { type: "integer" }, expires_at: { type: "string" }, source_ref: { type: "string" }, created_by: { type: "string" }, runtime_contract: { type: "object" }, meta: { type: "object" } }, required: ["template_id"] }
+  },
+  mem_quality_gate_template_list: {
+    description: "List built-in agent-neutral quality gates used before Work Orders can be marked done.",
+    inputSchema: { type: "object", properties: { gate_id: { type: "string" }, id: { type: "string" } } }
+  },
+  mem_quality_gate_run: {
+    description: "Run an agent-neutral quality gate against concrete evidence. Failing gates should block done and force needs_review/blocked.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, gate_id: { type: "string" }, template_id: { type: "string" }, gate: { type: "string" }, project: { type: "string" }, work_order_id: { type: "integer" }, agent_name: { type: "string" }, agent: { type: "string" }, evidence: { type: "array", items: { type: "object" } }, required_evidence: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, include_work_order_evidence: { type: "boolean" }, persist: { type: "boolean" }, meta: { type: "object" } } }
+  },
+  mem_context_snapshot_create: {
+    description: "Save an agent-neutral context snapshot: decisions, remaining work, affected files/routes, branch, and Work Order link.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, agent_name: { type: "string" }, agent: { type: "string" }, runtime_name: { type: "string" }, runtime: { type: "string" }, work_order_id: { type: "integer" }, title: { type: "string" }, summary: { type: "string" }, context: { type: "string" }, notes: { type: "string" }, decisions: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, remaining_work: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, remaining: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, next_steps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, files: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, routes: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, urls: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, branch: { type: "string" }, commit_sha: { type: "string" }, commit: { type: "string" }, dirty: { type: "boolean" }, source_ref: { type: "string" }, status: { type: "string" }, meta: { type: "object" } }, required: ["summary"] }
+  },
+  mem_context_restore_brief: {
+    description: "Return the latest saved context snapshot as a concise resume brief. Context is not company truth; agents must still check gates.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, id: { type: "integer" }, snapshot_id: { type: "integer" }, project: { type: "string" }, agent_name: { type: "string" }, agent: { type: "string" }, work_order_id: { type: "integer" }, status: { type: "string" } } }
+  },
   mem_work_order_create: {
     description: "Create a structured work order: objective, owner, department, assigned agent, scope, done criteria, risk, evidence, and optional capability token.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, title: { type: "string" }, objective: { type: "string" }, summary: { type: "string" }, task: { type: "string" }, department_name: { type: "string" }, department: { type: "string" }, owner_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, risk_class: { type: "string" }, action_type: { type: "string" }, allowed_tools: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, files: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, domains: { type: "array", items: { type: "string" } }, system_names: { type: "array", items: { type: "string" } }, resources: { type: "array", items: { type: "object" } }, done_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, required_evidence: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, evidence_required: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, approval_ids: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, deadline_at: { type: "string" }, issue_token: { type: "boolean" }, ttl_minutes: { type: "integer" }, expires_at: { type: "string" }, source_ref: { type: "string" }, created_by: { type: "string" }, meta: { type: "object" } }, required: ["objective"] }
@@ -1013,6 +1563,13 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
 };
 
 function handleAgentGovernanceTool(db, name, input = {}) {
+  if (name === "mem_work_order_template_list") return { handled: true, result: workOrderTemplateList(db, input || {}) };
+  if (name === "mem_work_order_template_upsert") return { handled: true, result: workOrderTemplateUpsert(db, input || {}) };
+  if (name === "mem_work_order_create_from_template") return { handled: true, result: workOrderCreateFromTemplate(db, input || {}) };
+  if (name === "mem_quality_gate_template_list") return { handled: true, result: qualityGateTemplateList(db, input || {}) };
+  if (name === "mem_quality_gate_run") return { handled: true, result: qualityGateRun(db, input || {}) };
+  if (name === "mem_context_snapshot_create") return { handled: true, result: contextSnapshotCreate(db, input || {}) };
+  if (name === "mem_context_restore_brief") return { handled: true, result: contextRestoreBrief(db, input || {}) };
   if (name === "mem_work_order_create") return { handled: true, result: workOrderCreate(db, input || {}) };
   if (name === "mem_work_order_list") return { handled: true, result: workOrderList(db, input || {}) };
   if (name === "mem_work_order_complete") return { handled: true, result: workOrderComplete(db, input || {}) };
@@ -1031,6 +1588,13 @@ module.exports = {
   AGENT_GOVERNANCE_TOOL_DEFS,
   ensureAgentGovernanceSchema,
   handleAgentGovernanceTool,
+  workOrderTemplateList,
+  workOrderTemplateUpsert,
+  workOrderCreateFromTemplate,
+  qualityGateTemplateList,
+  qualityGateRun,
+  contextSnapshotCreate,
+  contextRestoreBrief,
   workOrderCreate,
   workOrderList,
   workOrderComplete,

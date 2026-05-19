@@ -102,11 +102,12 @@ function readGitInfo(repoPath = WORKSPACE) {
   if (cached && nowMs - cached.at < 60 * 1000) return cached.value;
   const info = { commit: null, branch: null, dirty: null };
   try {
-    const commit = spawnSync("git", ["-C", key, "rev-parse", "--short", "HEAD"], { encoding: "utf8", timeout: 3000 });
+    const spawnOptions = { encoding: "utf8", timeout: 3000, windowsHide: true };
+    const commit = spawnSync("git", ["-C", key, "rev-parse", "--short", "HEAD"], spawnOptions);
     if (commit.status === 0) info.commit = commit.stdout.trim() || null;
-    const branch = spawnSync("git", ["-C", key, "branch", "--show-current"], { encoding: "utf8", timeout: 3000 });
+    const branch = spawnSync("git", ["-C", key, "branch", "--show-current"], spawnOptions);
     if (branch.status === 0) info.branch = branch.stdout.trim() || null;
-    const status = spawnSync("git", ["-C", key, "status", "--porcelain"], { encoding: "utf8", timeout: 5000 });
+    const status = spawnSync("git", ["-C", key, "status", "--porcelain"], { encoding: "utf8", timeout: 5000, windowsHide: true });
     if (status.status === 0) info.dirty = !!status.stdout.trim();
   } catch {}
   gitInfoCache.set(key, { at: nowMs, value: info });

@@ -97,6 +97,115 @@ function tool(name, args) {
   assert.strictEqual(tool("mem_department_charter_list", {}).count, 1);
 }
 
+let templatedWorkOrderId;
+let templatedTokenId;
+{
+  const templates = tool("mem_work_order_template_list", {});
+  assert.strictEqual(templates.ok, true);
+  assert(templates.templates.some((template) => template.template_id === "wizard_surface_work"));
+  const wizardTemplate = templates.templates.find((template) => template.template_id === "wizard_surface_work");
+  assert.strictEqual(wizardTemplate.runtime_contract.agent_neutral, true);
+
+  const custom = tool("mem_work_order_template_upsert", {
+    template_id: "agent-neutral-smoke",
+    title: "Agent neutral smoke",
+    description: "Template usable by Claude, GPT/Codex, and OpenClaw adapters.",
+    department_name: "engineering",
+    action_type: "code_edit",
+    allowed_tools: ["apply_patch"],
+    files: ["packages/core/*"],
+    required_evidence: ["smoke proof"],
+    updated_by: "alfred",
+  });
+  assert.strictEqual(custom.ok, true);
+  assert.strictEqual(custom.template.runtime_contract.agent_neutral, true);
+
+  const templated = tool("mem_work_order_create_from_template", {
+    template_id: "wizard_surface_work",
+    project: "apps.blun.ai",
+    objective: "Merge only the Wizard2 final builder surface.",
+    assigned_agent: "angel",
+    owner_agent: "alfred",
+    created_by: "alfred",
+    routes: ["/de/dashboard/wizard2"],
+    files: ["admin/app/dashboard/wizard2/*"],
+    ttl_minutes: 30,
+  });
+  assert.strictEqual(templated.ok, true);
+  assert.strictEqual(templated.work_order.meta.template_id, "wizard_surface_work");
+  assert.strictEqual(templated.work_order.meta.runtime_contract.agent_neutral, true);
+  assert(templated.work_order.required_evidence.includes("explicit wizard target"));
+  assert(templated.work_order.required_evidence.includes("language check"));
+  assert(templated.token.token_id);
+  templatedWorkOrderId = templated.work_order.id;
+  templatedTokenId = templated.token.token_id;
+
+  const tokenCheck = tool("mem_capability_token_check", {
+    token_id: templatedTokenId,
+    work_order_id: templatedWorkOrderId,
+    agent_name: "angel",
+    project: "apps.blun.ai",
+    action_type: "code_edit",
+    tool_name: "apply_patch",
+    routes: ["/de/dashboard/wizard2"],
+    files: ["admin/app/dashboard/wizard2/page.tsx"],
+  });
+  assert.strictEqual(tokenCheck.granted, true);
+}
+
+{
+  const blockedGate = tool("mem_quality_gate_run", {
+    gate_id: "wizard_gate",
+    work_order_id: templatedWorkOrderId,
+    agent_name: "angel",
+    evidence: [{ check: "explicit wizard target", result: "pass", file_path: "admin/app/dashboard/wizard2/page.tsx" }],
+  });
+  assert.strictEqual(blockedGate.ok, false);
+  assert(blockedGate.missing.includes("builder route check"));
+
+  const passGate = tool("mem_quality_gate_run", {
+    gate_id: "wizard_gate",
+    work_order_id: templatedWorkOrderId,
+    agent_name: "angel",
+    evidence: [
+      { check: "explicit wizard target", result: "pass", file_path: "admin/app/dashboard/wizard2/page.tsx" },
+      { check: "builder route check", result: "pass", url: "https://apps.blun.ai/de/dashboard/wizard2" },
+      { check: "browser verification", result: "pass", url: "https://apps.blun.ai/de/dashboard/wizard2" },
+      { check: "language check", result: "pass", url: "https://apps.blun.ai/sv/dashboard/wizard2" },
+    ],
+  });
+  assert.strictEqual(passGate.ok, true);
+  assert.strictEqual(passGate.status, "pass");
+}
+
+{
+  const snapshot = tool("mem_context_snapshot_create", {
+    project: "apps.blun.ai",
+    agent_name: "alfred",
+    runtime_name: "codex",
+    work_order_id: templatedWorkOrderId,
+    title: "Wizard2 builder merge checkpoint",
+    summary: "Wizard2 final builder merge is scoped to the new-create flow, not Wizard1.",
+    decisions: ["Wizard2 is the target", "Wizard1 must not be edited in this task"],
+    remaining_work: ["Run browser QA", "Check all eight languages"],
+    files: ["admin/app/dashboard/wizard2/page.tsx"],
+    routes: ["/de/dashboard/wizard2"],
+    branch: "main",
+    commit_sha: "abc123",
+    dirty: true,
+  });
+  assert.strictEqual(snapshot.ok, true);
+  assert.strictEqual(snapshot.snapshot.meta.agent_neutral, true);
+
+  const restore = tool("mem_context_restore_brief", {
+    project: "apps.blun.ai",
+    work_order_id: templatedWorkOrderId,
+  });
+  assert.strictEqual(restore.ok, true);
+  assert(restore.brief.includes("Wizard2 is the target"));
+  assert(restore.brief.includes("Treat this brief as context, not company truth"));
+}
+
 {
   const readCheck = capabilityTokenCheck(db, {
     agent_name: "alfred",

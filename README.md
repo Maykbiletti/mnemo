@@ -95,7 +95,11 @@ can prove what changed, who did it, or which project gates are still open.
   instruction. `mem_work_order_create` defines the assignment and
   `mem_capability_token_check` deterministically gates write/exec/deploy/auth/
   billing/external-send actions by agent, scope, tools, expiry, approvals, and
-  evidence requirements.
+  evidence requirements. `mem_work_order_create_from_template`,
+  `mem_quality_gate_run`, and `mem_context_snapshot_create` add agent-neutral
+  workflow contracts so Claude, GPT/Codex, OpenClaw, CodexLink, and other
+  runtimes all follow the same Mnemo gates even though their local prompts and
+  tool names differ.
 - **Protected Scope Gates.** `mem_protected_scope_check` protects auth, billing,
   production infra, final artifacts, shared portal design, translations, chat
   runtime, and Mnemo coordination surfaces. Owner approval and active claims are
@@ -201,6 +205,9 @@ See [`docs/memory-consolidation.md`](docs/memory-consolidation.md) for the
 Company Ledger / Department Journal / Agent Sleep Notes model.
 See [`docs/work-orders-capability-tokens.md`](docs/work-orders-capability-tokens.md)
 for the Work Order / Capability Token gate.
+See [`docs/agent-neutral-workflows.md`](docs/agent-neutral-workflows.md) for
+template-based Work Orders, quality gates, context snapshots, and the runtime
+adapter contract.
 
 Useful calls:
 

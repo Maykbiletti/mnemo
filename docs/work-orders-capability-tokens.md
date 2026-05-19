@@ -14,7 +14,8 @@ capture hooks.
 
 ## Flow
 
-1. Create a Work Order with `mem_work_order_create`.
+1. Create a Work Order with `mem_work_order_create_from_template` or
+   `mem_work_order_create`.
    It contains objective, owner, department, assigned agent, scope, done
    criteria, risk, allowed tools/resources, required evidence, and deadline.
 2. Mnemo issues a Capability Token for that Work Order.
@@ -34,6 +35,26 @@ capture hooks.
 5. Completion uses `mem_work_order_complete` and must attach concrete evidence.
    A handoff id alone is not enough for `done`.
 6. Trust/autonomy is updated from facts with `mem_autonomy_score_report`.
+
+## Templates, Quality Gates, Context
+
+Use templates when the work is a repeated company process. Templates are
+agent-neutral: Claude, GPT/Codex, OpenClaw, CodexLink, and other runtimes all
+call the same Mnemo tools through their adapter.
+
+- `mem_work_order_template_list` lists built-ins such as `debug_investigation`,
+  `browser_qa`, `ship_release`, `design_review`, `i18n_qa`,
+  `wizard_surface_work`, and `context_checkpoint`.
+- `mem_work_order_create_from_template` creates the scoped Work Order and
+  carries the template's quality gates and runtime contract into `meta`.
+- `mem_quality_gate_run` checks concrete evidence before done.
+- `mem_context_snapshot_create` saves a compaction/handoff-safe state.
+- `mem_context_restore_brief` lets any agent resume from that snapshot without
+  pretending the snapshot is company truth.
+
+This is deliberately not Claude-specific. A runtime adapter may have different
+tool names, but it must map them into Mnemo fields such as `runtime_name`,
+`agent_name`, `tool_name`, `files`, `routes`, `resources`, and `evidence`.
 
 ## Token Is Not Truth
 

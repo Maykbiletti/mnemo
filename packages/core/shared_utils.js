@@ -347,6 +347,81 @@ function uiSensitiveTask(input) {
   return /\b(ui|frontend|header|headder|footer|menu|menue|nav|navigation|button|buttons|theme|light|dark|logo|style|design|layout|mobile|responsive|landing)\b/i.test(text);
 }
 
+function wizardTargetGate(input, projectRules) {
+  const rules = projectRules && !projectRules.error ? projectRules : {};
+  const requiredGates = parseMaybeJson(rules.required_gates, []) || [];
+  const deployRules = parseMaybeJson(rules.deploy_rules, {}) || {};
+  const canonicalNav = parseMaybeJson(rules.canonical_nav, {}) || {};
+  const required = Boolean(
+    deployRules.wizard_target_required
+    || deployRules.ambiguous_wizard_task_blocks
+    || requiredGates.includes("explicit_wizard_target")
+    || (canonicalNav.wizard1 && canonicalNav.wizard2)
+  );
+  if (!required) return { required: false, status: "ok", reason: "wizard target gate not configured" };
+
+  const resourceText = Array.isArray(input && input.resources)
+    ? input.resources.map((resource) => [
+      resource && resource.resource_key,
+      resource && resource.resource_kind,
+      resource && resource.label,
+      resource && resource.name
+    ].filter(Boolean).join(" ")).join(" ")
+    : "";
+  const text = [
+    input && input.project,
+    input && input.task,
+    input && input.summary,
+    input && input.scope,
+    input && input.action_type,
+    input && input.tool_name,
+    Array.isArray(input && input.topics) ? input.topics.join(" ") : "",
+    Array.isArray(input && input.files) ? input.files.join(" ") : "",
+    Array.isArray(input && input.routes) ? input.routes.join(" ") : "",
+    Array.isArray(input && input.urls) ? input.urls.join(" ") : "",
+    Array.isArray(input && input.system_names) ? input.system_names.join(" ") : "",
+    resourceText
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  const mentionsWizard = /\bwiz(?:ard|rad)\b/.test(text)
+    || /\bwiz(?:ard|rad)\s*[12]\b/.test(text)
+    || /apps\.blun\.ai:wizard[12]\b/.test(text)
+    || /\/dashboard\/wizard[2]?\b/.test(text);
+  if (!mentionsWizard) return { required: true, status: "ok", reason: "no wizard surface mentioned" };
+
+  const wizard1 = /\bwiz(?:ard|rad)\s*1\b/.test(text)
+    || /\bwiz(?:ard|rad)1\b/.test(text)
+    || /apps\.blun\.ai:wizard1\b/.test(text)
+    || /\/dashboard\/wizard(?!2)\b/.test(text);
+  const wizard2 = /\bwiz(?:ard|rad)\s*2\b/.test(text)
+    || /\bwiz(?:ard|rad)2\b/.test(text)
+    || /apps\.blun\.ai:wizard2\b/.test(text)
+    || /\/dashboard\/wizard2\b/.test(text);
+
+  if (wizard1 && wizard2) {
+    return {
+      required: true,
+      status: "block",
+      reason: "multiple wizard targets mentioned; create separate Work Orders for Wizard1 and Wizard2",
+      target: "mixed"
+    };
+  }
+  if (wizard1 || wizard2) {
+    return {
+      required: true,
+      status: "ok",
+      reason: "explicit wizard target present",
+      target: wizard2 ? "apps.blun.ai:wizard2" : "apps.blun.ai:wizard1"
+    };
+  }
+  return {
+    required: true,
+    status: "block",
+    reason: "ambiguous wizard target; task must explicitly name apps.blun.ai:wizard1 or apps.blun.ai:wizard2",
+    target: null
+  };
+}
+
 // --- Contract report builders ---
 // These take an ensureTables callback so callers wire in their own schema bootstrap.
 
@@ -671,6 +746,7 @@ module.exports = {
   // Contract validation
   AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS,
   authSensitiveTask, uiSensitiveTask,
+  wizardTargetGate,
   authContractReport, uiContractReport,
   // Reminder helpers
   normalizeReminderText, parseReminderTime, applyReminderTime,

@@ -458,6 +458,39 @@ test("uiSensitiveTask detects UI keywords", () => {
   assert.strictEqual(su.uiSensitiveTask({ task: "fix database query" }), false);
 });
 
+// --- wizard target gate ---
+
+const wizardRules = {
+  required_gates: ["explicit_wizard_target"],
+  deploy_rules: {
+    wizard_target_required: true,
+    ambiguous_wizard_task_blocks: true
+  },
+  canonical_nav: {
+    wizard1: { resource_key: "apps.blun.ai:wizard1" },
+    wizard2: { resource_key: "apps.blun.ai:wizard2" }
+  }
+};
+
+test("wizardTargetGate blocks ambiguous wizard work", () => {
+  const r = su.wizardTargetGate({ project: "apps.blun.ai", task: "fix Wizard build output" }, wizardRules);
+  assert.strictEqual(r.required, true);
+  assert.strictEqual(r.status, "block");
+  assert.ok(r.reason.includes("ambiguous wizard target"));
+});
+
+test("wizardTargetGate accepts explicit Wizard2 work", () => {
+  const r = su.wizardTargetGate({ project: "apps.blun.ai", task: "QA Wizard2 tattoo build" }, wizardRules);
+  assert.strictEqual(r.status, "ok");
+  assert.strictEqual(r.target, "apps.blun.ai:wizard2");
+});
+
+test("wizardTargetGate blocks mixed Wizard1 and Wizard2 work", () => {
+  const r = su.wizardTargetGate({ project: "apps.blun.ai", task: "copy Wizard1 fixes into Wizard2" }, wizardRules);
+  assert.strictEqual(r.status, "block");
+  assert.strictEqual(r.target, "mixed");
+});
+
 // --- Summary ---
 
 console.log(`\n${passed} passed, ${failed} failed, ${passed + failed} total`);

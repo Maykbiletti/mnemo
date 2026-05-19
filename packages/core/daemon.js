@@ -69,7 +69,7 @@ const TZ_OFFSET_HOURS = parseInt(process.env.MNEMO_TZ_OFFSET_HOURS || "0", 10);
 const QUIET_START = parseInt(process.env.MNEMO_QUIET_START || "23", 10);
 const QUIET_END = parseInt(process.env.MNEMO_QUIET_END || "7", 10);
 const { collectBody } = require("./http_utils");
-const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
+const { parseMaybeJson, deepMergePlain, uniqueIntegers, stripPrivate, parseAgentCsv, normalizeAgentName, jsonSafe, compactContent, parseMetaJson, isoOrNull, parseBriefTitle, TEAM_BRIEF_ALIASES, BRIEF_CONTRACT_VERSION, BRIEF_REQUIRED_HEADINGS, cleanScope, uniqueAgentNames, isTeamBriefTarget, hasCanonicalBriefShape, normalizeBriefMeta, normalizeBriefContent, baseName, extensionName, inferMediaKind, inferMediaType, uniqueStrings, boolFlag, isoAgeDays, freshnessFromAgeDays, capabilityMatrixForDepartments, AUTH_CONTRACT_REQUIRED_FIELDS, UI_CONTRACT_REQUIRED_FIELDS, authSensitiveTask, uiSensitiveTask, wizardTargetGate, authContractReport, uiContractReport, normalizeReminderText, parseReminderTime, applyReminderTime, parseReminderDue, reminderTitleFromText, reminderRow, buildMediaTitle, buildCanonicalMediaFileName, slugFilePart } = require("./shared_utils");
 const briefCoordination = require("./brief_coordination");
 const { ensureAgentMailTables, handleAgentMailTool, dispatchInboundBriefs } = require("./agent_mail");
 const { ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_routes");
@@ -6518,6 +6518,18 @@ function handleTool(tdb, name, a) {
         const rules = handleTool(tdb, "mem_project_rules_get", { project });
         checks.push({ name: "project_rules", result: rules.error ? "missing" : "ok" });
         if (rules.error && a.require_project_rules !== false) blockers.push("missing project rules for " + project);
+        if (!rules.error) {
+          const wizardGate = wizardTargetGate(a, rules);
+          if (wizardGate.required) {
+            checks.push({
+              name: "explicit_wizard_target",
+              result: wizardGate.status,
+              target: wizardGate.target || null,
+              reason: wizardGate.reason
+            });
+            if (wizardGate.status === "block") blockers.push("wizard target blocked: " + wizardGate.reason);
+          }
+        }
         if (authSensitiveTask(a)) {
           const authCheck = handleTool(tdb, "mem_auth_contract_check", { project });
           checks.push({ name: "auth_contract", result: authCheck.status || (authCheck.ok ? "ok" : "block"), missing: authCheck.missing || [], mismatches: authCheck.mismatches || [] });
