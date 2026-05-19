@@ -33,6 +33,7 @@ const { handleContextPreviewTool } = require("./context_preview_tools");
 const { LOOP_DOCTOR_TOOL_DEFS, handleLoopDoctorTool } = require("./loop_doctor_tools");
 const { TIMELINE_REPORT_TOOL_DEFS, handleTimelineReportTool } = require("./timeline_report_tools");
 const { ensureTeamQualityTables, handleTeamQualityTool } = require("./team_quality_ops");
+const { handleAgentGovernanceTool } = require("./agent_governance");
 const { memoryHealth } = require("./memory_health_tools");
 
 const DB_PATH = process.env.MNEMO_DB || path.join(__dirname, "mnemo.db");
@@ -4368,6 +4369,8 @@ function handleTool(tdb, name, a) {
   if (resourceAccessTool.handled) return resourceAccessTool.result;
   const teamQuality = handleTeamQualityTool(tdb, name, a || {});
   if (teamQuality.handled) return teamQuality.result;
+  const agentGovernance = handleAgentGovernanceTool(tdb, name, a || {});
+  if (agentGovernance.handled) return agentGovernance.result;
   const agentMail = handleAgentMailTool(tdb, name, a || {});
   if (agentMail.handled) return agentMail.result;
   const accessRoute = handleAccessRouteTool(tdb, name, a || {});
