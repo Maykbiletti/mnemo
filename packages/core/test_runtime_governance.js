@@ -146,4 +146,90 @@ function tool(name, args) {
   assert(events.c >= 2, "runtime receipts should journal audit events");
 }
 
+{
+  const angelDefault = tool("mem_runtime_policy_get", {
+    runtime_name: "codexlink",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "wizard2",
+  });
+  assert.strictEqual(angelDefault.ok, true);
+  assert.strictEqual(angelDefault.source, "default");
+  assert.strictEqual(angelDefault.policy.required_brief_pull, true);
+  assert.strictEqual(angelDefault.policy.required_board, "wizard2-bridge");
+  assert.strictEqual(angelDefault.policy.stale_after_minutes, 15);
+  assert.strictEqual(angelDefault.policy.full_sync_every_messages, 10);
+  assert.strictEqual(angelDefault.policy.response_allowed_when_context_missing, false);
+
+  const blocked = tool("mem_runtime_policy_check", {
+    runtime_name: "codexlink",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "wizard2",
+    messages_since_full_sync: 10,
+  });
+  assert.strictEqual(blocked.status, "block");
+  assert.strictEqual(blocked.allowed, false);
+  assert(blocked.audit_id, "runtime policy check should persist an audit event");
+  assert(blocked.required_actions.includes("mem_brief_pull"));
+  assert(blocked.required_actions.includes("mem_project_board"));
+  assert(blocked.required_actions.includes("memory_update"));
+
+  const afterLoad = tool("mem_runtime_policy_check", {
+    runtime_name: "codexlink",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "wizard2",
+    board: "wizard2-bridge",
+    has_full_sync: true,
+    has_brief_pull: true,
+    has_recall: true,
+    has_project_board: true,
+    has_chat_sync: true,
+    has_memory_update: true,
+  });
+  assert.strictEqual(afterLoad.status, "ok");
+  assert.strictEqual(afterLoad.allowed, true);
+}
+
+{
+  const warn = tool("mem_runtime_policy_check", {
+    runtime_name: "codexlink",
+    agent_name: "dieter",
+    channel: "telegram",
+    project: "wizard2",
+    messages_since_full_sync: 10,
+  });
+  assert.strictEqual(warn.status, "warn");
+  assert.strictEqual(warn.allowed, true);
+  assert.strictEqual(warn.warning_token, "MNEMO_CONTEXT_STALE");
+}
+
+{
+  const set = tool("mem_runtime_policy_set", {
+    runtime_name: "codexlink",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "demo",
+    required_board: "demo-board",
+    stale_after_minutes: 5,
+    full_sync_every_messages: 10,
+    response_allowed_when_context_missing: true,
+    updated_by: "mayk",
+  });
+  assert.strictEqual(set.ok, true);
+  assert.strictEqual(set.policy.required_board, "demo-board");
+  assert.strictEqual(set.policy.stale_after_minutes, 5);
+  assert.strictEqual(set.policy.response_allowed_when_context_missing, true);
+
+  const custom = tool("mem_runtime_policy_get", {
+    runtime_name: "codexlink",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "demo",
+  });
+  assert.strictEqual(custom.source, "stored");
+  assert.strictEqual(custom.policy.required_board, "demo-board");
+}
+
 console.log("test_runtime_governance ok");
