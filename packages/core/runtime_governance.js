@@ -668,10 +668,12 @@ function runtimePolicyCheck(db, input = {}) {
   }
   const responseAllowed = missing.length === 0 || !!policy.response_allowed_when_context_missing;
   const status = missing.length === 0 ? "ok" : (responseAllowed ? "warn" : "block");
-  const requiredActions = uniqueStrings([])
-    .concat(policy.required_actions || [])
-    .concat(missing.map((entry) => entry.requirement))
-    .concat(fullSyncDue ? ["mem_event_log", "chat_sync", "memory_update"] : []);
+  const requiredActions = uniqueStrings(
+    []
+      .concat(policy.required_actions || [])
+      .concat(missing.map((entry) => entry.requirement))
+      .concat(fullSyncDue ? ["mem_event_log", "chat_sync", "memory_update"] : [])
+  );
   const result = {
     ok: responseAllowed,
     allowed: responseAllowed,
