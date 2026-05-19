@@ -332,6 +332,25 @@ CREATE INDEX IF NOT EXISTS idx_project_task_project ON project_task(project, sta
 CREATE INDEX IF NOT EXISTS idx_project_task_assigned ON project_task(assigned_agent, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_task_source ON project_task(source_kind, source_id);
 
+CREATE TABLE IF NOT EXISTS project_task_ingest (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  source_kind TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  task_id INTEGER NOT NULL,
+  project TEXT,
+  brief_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'linked',
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_task_ingest_source ON project_task_ingest(scope, source_kind, source_id);
+CREATE INDEX IF NOT EXISTS idx_project_task_ingest_dedupe ON project_task_ingest(scope, dedupe_key, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_task_ingest_task ON project_task_ingest(task_id);
+CREATE INDEX IF NOT EXISTS idx_project_task_ingest_brief ON project_task_ingest(brief_id);
+
 CREATE TABLE IF NOT EXISTS user_intent (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'default',
@@ -1804,6 +1823,273 @@ function projectTaskList(db, input = {}) {
   return { ok: true, count: rows.length, tasks: rows };
 }
 
+function normalizeBriefHeading(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[`*_()[\]{}:.,!?]+/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function markdownSection(content, names) {
+  const wanted = new Set((Array.isArray(names) ? names : [names]).map(normalizeBriefHeading));
+  const lines = String(content || "").split(/\r?\n/);
+  let start = -1;
+  let level = 99;
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[i]);
+    if (!match) continue;
+    const heading = normalizeBriefHeading(match[2]);
+    if (wanted.has(heading)) {
+      start = i + 1;
+      level = match[1].length;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const out = [];
+  for (let i = start; i < lines.length; i++) {
+    const match = /^(#{1,6})\s+/.exec(lines[i]);
+    if (match && match[1].length <= level) break;
+    out.push(lines[i]);
+  }
+  return textOrNull(out.join("\n").trim(), 4000);
+}
+
+function firstMarkdownTitle(content) {
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const match = /^#{1,6}\s+(.+?)\s*$/.exec(line);
+    if (match) {
+      const title = textOrNull(match[1].replace(/^brief\s*[:#-]?\s*/i, ""), 260);
+      if (title) return title;
+    }
+  }
+  return null;
+}
+
+function briefPreview(content, max = 700) {
+  return textOrNull(String(content || "")
+    .replace(/^#{1,6}\s+.+$/gm, "")
+    .replace(/^\s*[-*+]\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim(), max);
+}
+
+function sectionList(content, names) {
+  const section = markdownSection(content, names);
+  if (!section) return [];
+  const items = [];
+  for (const line of section.split(/\r?\n/)) {
+    const match = /^\s*(?:[-*+]|\d+[.)]|[•])\s+(.+?)\s*$/.exec(line);
+    if (match && match[1]) items.push(match[1].trim());
+  }
+  return items.length ? uniqueStrings(items) : listInput(section);
+}
+
+function briefMeta(row) {
+  return parseJson(row && row.meta_json, {});
+}
+
+function extractBriefFiles(content, meta = {}) {
+  const files = [];
+  const add = (value) => {
+    for (const item of listInput(value)) {
+      if (/[\\/]/.test(item) || /\.[A-Za-z0-9]{1,8}$/.test(item)) files.push(item);
+    }
+  };
+  add(meta.files);
+  add(meta.file_paths);
+  add(meta.paths);
+  const text = String(content || "");
+  for (const match of text.matchAll(/`([^`\n]*(?:[\\/][^`\n]+|\.[A-Za-z0-9]{1,8})[^`\n]*)`/g)) add(match[1]);
+  for (const match of text.matchAll(/(?:[A-Za-z]:\\)?[A-Za-z0-9_. -]+[\\/][A-Za-z0-9_.() \\/-]+\.[A-Za-z0-9]{1,8}/g)) add(match[0]);
+  return uniqueStrings(files).sort();
+}
+
+function briefTaskDedupeKey(scope, draft) {
+  const basis = {
+    scope,
+    project: draft.project || "",
+    category: draft.category || "",
+    title: String(draft.title || "").trim().toLowerCase(),
+    files: Array.isArray(draft.files) ? draft.files.slice().sort() : [],
+  };
+  return { key: sha(JSON.stringify(basis)), basis };
+}
+
+function briefToTaskDraft(row, input = {}) {
+  const meta = briefMeta(row);
+  const content = String(row && row.content || "");
+  const explicitProject = input.project || input.default_project || meta.project || meta.project_name || markdownSection(content, ["project", "projekt", "scope"]);
+  const project = normalizeProject(explicitProject);
+  const title = textOrNull(
+    input.title ||
+    meta.title ||
+    markdownSection(content, ["title", "titel", "task", "aufgabe", "finding", "befund"]) ||
+    firstMarkdownTitle(content) ||
+    briefPreview(content, 220),
+    260
+  );
+  const summary = textOrNull(
+    input.summary ||
+    meta.summary ||
+    markdownSection(content, ["request", "anforderung", "summary", "zusammenfassung", "description", "beschreibung", "details", "befund"]) ||
+    briefPreview(content, 1200),
+    4000
+  );
+  const files = extractBriefFiles(content, meta);
+  const acceptance = listInput(input.acceptance || input.acceptance_criteria || meta.acceptance || meta.acceptance_criteria)
+    .concat(sectionList(content, ["acceptance", "akzeptanz", "done", "definition of done", "annahme", "verify", "verification", "test"]));
+  const priorityText = input.priority || meta.priority || markdownSection(content, ["priority", "priorität", "prio"]) || content;
+  const category = normalizeIntentKind(input.category || input.kind || meta.category || meta.kind || "brief");
+  const draft = {
+    project,
+    title,
+    summary,
+    category,
+    priority: inferUserIntentPriority(priorityText + " " + title + " " + summary, input.priority || meta.priority),
+    status: normalizeTaskStatus(input.task_status || input.status_for_task || "open"),
+    owner_agent: normalizeAgentName(input.owner_agent || input.owner || meta.owner_agent || row.agent_name || "") || null,
+    assigned_agent: normalizeAgentName(input.assigned_agent || input.agent_name || input.assignee || meta.assigned_agent || row.agent_name || "") || null,
+    acceptance: uniqueStrings(acceptance),
+    blockers: listInput(input.blockers || meta.blockers),
+    files,
+    source_kind: "agent_brief",
+    source_id: String(row.id),
+    source_ref: input.source_ref || meta.source_ref || ("agent_brief:" + row.id),
+    created_by: normalizeAgentName(input.created_by || input.agent_name || row.source_agent || "mnemo") || "mnemo",
+    meta: Object.assign({}, meta, {
+      brief_id: row.id,
+      brief_agent_name: row.agent_name || null,
+      brief_source_agent: row.source_agent || null,
+      files,
+    }),
+  };
+  return draft;
+}
+
+function insertProjectTaskIngest(db, values) {
+  db.prepare(`
+    INSERT OR IGNORE INTO project_task_ingest
+      (scope, source_kind, source_id, dedupe_key, task_id, project, brief_id, status, meta_json, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  `).run(
+    values.scope,
+    values.source_kind,
+    String(values.source_id),
+    values.dedupe_key,
+    values.task_id,
+    values.project || null,
+    values.brief_id || null,
+    values.status || "linked",
+    safeJson(values.meta || {}, {})
+  );
+}
+
+function ingestOneBriefAsTask(db, row, input = {}) {
+  const scope = scopeName(input.scope);
+  const sourceId = String(row.id);
+  const existingSource = db.prepare("SELECT * FROM project_task_ingest WHERE scope=? AND source_kind='agent_brief' AND source_id=?").get(scope, sourceId);
+  if (existingSource) {
+    const task = db.prepare("SELECT * FROM project_task WHERE id=?").get(existingSource.task_id);
+    return { action: "source_existing", brief_id: row.id, task: rowToProjectTask(task), task_id: existingSource.task_id };
+  }
+
+  const draft = briefToTaskDraft(row, input);
+  if (!draft.project || !draft.title) {
+    return { action: "skipped", reason: !draft.project ? "project_missing" : "title_missing", brief_id: row.id };
+  }
+  const dedupe = briefTaskDedupeKey(scope, draft);
+  draft.meta.dedupe_key = dedupe.key;
+  draft.meta.dedupe_basis = dedupe.basis;
+
+  if (input.dry_run === true) {
+    return { action: "dry_run", brief_id: row.id, dedupe_key: dedupe.key, draft };
+  }
+
+  let task = null;
+  let action = "created";
+  const mapped = db.prepare("SELECT * FROM project_task_ingest WHERE scope=? AND dedupe_key=? ORDER BY updated_at DESC LIMIT 1").get(scope, dedupe.key);
+  if (mapped) {
+    task = db.prepare("SELECT * FROM project_task WHERE id=?").get(mapped.task_id);
+    action = "linked_duplicate";
+  }
+  if (!task) {
+    const where = ["scope=?", "project=?", "title=?"];
+    const params = [scope, draft.project, draft.title];
+    if (input.include_done !== true) where.push("status NOT IN ('done','closed','cancelled')");
+    task = db.prepare(`SELECT * FROM project_task WHERE ${where.join(" AND ")} ORDER BY updated_at DESC LIMIT 1`).get(...params);
+    if (task) action = "linked_existing";
+  }
+  if (!task) {
+    const created = projectTaskCreate(db, Object.assign({}, draft, {
+      scope,
+      meta: draft.meta,
+    }));
+    task = created.task;
+    action = "created";
+  } else {
+    task = rowToProjectTask(task);
+  }
+
+  insertProjectTaskIngest(db, {
+    scope,
+    source_kind: "agent_brief",
+    source_id: sourceId,
+    dedupe_key: dedupe.key,
+    task_id: task.id,
+    project: draft.project,
+    brief_id: row.id,
+    status: action,
+    meta: { dedupe_basis: dedupe.basis, linked_from_agent_brief: row.id },
+  });
+  if (input.mark_brief_status) {
+    try {
+      db.prepare("UPDATE agent_brief SET status=? WHERE id=?").run(String(input.mark_brief_status), row.id);
+    } catch {}
+  }
+  return { action, brief_id: row.id, dedupe_key: dedupe.key, task };
+}
+
+function briefTaskIngest(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  if (!tableExists(db, "agent_brief")) return { ok: true, count: 0, created: 0, linked: 0, skipped: 0, results: [], note: "agent_brief table missing" };
+  const scope = scopeName(input.scope);
+  const where = [];
+  const params = [];
+  const briefIds = uniqueStrings([].concat(input.brief_ids || [], input.brief_id || []).filter((id) => id !== undefined && id !== null)).map((id) => parseInt(id, 10)).filter(Boolean);
+  if (briefIds.length) {
+    where.push(`id IN (${briefIds.map(() => "?").join(",")})`);
+    params.push(...briefIds);
+  } else {
+    const statuses = listInput(input.statuses || input.status || ["pending", "dispatched"]);
+    if (statuses.length && input.include_all_statuses !== true) {
+      where.push(`status IN (${statuses.map(() => "?").join(",")})`);
+      params.push(...statuses);
+    }
+    if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+    if (input.source_agent) { where.push("source_agent=?"); params.push(normalizeAgentName(input.source_agent)); }
+    const project = normalizeProject(input.project || input.default_project);
+    if (project) {
+      where.push("(content LIKE ? OR (json_valid(meta_json) AND json_extract(meta_json,'$.project')=?))");
+      params.push("%" + project + "%", project);
+    }
+  }
+  const limit = clampInt(input.limit, 20, 1, 200);
+  params.push(limit);
+  const rows = db.prepare(`SELECT id, agent_name, source_agent, content, status, created_at, meta_json FROM agent_brief ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at ASC, id ASC LIMIT ?`).all(...params);
+  const results = rows.map((row) => ingestOneBriefAsTask(db, row, Object.assign({}, input, { scope })));
+  return {
+    ok: true,
+    count: results.length,
+    created: results.filter((result) => result.action === "created").length,
+    linked: results.filter((result) => result.action === "linked_duplicate" || result.action === "linked_existing" || result.action === "source_existing").length,
+    skipped: results.filter((result) => result.action === "skipped").length,
+    dry_run: input.dry_run === true,
+    results,
+  };
+}
+
 function userIntentCapture(db, input = {}) {
   ensureAgentGovernanceSchema(db);
   const scope = scopeName(input.scope);
@@ -1937,7 +2223,19 @@ function projectBoard(db, input = {}) {
   const policy = projectChannelPolicyGet(db, { scope, project }).policy || null;
   const activeWorkOrders = latestRows(db, "SELECT * FROM work_order WHERE scope=? AND project=? AND status NOT IN ('done','closed','cancelled') ORDER BY updated_at DESC LIMIT ?", [scope, project, limit], rowToWorkOrder);
   const pendingBriefs = tableExists(db, "agent_brief")
-    ? latestRows(db, "SELECT id, agent_name, source_agent, status, substr(content,1,240) AS preview, created_at FROM agent_brief WHERE status IN ('pending','dispatched') AND (content LIKE ? OR (json_valid(meta_json) AND json_extract(meta_json,'$.project')=?)) ORDER BY created_at DESC LIMIT ?", ["%" + project + "%", project, limit])
+    ? latestRows(
+      db,
+      `SELECT b.id, b.agent_name, b.source_agent, b.status, substr(b.content,1,240) AS preview, b.created_at
+       FROM agent_brief b
+       WHERE b.status IN ('pending','dispatched')
+         AND (b.content LIKE ? OR (json_valid(b.meta_json) AND json_extract(b.meta_json,'$.project')=?))
+         AND (?=1 OR NOT EXISTS (
+           SELECT 1 FROM project_task_ingest ti
+           WHERE ti.scope=? AND ti.source_kind='agent_brief' AND ti.source_id=CAST(b.id AS TEXT)
+         ))
+       ORDER BY b.created_at DESC LIMIT ?`,
+      ["%" + project + "%", project, input.include_ingested_briefs === true ? 1 : 0, scope, limit]
+    )
     : [];
   const intents = latestRows(db, "SELECT * FROM user_intent WHERE scope=? AND (project=? OR project IS NULL) AND status NOT IN ('done','closed','cancelled') ORDER BY created_at DESC LIMIT ?", [scope, project, limit], rowToUserIntent);
   const byStatus = {};
@@ -2070,6 +2368,10 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
     description: "List durable project tasks by project, owner, assigned agent, status, or priority.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, owner_agent: { type: "string" }, owner: { type: "string" }, status: { type: "string" }, include_done: { type: "boolean" }, limit: { type: "integer" } } }
   },
+  mem_brief_task_ingest: {
+    description: "Convert pending Mnemo agent briefs into durable project tasks with deterministic dedupe. Use this before project boards so old briefs stop reappearing as loose work.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, brief_id: { type: "integer" }, brief_ids: { type: "array", items: { type: "integer" } }, agent_name: { type: "string" }, source_agent: { type: "string" }, project: { type: "string" }, default_project: { type: "string" }, status: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, statuses: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, limit: { type: "integer" }, title: { type: "string" }, summary: { type: "string" }, category: { type: "string" }, kind: { type: "string" }, priority: { type: "string" }, assigned_agent: { type: "string" }, assignee: { type: "string" }, owner_agent: { type: "string" }, owner: { type: "string" }, created_by: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, mark_brief_status: { type: "string" }, include_done: { type: "boolean" }, include_all_statuses: { type: "boolean" }, dry_run: { type: "boolean" } } }
+  },
   mem_user_intent_capture: {
     description: "Capture what the human actually wants in durable form, optionally creating a project task and/or active focus. Use this when user wording is business intent, not agent-internal thinking.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, user_name: { type: "string" }, user: { type: "string" }, actor: { type: "string" }, source_channel: { type: "string" }, channel: { type: "string" }, message_ref: { type: "string" }, source_ref: { type: "string" }, intent_kind: { type: "string" }, kind: { type: "string" }, summary: { type: "string" }, intent: { type: "string" }, exact_words: { type: "string" }, text: { type: "string" }, message: { type: "string" }, content: { type: "string" }, priority: { type: "string" }, status: { type: "string" }, linked_task_id: { type: "integer" }, task_id: { type: "integer" }, linked_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, create_task: { type: "boolean" }, set_focus: { type: "boolean" }, task_title: { type: "string" }, task_status: { type: "string" }, surface: { type: "string" }, active_target: { type: "string" }, owner_agent: { type: "string" }, coordinator_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_not_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, out_of_scope: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, meta: { type: "object" } } }
@@ -2084,7 +2386,7 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
   },
   mem_project_board: {
     description: "Render a project operating board: active focus, channel policy, tasks, active Work Orders, pending briefs, user intents, and next actions.",
-    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, include_done: { type: "boolean" }, limit: { type: "integer" } }, required: ["project"] }
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, include_done: { type: "boolean" }, include_ingested_briefs: { type: "boolean" }, limit: { type: "integer" } }, required: ["project"] }
   },
 };
 
@@ -2113,6 +2415,7 @@ function handleAgentGovernanceTool(db, name, input = {}) {
   if (name === "mem_project_task_create") return { handled: true, result: projectTaskCreate(db, input || {}) };
   if (name === "mem_project_task_update") return { handled: true, result: projectTaskUpdate(db, input || {}) };
   if (name === "mem_project_task_list") return { handled: true, result: projectTaskList(db, input || {}) };
+  if (name === "mem_brief_task_ingest") return { handled: true, result: briefTaskIngest(db, input || {}) };
   if (name === "mem_user_intent_capture") return { handled: true, result: userIntentCapture(db, input || {}) };
   if (name === "mem_project_channel_policy_set") return { handled: true, result: projectChannelPolicySet(db, input || {}) };
   if (name === "mem_project_channel_policy_get") return { handled: true, result: projectChannelPolicyGet(db, input || {}) };
@@ -2149,6 +2452,7 @@ module.exports = {
   projectTaskCreate,
   projectTaskUpdate,
   projectTaskList,
+  briefTaskIngest,
   userIntentCapture,
   projectChannelPolicySet,
   projectChannelPolicyGet,

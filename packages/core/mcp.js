@@ -135,6 +135,7 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_project_task_create",
   "mem_project_task_update",
   "mem_project_task_list",
+  "mem_brief_task_ingest",
   "mem_user_intent_capture",
   "mem_project_channel_policy_set",
   "mem_project_channel_policy_get",

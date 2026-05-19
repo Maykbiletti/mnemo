@@ -438,6 +438,47 @@ let workOrderId;
   assert.strictEqual(tasks.ok, true);
   assert(tasks.count >= 1);
 
+  const briefContent = `# Wizard2 QA Brief
+## Title
+Wizard2 header nav overflow
+## Project
+apps.blun.ai
+## Request
+Generated Wizard2 output has too many header nav items and overflows the viewport.
+## Acceptance
+- Top navigation fits without horizontal scroll
+- Legal links move to footer
+## Files
+- /root/blun-website/src/routes/wizard-build.js`;
+  const firstBrief = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)")
+    .run("alfred", "dieter", briefContent, JSON.stringify({ project: "apps.blun.ai", priority: "high" })).lastInsertRowid;
+  const ingest = tool("mem_brief_task_ingest", {
+    brief_id: firstBrief,
+    default_project: "apps.blun.ai",
+    assigned_agent: "alfred",
+    created_by: "mnemo",
+  });
+  assert.strictEqual(ingest.ok, true);
+  assert.strictEqual(ingest.created, 1);
+  assert.strictEqual(ingest.results[0].task.source_kind, "agent_brief");
+  assert.strictEqual(ingest.results[0].task.source_id, String(firstBrief));
+  assert(ingest.results[0].task.acceptance.includes("Top navigation fits without horizontal scroll"));
+
+  const duplicateBrief = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)")
+    .run("alfred", "angel", briefContent, JSON.stringify({ project: "apps.blun.ai", priority: "high" })).lastInsertRowid;
+  const duplicateIngest = tool("mem_brief_task_ingest", {
+    brief_id: duplicateBrief,
+    default_project: "apps.blun.ai",
+    assigned_agent: "alfred",
+  });
+  assert.strictEqual(duplicateIngest.ok, true);
+  assert.strictEqual(duplicateIngest.created, 0);
+  assert.strictEqual(duplicateIngest.linked, 1);
+  assert.strictEqual(duplicateIngest.results[0].task.id, ingest.results[0].task.id);
+
+  const repeatedIngest = tool("mem_brief_task_ingest", { brief_id: firstBrief, default_project: "apps.blun.ai" });
+  assert.strictEqual(repeatedIngest.results[0].action, "source_existing");
+
   const board = tool("mem_project_board", { project: "apps.blun.ai" });
   assert.strictEqual(board.ok, true);
   assert.strictEqual(board.focus.surface, "wizard2");
@@ -445,6 +486,10 @@ let workOrderId;
   assert(board.summary.open_tasks >= 1);
   assert(board.summary.active_work_orders >= 1);
   assert(board.tasks_by_status.active.some((task) => task.id === intent.task.id));
+  assert(board.tasks_by_status.open.some((task) => task.id === ingest.results[0].task.id));
+  assert(!board.pending_briefs.some((brief) => brief.id === firstBrief || brief.id === duplicateBrief));
+  const boardWithBriefs = tool("mem_project_board", { project: "apps.blun.ai", include_ingested_briefs: true });
+  assert(boardWithBriefs.pending_briefs.some((brief) => brief.id === firstBrief));
   assert.strictEqual(board.channel_rule, "Telegram coordinates; Mnemo briefs assign durable work; Work Orders authorize execution; Company Ledger remains truth.");
 }
 
