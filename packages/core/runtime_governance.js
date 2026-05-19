@@ -152,13 +152,14 @@ function defaultRuntimePolicy(input = {}) {
     required_project_board: true,
     required_chat_sync: true,
     required_memory_update: true,
+    required_message_capture: true,
     required_board: "",
     stale_after_minutes: 15,
     full_sync_every_messages: 10,
     response_allowed_when_context_missing: true,
     warning_token_required: true,
     status: "active",
-    required_actions: ["mem_brief_pull", "mem_recall", "mem_project_board", "mem_event_log"],
+    required_actions: ["mem_capture_ingest", "mem_brief_pull", "mem_recall", "mem_project_board", "mem_event_log"],
     meta: { source: "default" },
     updated_by: null,
     created_at: null,
@@ -283,6 +284,7 @@ CREATE TABLE IF NOT EXISTS runtime_policy (
   required_project_board INTEGER NOT NULL DEFAULT 1,
   required_chat_sync INTEGER NOT NULL DEFAULT 1,
   required_memory_update INTEGER NOT NULL DEFAULT 1,
+  required_message_capture INTEGER NOT NULL DEFAULT 1,
   required_board TEXT,
   stale_after_minutes INTEGER NOT NULL DEFAULT 15,
   full_sync_every_messages INTEGER NOT NULL DEFAULT 10,
@@ -299,6 +301,10 @@ CREATE TABLE IF NOT EXISTS runtime_policy (
 CREATE INDEX IF NOT EXISTS idx_runtime_policy_lookup ON runtime_policy(scope, runtime_name, agent_name, channel, project, status);
 CREATE INDEX IF NOT EXISTS idx_runtime_policy_agent ON runtime_policy(agent_name, status, updated_at DESC);
 `);
+
+  try {
+    db.exec("ALTER TABLE runtime_policy ADD COLUMN required_message_capture INTEGER NOT NULL DEFAULT 1");
+  } catch {}
 
   try {
     db.exec(`
@@ -528,6 +534,7 @@ function rowToRuntimePolicy(row) {
     required_project_board: !!row.required_project_board,
     required_chat_sync: !!row.required_chat_sync,
     required_memory_update: !!row.required_memory_update,
+    required_message_capture: row.required_message_capture == null ? true : !!row.required_message_capture,
     response_allowed_when_context_missing: !!row.response_allowed_when_context_missing,
     warning_token_required: !!row.warning_token_required,
     required_actions: parseJsonField(row.required_actions_json, []),
@@ -546,9 +553,9 @@ function runtimePolicySet(db, input = {}) {
   const base = defaultRuntimePolicy({ scope, runtime_name: runtime, agent_name: agent, channel, project, policy_key: policyKey });
   const requiredActions = normalizeStringList(input.required_actions || input.required_actions_json || base.required_actions);
   db.prepare(
-    "INSERT INTO runtime_policy (scope, runtime_name, agent_name, channel, project, policy_key, required_brief_pull, required_recall, required_project_board, required_chat_sync, required_memory_update, required_board, stale_after_minutes, full_sync_every_messages, response_allowed_when_context_missing, warning_token_required, status, required_actions_json, meta_json, updated_by, updated_at) " +
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) " +
-    "ON CONFLICT(scope, runtime_name, policy_key) DO UPDATE SET agent_name=excluded.agent_name, channel=excluded.channel, project=excluded.project, required_brief_pull=excluded.required_brief_pull, required_recall=excluded.required_recall, required_project_board=excluded.required_project_board, required_chat_sync=excluded.required_chat_sync, required_memory_update=excluded.required_memory_update, required_board=excluded.required_board, stale_after_minutes=excluded.stale_after_minutes, full_sync_every_messages=excluded.full_sync_every_messages, response_allowed_when_context_missing=excluded.response_allowed_when_context_missing, warning_token_required=excluded.warning_token_required, status=excluded.status, required_actions_json=excluded.required_actions_json, meta_json=excluded.meta_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at"
+    "INSERT INTO runtime_policy (scope, runtime_name, agent_name, channel, project, policy_key, required_brief_pull, required_recall, required_project_board, required_chat_sync, required_memory_update, required_message_capture, required_board, stale_after_minutes, full_sync_every_messages, response_allowed_when_context_missing, warning_token_required, status, required_actions_json, meta_json, updated_by, updated_at) " +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) " +
+    "ON CONFLICT(scope, runtime_name, policy_key) DO UPDATE SET agent_name=excluded.agent_name, channel=excluded.channel, project=excluded.project, required_brief_pull=excluded.required_brief_pull, required_recall=excluded.required_recall, required_project_board=excluded.required_project_board, required_chat_sync=excluded.required_chat_sync, required_memory_update=excluded.required_memory_update, required_message_capture=excluded.required_message_capture, required_board=excluded.required_board, stale_after_minutes=excluded.stale_after_minutes, full_sync_every_messages=excluded.full_sync_every_messages, response_allowed_when_context_missing=excluded.response_allowed_when_context_missing, warning_token_required=excluded.warning_token_required, status=excluded.status, required_actions_json=excluded.required_actions_json, meta_json=excluded.meta_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at"
   ).run(
     scope,
     runtime,
@@ -561,6 +568,7 @@ function runtimePolicySet(db, input = {}) {
     boolFlag(input.required_project_board, base.required_project_board) ? 1 : 0,
     boolFlag(input.required_chat_sync, base.required_chat_sync) ? 1 : 0,
     boolFlag(input.required_memory_update, base.required_memory_update) ? 1 : 0,
+    boolFlag(input.required_message_capture, base.required_message_capture) ? 1 : 0,
     input.required_board != null ? String(input.required_board) : base.required_board,
     intFlag(input.stale_after_minutes, base.stale_after_minutes, 1, 10080),
     intFlag(input.full_sync_every_messages, base.full_sync_every_messages, 1, 100000),
@@ -654,6 +662,7 @@ function runtimePolicyCheck(db, input = {}) {
   if (policy.required_project_board) addMissing("mem_project_board", requirementStale(input, "project_board", staleAfter));
   if (policy.required_chat_sync) addMissing("chat_sync", requirementStale(input, "chat_sync", staleAfter));
   if (policy.required_memory_update) addMissing("memory_update", requirementStale(input, "memory_update", staleAfter));
+  if (policy.required_message_capture) addMissing("message_capture", requirementStale(input, "message_capture", staleAfter));
   if (policy.required_board) {
     const board = String(input.board || input.project_board || "").trim().toLowerCase();
     const requiredBoard = String(policy.required_board || "").trim().toLowerCase();
@@ -902,7 +911,7 @@ const RUNTIME_GOVERNANCE_TOOL_DEFS = {
   },
   mem_runtime_policy_set: {
     description: "Set an adapter/runtime response policy for an agent/channel/project, including mandatory Mnemo context sync, stale limits, and every-N-message full sync cadence.",
-    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, project: { type: "string" }, policy_key: { type: "string" }, required_brief_pull: { type: "boolean" }, required_recall: { type: "boolean" }, required_project_board: { type: "boolean" }, required_chat_sync: { type: "boolean" }, required_memory_update: { type: "boolean" }, required_board: { type: "string" }, stale_after_minutes: { type: "integer" }, full_sync_every_messages: { type: "integer" }, response_allowed_when_context_missing: { type: "boolean" }, warning_token_required: { type: "boolean" }, required_actions: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, status: { type: "string" }, meta: { type: "object" }, updated_by: { type: "string" } } }
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, project: { type: "string" }, policy_key: { type: "string" }, required_brief_pull: { type: "boolean" }, required_recall: { type: "boolean" }, required_project_board: { type: "boolean" }, required_chat_sync: { type: "boolean" }, required_memory_update: { type: "boolean" }, required_message_capture: { type: "boolean" }, required_board: { type: "string" }, stale_after_minutes: { type: "integer" }, full_sync_every_messages: { type: "integer" }, response_allowed_when_context_missing: { type: "boolean" }, warning_token_required: { type: "boolean" }, required_actions: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, status: { type: "string" }, meta: { type: "object" }, updated_by: { type: "string" } } }
   },
   mem_runtime_policy_get: {
     description: "Return the effective runtime response policy for an agent/channel/project, falling back to built-in defaults when no stored policy exists.",
@@ -910,7 +919,7 @@ const RUNTIME_GOVERNANCE_TOOL_DEFS = {
   },
   mem_runtime_policy_check: {
     description: "Check whether a runtime/agent is allowed to answer now, enforcing stale Mnemo context, project-board load, chat/memory sync, and every-N-message full sync. Writes an audit event and returns audit_id.",
-    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, project: { type: "string" }, board: { type: "string" }, project_board: { type: "string" }, message_count_since_full_sync: { type: "integer" }, messages_since_full_sync: { type: "integer" }, turn_number: { type: "integer" }, has_full_sync: { type: "boolean" }, full_sync_completed: { type: "boolean" }, has_brief_pull: { type: "boolean" }, has_recall: { type: "boolean" }, has_project_board: { type: "boolean" }, has_chat_sync: { type: "boolean" }, has_memory_update: { type: "boolean" }, brief_pull_at: { type: "string" }, recall_at: { type: "string" }, project_board_at: { type: "string" }, chat_sync_at: { type: "string" }, memory_update_at: { type: "string" }, minutes_since_brief_pull: { type: "number" }, minutes_since_recall: { type: "number" }, minutes_since_project_board: { type: "number" }, minutes_since_chat_sync: { type: "number" }, minutes_since_memory_update: { type: "number" }, message_ref: { type: "string" }, session_key: { type: "string" }, meta: { type: "object" } } }
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, runtime_name: { type: "string" }, agent_name: { type: "string" }, channel: { type: "string" }, project: { type: "string" }, board: { type: "string" }, project_board: { type: "string" }, message_count_since_full_sync: { type: "integer" }, messages_since_full_sync: { type: "integer" }, turn_number: { type: "integer" }, has_full_sync: { type: "boolean" }, full_sync_completed: { type: "boolean" }, has_brief_pull: { type: "boolean" }, has_recall: { type: "boolean" }, has_project_board: { type: "boolean" }, has_chat_sync: { type: "boolean" }, has_memory_update: { type: "boolean" }, has_message_capture: { type: "boolean" }, brief_pull_at: { type: "string" }, recall_at: { type: "string" }, project_board_at: { type: "string" }, chat_sync_at: { type: "string" }, memory_update_at: { type: "string" }, message_capture_at: { type: "string" }, minutes_since_brief_pull: { type: "number" }, minutes_since_recall: { type: "number" }, minutes_since_project_board: { type: "number" }, minutes_since_chat_sync: { type: "number" }, minutes_since_memory_update: { type: "number" }, minutes_since_message_capture: { type: "number" }, message_ref: { type: "string" }, session_key: { type: "string" }, meta: { type: "object" } } }
   },
   mem_runtime_tool_receipt_start: {
     description: "Open a Mnemo receipt for an external runtime toolrun. This must run before OpenClaw-like tool execution and stores the preflight result, capability gate, claims, approvals, resources, and receipt id.",

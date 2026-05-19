@@ -156,6 +156,7 @@ function tool(name, args) {
   assert.strictEqual(angelDefault.ok, true);
   assert.strictEqual(angelDefault.source, "default");
   assert.strictEqual(angelDefault.policy.required_brief_pull, true);
+  assert.strictEqual(angelDefault.policy.required_message_capture, true);
   assert.strictEqual(angelDefault.policy.required_board, "wizard2-bridge");
   assert.strictEqual(angelDefault.policy.stale_after_minutes, 15);
   assert.strictEqual(angelDefault.policy.full_sync_every_messages, 10);
@@ -187,6 +188,7 @@ function tool(name, args) {
     has_project_board: true,
     has_chat_sync: true,
     has_memory_update: true,
+    has_message_capture: true,
   });
   assert.strictEqual(afterLoad.status, "ok");
   assert.strictEqual(afterLoad.allowed, true);
@@ -214,6 +216,7 @@ function tool(name, args) {
     required_board: "demo-board",
     stale_after_minutes: 5,
     full_sync_every_messages: 10,
+    required_message_capture: true,
     response_allowed_when_context_missing: true,
     updated_by: "mayk",
   });
