@@ -471,6 +471,125 @@ function runtimeTurnBegin(db, input = {}, ops = {}) {
   return result;
 }
 
+function runtimeTurnFinish(db, input = {}, ops = {}) {
+  ensureRuntimeTurnSchema(db);
+  const content = compactContent(
+    input.response !== undefined ? input.response : (input.content !== undefined ? input.content : (input.text !== undefined ? input.text : input.message)),
+    input.max_content_chars || 12000
+  ) || "";
+  if (!content && !boolFlag(input.has_media, false)) return { ok: false, status: "error", error: "response/content/text/message required" };
+
+  const state = upsertTurnState(db, input, {
+    increment: false,
+    meta: { last_outbound_ref: input.message_ref || input.ref_id || input.message_id || null },
+  });
+  const now = nowIso();
+  const runtime = state.runtime_name || normalizeRuntimeName(input.runtime_name || input.runtime || input.adapter || "external");
+  const agent = state.agent_name || normalizeAgentName(input.agent_name || input.agent || "agent") || "agent";
+  const telegram = shouldUseTelegramEnvelope(input);
+  const messageId = input.message_id || (input.meta && input.meta.message_id) || input.ref_id || null;
+  const refId = input.ref_id || messageId || `out:${state.turn_key}:${Date.now()}`;
+  const meta = Object.assign({}, input.meta || {}, {
+    runtime_name: runtime,
+    agent_name: agent,
+    project: state.project || input.project || null,
+    board: state.board || inferBoard(input) || null,
+    runtime_turn_key: state.turn_key,
+    outbound: true,
+    recipient: input.recipient || input.target || input.to || null,
+    reply_to_ref: input.reply_to_ref || input.reply_to_message_id || input.in_reply_to || null,
+  });
+  if (input.chat_id && !meta.chat_id) meta.chat_id = input.chat_id;
+  if (messageId && !meta.message_id) meta.message_id = messageId;
+
+  let capture = { ok: false, error: "capture op missing" };
+  if (typeof ops.capture === "function") {
+    try {
+      capture = ops.capture({
+        source: input.source || `runtime:${runtime}:outbound`,
+        channel: state.channel || input.channel || "runtime",
+        direction: "outbound",
+        actor: input.actor || input.speaker || agent,
+        actor_id: input.actor_id || input.user_id || meta.actor_id || meta.user_id || null,
+        speaker: input.speaker || input.actor || agent,
+        event_kind: input.event_kind || "runtime_response",
+        ref_kind: telegram ? "telegram_message" : (input.ref_kind || "runtime_response"),
+        ref_id: String(refId),
+        source_ref: input.source_ref || `runtime_response:${runtime}:${agent}:${refId}`,
+        thread_id: state.thread_id || inferThreadId(input),
+        occurred_at: input.occurred_at || now,
+        content,
+        promote_transcript: input.promote_transcript !== false,
+        promote_memory: input.promote_memory !== false,
+        remember: input.remember !== false,
+        importance: input.importance != null ? input.importance : 4,
+        meta,
+      });
+    } catch (e) {
+      capture = { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  let event = null;
+  if (typeof ops.eventLog === "function") {
+    try {
+      event = ops.eventLog({
+        source: "runtime_turn_gate",
+        channel: state.channel,
+        direction: "outbound",
+        actor: agent,
+        event_kind: "runtime_outbound_capture",
+        ref_kind: "runtime_turn_state",
+        ref_id: state.turn_key,
+        thread_id: state.thread_id,
+        status: capture && capture.ok ? "ok" : "error",
+        content: `runtime outbound capture for ${agent}`,
+        payload: {
+          capture_ok: !!(capture && capture.ok),
+          response_ref: String(refId),
+          recipient: meta.recipient || null,
+        },
+        meta: { runtime_name: runtime, error: capture && capture.error || null },
+      });
+    } catch {}
+  }
+
+  const updated = capture && capture.ok
+    ? upsertTurnState(db, input, {
+        increment: false,
+        last_chat_sync_at: now,
+        last_memory_update_at: now,
+        meta: { last_outbound_capture_id: capture.event_id || capture.memory_id || null },
+      })
+    : state;
+
+  return {
+    ok: !!(capture && capture.ok),
+    status: capture && capture.ok ? "captured" : "error",
+    runtime_name: runtime,
+    agent_name: agent,
+    channel: updated.channel,
+    project: updated.project,
+    board: updated.board,
+    turn_key: updated.turn_key,
+    thread_id: updated.thread_id,
+    direction: "outbound",
+    capture,
+    event_log_id: event && event.id || null,
+    context_block: [
+      "[Mnemo Runtime Outbound]",
+      `status: ${capture && capture.ok ? "captured" : "error"}`,
+      `runtime: ${runtime}`,
+      `agent: ${agent}`,
+      `project: ${updated.project || ""}`,
+      `turn_key: ${updated.turn_key}`,
+      `outbound_captured: ${capture && capture.ok ? "yes" : "no"}`,
+      `event_log_id: ${event && event.id || ""}`,
+      "[/Mnemo Runtime Outbound]",
+    ].join("\n"),
+  };
+}
+
 const RUNTIME_TURN_TOOL_DEFS = {
   mem_runtime_turn_begin: {
     description: "Runtime-neutral pre-answer gate for CodexLink, Claude/aigramm, and portal chat: capture the inbound message, recall memory, refresh briefs/project board as required, run the every-N-message full sync, and return an allow/block context block before the agent may answer.",
@@ -521,11 +640,61 @@ const RUNTIME_TURN_TOOL_DEFS = {
       required: ["agent_name"],
     },
   },
+  mem_runtime_turn_finish: {
+    description: "Runtime-neutral outbound capture hook. Call after an agent sends a reply to Mayk, Telegram, another agent, email, or a portal chat so agent-to-agent and agent-to-human messages are captured in Mnemo, not only inbound user prompts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string" },
+        runtime_name: { type: "string" },
+        runtime: { type: "string" },
+        adapter: { type: "string" },
+        agent_name: { type: "string" },
+        agent: { type: "string" },
+        channel: { type: "string" },
+        project: { type: "string" },
+        board: { type: "string" },
+        project_board: { type: "string" },
+        thread_id: { type: "string" },
+        session_id: { type: "string" },
+        session_key: { type: "string" },
+        conversation_id: { type: "string" },
+        chat_id: { type: "string" },
+        message_id: { type: "string" },
+        message_ref: { type: "string" },
+        ref_kind: { type: "string" },
+        ref_id: { type: "string" },
+        source: { type: "string" },
+        source_ref: { type: "string" },
+        actor: { type: "string" },
+        speaker: { type: "string" },
+        actor_id: { type: "string" },
+        user_id: { type: "string" },
+        recipient: { type: "string" },
+        target: { type: "string" },
+        to: { type: "string" },
+        reply_to_ref: { type: "string" },
+        reply_to_message_id: { type: "string" },
+        in_reply_to: { type: "string" },
+        response: { type: "string" },
+        content: { type: "string" },
+        text: { type: "string" },
+        message: { type: "string" },
+        promote_memory: { type: "boolean" },
+        promote_transcript: { type: "boolean" },
+        remember: { type: "boolean" },
+        telegram: { type: "boolean" },
+        meta: { type: "object" },
+      },
+      required: ["agent_name"],
+    },
+  },
 };
 
 module.exports = {
   RUNTIME_TURN_TOOL_DEFS,
   ensureRuntimeTurnSchema,
   runtimeTurnBegin,
+  runtimeTurnFinish,
   buildTurnKey,
 };

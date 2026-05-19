@@ -39,7 +39,7 @@ const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool }
 const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool, runtimeToolReceiptStart } = require("./runtime_governance");
-const { RUNTIME_TURN_TOOL_DEFS, runtimeTurnBegin } = require("./runtime_turn_gate");
+const { RUNTIME_TURN_TOOL_DEFS, runtimeTurnBegin, runtimeTurnFinish } = require("./runtime_turn_gate");
 const { MEMORY_CONSOLIDATION_TOOL_DEFS, ensureMemoryConsolidationSchema, handleMemoryConsolidationTool } = require("./memory_consolidation");
 const { AGENT_GOVERNANCE_TOOL_DEFS, ensureAgentGovernanceSchema, handleAgentGovernanceTool, capabilityTokenCheck, requiresCapabilityToken } = require("./agent_governance");
 
@@ -101,6 +101,7 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_runtime_policy_get",
   "mem_runtime_policy_check",
   "mem_runtime_turn_begin",
+  "mem_runtime_turn_finish",
   "mem_runtime_tool_receipt_start",
   "mem_runtime_tool_receipt_finish",
   "mem_runtime_tool_receipt_list",
@@ -8706,6 +8707,12 @@ for (const [name, def] of Object.entries(RUNTIME_TURN_TOOL_DEFS)) {
     handler: async (args) => {
       const input = args || {};
       if (HUB_URL) return await callHub(name, input);
+      if (name === "mem_runtime_turn_finish") {
+        return runtimeTurnFinish(db, input, {
+          capture: (payload) => captureIngest(payload || {}),
+          eventLog: (payload) => tools.mem_event_log.handler(payload || {}),
+        });
+      }
       return runtimeTurnBegin(db, input, {
         capture: (payload) => captureIngest(payload || {}),
         // Local MCP fallback keeps the gate usable without a hub. Hub mode runs

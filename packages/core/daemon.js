@@ -77,7 +77,7 @@ const { ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_rou
 const { ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool } = require("./runtime_governance");
-const { runtimeTurnBegin } = require("./runtime_turn_gate");
+const { runtimeTurnBegin, runtimeTurnFinish } = require("./runtime_turn_gate");
 const { ensureMemoryConsolidationSchema, handleMemoryConsolidationTool, dreammodeRun } = require("./memory_consolidation");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
@@ -1808,7 +1808,7 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_recall","mem_recall_ids","mem_recall_layered","mem_recall_at_time","mem_recall_on_date","mem_recall_between",
   "mem_search","mem_question_answer","mem_neighbors","mem_get","mem_who_am_i",
   "mem_health","mem_loop_doctor","mem_agent_name_migrate","mem_brief_requeue_stale","mem_brief_reconcile_stale","mem_project_timeline_report","mem_work_report_feed","mem_brief_health","mem_brief_status","mem_brief_list","mem_brief_pull","mem_brief_done",
-  "mem_runtime_health","mem_agent_memory_health","mem_runtime_policy_set","mem_runtime_policy_get","mem_runtime_policy_check","mem_runtime_turn_begin","mem_dreammode_run","mem_dreammode_status",
+  "mem_runtime_health","mem_agent_memory_health","mem_runtime_policy_set","mem_runtime_policy_get","mem_runtime_policy_check","mem_runtime_turn_begin","mem_runtime_turn_finish","mem_dreammode_run","mem_dreammode_status",
   "mem_action_log","mem_action_finish","mem_actions_recent","mem_actions_search",
   "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_media_capture","mem_media_recent","mem_media_search","mem_media_get","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_route_resolve","mem_access_preflight","mem_access_event_log",
   "mem_connector_upsert","mem_connector_list","mem_agent_pass_set","mem_agent_pass_get","mem_agent_pass_list","mem_drift_check_report","mem_drift_status",
@@ -4414,6 +4414,12 @@ function handleTool(tdb, name, a) {
       recall: (payload) => recallMemories(tdb, payload || {}),
       briefPull: (payload) => handleTool(tdb, "mem_brief_pull", payload || {}),
       projectBoard: (payload) => handleTool(tdb, "mem_project_board", payload || {}),
+      eventLog: (payload) => handleTool(tdb, "mem_event_log", payload || {}),
+    });
+  }
+  if (name === "mem_runtime_turn_finish") {
+    return runtimeTurnFinish(tdb, a || {}, {
+      capture: (payload) => captureIngest(tdb, payload || {}),
       eventLog: (payload) => handleTool(tdb, "mem_event_log", payload || {}),
     });
   }

@@ -8,7 +8,7 @@ const {
   runtimeToolReceiptStart,
   runtimeToolReceiptFinish,
 } = require("./runtime_governance");
-const { runtimeTurnBegin } = require("./runtime_turn_gate");
+const { runtimeTurnBegin, runtimeTurnFinish } = require("./runtime_turn_gate");
 
 const db = new Database(":memory:");
 db.exec(`
@@ -338,6 +338,22 @@ function tool(name, args) {
   const state = db.prepare("SELECT * FROM runtime_turn_state WHERE agent_name='angel' AND runtime_name='claude-aigramm'").get();
   assert.strictEqual(state.message_count, 2);
   assert.strictEqual(state.message_count_since_full_sync, 0);
+
+  const outbound = runtimeTurnFinish(db, {
+    runtime_name: "claude-aigramm",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "apps.blun.ai:wizard2",
+    thread_id: "blun-group",
+    actor: "angel",
+    recipient: "Filedatabase",
+    response: "Antwort an Mayk muss ebenfalls in Mnemo landen.",
+    ref_id: "outbound-test-1",
+  }, ops);
+  assert.strictEqual(outbound.ok, true);
+  assert.strictEqual(outbound.direction, "outbound");
+  assert(outbound.context_block.includes("outbound_captured: yes"));
+  assert.strictEqual(captureCalls, 3);
 }
 
 console.log("test_runtime_governance ok");
