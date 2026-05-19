@@ -398,18 +398,22 @@ db.pragma("synchronous = NORMAL");
 const TENANT_ROOT = process.env.MNEMO_TENANT_ROOT || path.join(__dirname, "tenants");
 if (!fs.existsSync(TENANT_ROOT)) fs.mkdirSync(TENANT_ROOT, { recursive: true });
 const tenantPool = new Map();
+const tenantOpenFailures = new Map();
 function safeId(id) { return String(id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64); }
 function tenantDb(id) {
   const safe = safeId(id);
   if (!safe) return null;
+  const failedAt = tenantOpenFailures.get(safe);
+  if (failedAt && Date.now() - failedAt < 5 * 60 * 1000) return null;
   if (tenantPool.has(safe)) return tenantPool.get(safe);
   const dir = path.join(TENANT_ROOT, safe);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const dbFile = path.join(dir, "mnemo.db");
-  const tdb = new Database(dbFile);
-  tdb.pragma("journal_mode = WAL");
-  tdb.pragma("synchronous = NORMAL");
+  let tdb;
   try {
+    tdb = new Database(dbFile);
+    tdb.pragma("journal_mode = WAL");
+    tdb.pragma("synchronous = NORMAL");
     bootstrapBaseSchema(tdb, "tenant:" + safe);
     ensureConnectSchema(tdb);
     ensureUniversalJournalSchema(tdb);
@@ -418,7 +422,27 @@ function tenantDb(id) {
     ensureResourceAccessSchema(tdb);
     ensureRuntimeGovernanceSchema(tdb);
     ensureMemoryConsolidationSchema(tdb);
-  } catch (e) { console.error("[tenant-bootstrap]", safe, e.message); }
+  } catch (e) {
+    tenantOpenFailures.set(safe, Date.now());
+    try { if (tdb) tdb.close(); } catch {}
+    const msg = String(e && e.message || e);
+    console.error("[tenant-bootstrap]", safe, msg);
+    try {
+      journalEvent(db, {
+        source: "mnemo-daemon",
+        channel: "tenant",
+        direction: "internal",
+        actor: "mnemo-daemon",
+        event_kind: "tenant_db_open_failed",
+        ref_kind: "tenant",
+        ref_id: safe,
+        status: "error",
+        content: msg,
+        meta: { tenant: safe, db_file: dbFile, fallback: "host_db" },
+      });
+    } catch {}
+    return null;
+  }
   tenantPool.set(safe, tdb);
   return tdb;
 }
