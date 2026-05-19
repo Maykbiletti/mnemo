@@ -39,6 +39,7 @@ const { ACCESS_ROUTE_TOOL_DEFS, ensureAccessRouteSchema, handleAccessRouteTool }
 const { PROTECTED_SCOPE_TOOL_DEFS, ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { RESOURCE_ACCESS_TOOL_DEFS, ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool, runtimeToolReceiptStart } = require("./runtime_governance");
+const { RUNTIME_TURN_TOOL_DEFS, runtimeTurnBegin } = require("./runtime_turn_gate");
 const { MEMORY_CONSOLIDATION_TOOL_DEFS, ensureMemoryConsolidationSchema, handleMemoryConsolidationTool } = require("./memory_consolidation");
 const { AGENT_GOVERNANCE_TOOL_DEFS, ensureAgentGovernanceSchema, handleAgentGovernanceTool, capabilityTokenCheck, requiresCapabilityToken } = require("./agent_governance");
 
@@ -99,6 +100,7 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_runtime_policy_set",
   "mem_runtime_policy_get",
   "mem_runtime_policy_check",
+  "mem_runtime_turn_begin",
   "mem_runtime_tool_receipt_start",
   "mem_runtime_tool_receipt_finish",
   "mem_runtime_tool_receipt_list",
@@ -8695,6 +8697,35 @@ for (const [name, def] of Object.entries(AGENT_GOVERNANCE_TOOL_DEFS)) {
       const handled = handleAgentGovernanceTool(db, name, args || {});
       if (!handled.handled) throw new Error("unknown agent governance tool: " + name);
       return handled.result;
+    },
+  });
+}
+
+for (const [name, def] of Object.entries(RUNTIME_TURN_TOOL_DEFS)) {
+  tools[name] = Object.assign({}, def, {
+    handler: async (args) => {
+      const input = args || {};
+      if (HUB_URL) return await callHub(name, input);
+      return runtimeTurnBegin(db, input, {
+        capture: (payload) => captureIngest(payload || {}),
+        // Local MCP fallback keeps the gate usable without a hub. Hub mode runs
+        // the full recall path in daemon.js.
+        recall: () => [],
+        briefPull: (payload) => {
+          const targetAgent = normalizeAgentName(payload && payload.agent_name || input.agent_name);
+          const limit = Math.min(payload && payload.limit || 20, 100);
+          const rows = db.prepare(
+            "SELECT id, agent_name, source_agent, content, channel, created_at, meta_json FROM agent_brief " +
+            "WHERE lower(agent_name)=lower(?) AND status='pending' ORDER BY created_at ASC LIMIT ?"
+          ).all(targetAgent, limit);
+          return { count: rows.length, briefs: rows, _routed: "local-mcp-fallback" };
+        },
+        projectBoard: (payload) => {
+          const handled = handleAgentGovernanceTool(db, "mem_project_board", payload || {});
+          return handled.handled ? handled.result : { error: "mem_project_board not available" };
+        },
+        eventLog: (payload) => tools.mem_event_log.handler(payload || {}),
+      });
     },
   });
 }

@@ -8,6 +8,7 @@ const {
   runtimeToolReceiptStart,
   runtimeToolReceiptFinish,
 } = require("./runtime_governance");
+const { runtimeTurnBegin } = require("./runtime_turn_gate");
 
 const db = new Database(":memory:");
 db.exec(`
@@ -233,6 +234,110 @@ function tool(name, args) {
   });
   assert.strictEqual(custom.source, "stored");
   assert.strictEqual(custom.policy.required_board, "demo-board");
+}
+
+{
+  const set = tool("mem_runtime_policy_set", {
+    runtime_name: "claude-aigramm",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "apps.blun.ai:wizard2",
+    required_board: "wizard2-bridge",
+    stale_after_minutes: 15,
+    full_sync_every_messages: 2,
+    required_message_capture: true,
+    response_allowed_when_context_missing: false,
+    updated_by: "mayk",
+  });
+  assert.strictEqual(set.ok, true);
+
+  let captureCalls = 0;
+  let recallCalls = 0;
+  let briefCalls = 0;
+  let boardCalls = 0;
+  let eventCalls = 0;
+  const ops = {
+    capture: (payload) => {
+      captureCalls++;
+      assert.strictEqual(payload.promote_memory, true);
+      assert.strictEqual(payload.remember, true);
+      assert.strictEqual(payload.agent_name, undefined);
+      assert.strictEqual(payload.meta.agent_name, "angel");
+      return { ok: true, status: "captured", event_id: 100 + captureCalls, memory_id: 200 + captureCalls };
+    },
+    recall: (payload) => {
+      recallCalls++;
+      assert(payload.query.includes("Memory"));
+      return [{ surface: "memory", ref_id: "1", actor: "Filedatabase", preview: "Memory muss automatisch sein." }];
+    },
+    briefPull: (payload) => {
+      briefCalls++;
+      assert.strictEqual(payload.agent_name, "angel");
+      return { count: 0, briefs: [] };
+    },
+    projectBoard: (payload) => {
+      boardCalls++;
+      assert.strictEqual(payload.name, "wizard2-bridge");
+      return { ok: true, project: payload.project, next_actions: [] };
+    },
+    eventLog: (payload) => {
+      eventCalls++;
+      const info = db.prepare(
+        "INSERT INTO mnemo_event_journal (source, channel, direction, actor, event_kind, ref_kind, ref_id, thread_id, status, content, payload_json, meta_json, occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+      ).run(
+        payload.source || "test",
+        payload.channel || null,
+        payload.direction || "internal",
+        payload.actor || null,
+        payload.event_kind,
+        payload.ref_kind || null,
+        payload.ref_id || null,
+        payload.thread_id || null,
+        payload.status || "ok",
+        payload.content || null,
+        JSON.stringify(payload.payload || {}),
+        JSON.stringify(payload.meta || {})
+      );
+      return { ok: true, id: info.lastInsertRowid };
+    },
+  };
+
+  const first = runtimeTurnBegin(db, {
+    runtime_name: "claude-aigramm",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "apps.blun.ai:wizard2",
+    thread_id: "blun-group",
+    actor: "Filedatabase",
+    content: "Memory muss automatisch vor jeder Antwort laufen.",
+  }, ops);
+  assert.strictEqual(first.allowed, true);
+  assert.strictEqual(first.status, "ok");
+  assert.strictEqual(first.capture.ok, true);
+  assert.strictEqual(first.recall.ok, true);
+  assert.strictEqual(first.board, "wizard2-bridge");
+  assert(first.context_block.includes("memory_checked: yes"));
+  assert.strictEqual(captureCalls, 1);
+  assert.strictEqual(recallCalls, 1);
+  assert.strictEqual(briefCalls, 1);
+  assert.strictEqual(boardCalls, 1);
+
+  const second = runtimeTurnBegin(db, {
+    runtime_name: "claude-aigramm",
+    agent_name: "angel",
+    channel: "telegram",
+    project: "apps.blun.ai:wizard2",
+    thread_id: "blun-group",
+    actor: "Filedatabase",
+    content: "Memory muss auch jede zehnte Nachricht voll synchronisieren.",
+  }, ops);
+  assert.strictEqual(second.allowed, true);
+  assert.strictEqual(second.full_sync_due, true);
+  assert.strictEqual(second.full_sync_ran, true);
+  assert(eventCalls >= 1, "full-sync audit event should be written");
+  const state = db.prepare("SELECT * FROM runtime_turn_state WHERE agent_name='angel' AND runtime_name='claude-aigramm'").get();
+  assert.strictEqual(state.message_count, 2);
+  assert.strictEqual(state.message_count_since_full_sync, 0);
 }
 
 console.log("test_runtime_governance ok");
