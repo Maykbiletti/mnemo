@@ -280,6 +280,94 @@ CREATE TABLE IF NOT EXISTS autonomy_score_snapshot (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_autonomy_score_agent ON autonomy_score_snapshot(agent_name, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS project_focus (
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT NOT NULL,
+  surface TEXT,
+  active_target TEXT,
+  focus_summary TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  owner_agent TEXT,
+  coordinator_agent TEXT,
+  current_work_order_id INTEGER,
+  must_do_json TEXT,
+  must_not_do_json TEXT,
+  source_ref TEXT,
+  meta_json TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY(scope, project)
+);
+CREATE INDEX IF NOT EXISTS idx_project_focus_status ON project_focus(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS project_task (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT NOT NULL,
+  surface TEXT,
+  title TEXT NOT NULL,
+  summary TEXT,
+  category TEXT,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'open',
+  owner_agent TEXT,
+  assigned_agent TEXT,
+  source_kind TEXT,
+  source_id TEXT,
+  source_ref TEXT,
+  acceptance_json TEXT,
+  blockers_json TEXT,
+  evidence_json TEXT,
+  linked_work_order_id INTEGER,
+  meta_json TEXT,
+  created_by TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_project_task_project ON project_task(project, status, priority, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_task_assigned ON project_task(assigned_agent, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_task_source ON project_task(source_kind, source_id);
+
+CREATE TABLE IF NOT EXISTS user_intent (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  user_name TEXT,
+  source_channel TEXT,
+  message_ref TEXT,
+  intent_kind TEXT NOT NULL DEFAULT 'request',
+  summary TEXT NOT NULL,
+  exact_words TEXT,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'captured',
+  linked_task_id INTEGER,
+  linked_work_order_id INTEGER,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_user_intent_project ON user_intent(project, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_intent_status ON user_intent(status, priority, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS project_channel_policy (
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT NOT NULL,
+  telegram_role TEXT,
+  brief_role TEXT,
+  work_order_role TEXT,
+  rules_json TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  meta_json TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY(scope, project)
+);
+CREATE INDEX IF NOT EXISTS idx_project_channel_policy_status ON project_channel_policy(status, updated_at DESC);
 `);
   try {
     db.exec(`
@@ -312,6 +400,24 @@ CREATE TRIGGER IF NOT EXISTS mnemo_journal_quality_gate_run_ai AFTER INSERT ON q
     (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
   VALUES
     ('quality_gate', NEW.project, 'internal', NEW.agent_name, 'quality_gate_run', 'quality_gate_run', CAST(NEW.id AS TEXT), NEW.status, NEW.gate_id, NEW.evidence_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_project_focus_au AFTER UPDATE ON project_focus BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('project_focus', NEW.project, 'internal', NEW.updated_by, 'project_focus_update', 'project_focus', NEW.project, NEW.status, COALESCE(NEW.focus_summary, NEW.active_target, ''), NEW.must_do_json, NEW.meta_json, NEW.updated_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_project_task_ai AFTER INSERT ON project_task BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('project_task', NEW.project, 'internal', NEW.created_by, 'project_task_insert', 'project_task', CAST(NEW.id AS TEXT), NEW.status, NEW.title, NEW.acceptance_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_user_intent_ai AFTER INSERT ON user_intent BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('user_intent', NEW.project, 'inbound', NEW.user_name, 'user_intent_capture', 'user_intent', CAST(NEW.id AS TEXT), NEW.status, NEW.summary, NEW.exact_words, NEW.meta_json, NEW.created_at);
 END;
 `);
   } catch {}
@@ -1487,6 +1593,386 @@ function autonomyScoreReport(db, input = {}) {
   return { ok: true, agent_name: agent, score, autonomy_level: level, autonomy_meaning: autonomyMeaning(level), status, window_days: days, since, factors, snapshot_id: snapshotId };
 }
 
+function normalizeProject(value) {
+  return String(compactContent(value, 160) || "").trim();
+}
+
+function normalizeSurface(value) {
+  const text = String(compactContent(value, 160) || "").trim();
+  return text || null;
+}
+
+function normalizePriority(value) {
+  const clean = String(value || "normal").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (["critical", "high", "normal", "medium", "low", "backlog"].includes(clean)) return clean === "medium" ? "normal" : clean;
+  return "normal";
+}
+
+function normalizeTaskStatus(value) {
+  const clean = String(value || "open").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (["open", "active", "in_progress", "in-progress", "blocked", "needs_review", "needs-review", "done", "closed", "cancelled"].includes(clean)) {
+    return clean.replace(/-/g, "_");
+  }
+  return "open";
+}
+
+function normalizeIntentKind(value) {
+  return String(value || "request").trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, "_").replace(/^_+|_+$/g, "") || "request";
+}
+
+function inferUserIntentPriority(text, fallback) {
+  const src = String(text || "").toLowerCase();
+  if (/demo[- ]?blocker|production down|502|kaputt|sofort|heute|blocker|dringend|urgent|kritisch/.test(src)) return "critical";
+  if (/wichtig|high|bald|morgen/.test(src)) return "high";
+  return normalizePriority(fallback);
+}
+
+function rowToProjectFocus(row) {
+  return row ? Object.assign({}, row, {
+    must_do: parseJson(row.must_do_json, []),
+    must_not_do: parseJson(row.must_not_do_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function rowToProjectTask(row) {
+  return row ? Object.assign({}, row, {
+    acceptance: parseJson(row.acceptance_json, []),
+    blockers: parseJson(row.blockers_json, []),
+    evidence: parseJson(row.evidence_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function rowToUserIntent(row) {
+  return row ? Object.assign({}, row, { meta: parseJson(row.meta_json, {}) }) : null;
+}
+
+function rowToProjectChannelPolicy(row) {
+  return row ? Object.assign({}, row, {
+    rules: parseJson(row.rules_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function projectFocusSet(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  const summary = textOrNull(input.focus_summary || input.summary || input.objective, 4000);
+  const activeTarget = textOrNull(input.active_target || input.target || input.current_target, 1000);
+  db.prepare(`
+    INSERT INTO project_focus
+      (scope, project, surface, active_target, focus_summary, status, owner_agent, coordinator_agent, current_work_order_id, must_do_json, must_not_do_json, source_ref, meta_json, updated_by, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    ON CONFLICT(scope, project) DO UPDATE SET
+      surface=excluded.surface,
+      active_target=excluded.active_target,
+      focus_summary=excluded.focus_summary,
+      status=excluded.status,
+      owner_agent=excluded.owner_agent,
+      coordinator_agent=excluded.coordinator_agent,
+      current_work_order_id=excluded.current_work_order_id,
+      must_do_json=excluded.must_do_json,
+      must_not_do_json=excluded.must_not_do_json,
+      source_ref=excluded.source_ref,
+      meta_json=excluded.meta_json,
+      updated_by=excluded.updated_by,
+      updated_at=excluded.updated_at
+  `).run(
+    scope,
+    project,
+    normalizeSurface(input.surface || input.portal || input.area),
+    activeTarget,
+    summary,
+    input.status || "active",
+    normalizeAgentName(input.owner_agent || input.owner || "") || null,
+    normalizeAgentName(input.coordinator_agent || input.coordinator || "") || null,
+    input.current_work_order_id || input.work_order_id || null,
+    safeJson(listInput(input.must_do || input.must || input.acceptance), []),
+    safeJson(listInput(input.must_not_do || input.out_of_scope || input.exclusions), []),
+    textOrNull(input.source_ref || input.source || input.message_ref, 1000),
+    safeJson(input.meta || {}, {}),
+    normalizeAgentName(input.updated_by || input.agent_name || "") || null
+  );
+  return projectFocusGet(db, { scope, project });
+}
+
+function projectFocusGet(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  const row = db.prepare("SELECT * FROM project_focus WHERE scope=? AND project=?").get(scope, project);
+  return { ok: !!row, focus: rowToProjectFocus(row), hint: row ? undefined : "Set focus with mem_project_focus_set before assigning project work." };
+}
+
+function projectFocusList(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.status) { where.push("status=?"); params.push(input.status); }
+  params.push(clampInt(input.limit, 50, 1, 200));
+  const rows = db.prepare(`SELECT * FROM project_focus WHERE ${where.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`).all(...params).map(rowToProjectFocus);
+  return { ok: true, count: rows.length, focuses: rows };
+}
+
+function projectTaskCreate(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name);
+  const title = textOrNull(input.title || input.summary || input.objective, 300);
+  if (!project) return { error: "project required" };
+  if (!title) return { error: "title required" };
+  const summary = textOrNull(input.summary || input.objective || input.description || input.task, 4000);
+  const info = db.prepare(`
+    INSERT INTO project_task
+      (scope, project, surface, title, summary, category, priority, status, owner_agent, assigned_agent, source_kind, source_id, source_ref, acceptance_json, blockers_json, evidence_json, linked_work_order_id, meta_json, created_by, updated_by)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    scope,
+    project,
+    normalizeSurface(input.surface || input.portal || input.area),
+    title,
+    summary,
+    normalizeIntentKind(input.category || input.kind || "task"),
+    normalizePriority(input.priority),
+    normalizeTaskStatus(input.status || "open"),
+    normalizeAgentName(input.owner_agent || input.owner || "") || null,
+    normalizeAgentName(input.assigned_agent || input.agent_name || input.assignee || "") || null,
+    textOrNull(input.source_kind || input.source, 120),
+    textOrNull(input.source_id || input.brief_id || input.finding_id, 120),
+    textOrNull(input.source_ref || input.message_ref || input.url, 1000),
+    safeJson(listInput(input.acceptance || input.acceptance_criteria || input.done_criteria), []),
+    safeJson(listInput(input.blockers || input.blocked_by), []),
+    safeJson(Array.isArray(input.evidence) ? input.evidence : [], []),
+    input.linked_work_order_id || input.work_order_id || null,
+    safeJson(input.meta || {}, {}),
+    normalizeAgentName(input.created_by || input.agent_name || "") || null,
+    normalizeAgentName(input.updated_by || input.agent_name || input.created_by || "") || null
+  );
+  return { ok: true, task: rowToProjectTask(db.prepare("SELECT * FROM project_task WHERE id=?").get(info.lastInsertRowid)) };
+}
+
+function projectTaskUpdate(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const id = parseInt(input.id || input.task_id, 10);
+  if (!id) return { error: "task_id required" };
+  const existing = db.prepare("SELECT * FROM project_task WHERE id=?").get(id);
+  if (!existing) return { error: "project_task_not_found", task_id: id };
+  const updates = [];
+  const params = [];
+  function set(key, value) { updates.push(key + "=?"); params.push(value); }
+  if (input.project !== undefined) set("project", normalizeProject(input.project));
+  if (input.surface !== undefined || input.portal !== undefined || input.area !== undefined) set("surface", normalizeSurface(input.surface || input.portal || input.area));
+  if (input.title !== undefined) set("title", textOrNull(input.title, 300));
+  if (input.summary !== undefined || input.objective !== undefined || input.description !== undefined) set("summary", textOrNull(input.summary || input.objective || input.description, 4000));
+  if (input.category !== undefined || input.kind !== undefined) set("category", normalizeIntentKind(input.category || input.kind));
+  if (input.priority !== undefined) set("priority", normalizePriority(input.priority));
+  if (input.status !== undefined) {
+    const status = normalizeTaskStatus(input.status);
+    set("status", status);
+    if (["done", "closed", "cancelled"].includes(status)) set("completed_at", nowIso());
+  }
+  if (input.owner_agent !== undefined || input.owner !== undefined) set("owner_agent", normalizeAgentName(input.owner_agent || input.owner || "") || null);
+  if (input.assigned_agent !== undefined || input.agent_name !== undefined || input.assignee !== undefined) set("assigned_agent", normalizeAgentName(input.assigned_agent || input.agent_name || input.assignee || "") || null);
+  if (input.acceptance !== undefined || input.acceptance_criteria !== undefined || input.done_criteria !== undefined) set("acceptance_json", safeJson(listInput(input.acceptance || input.acceptance_criteria || input.done_criteria), []));
+  if (input.blockers !== undefined || input.blocked_by !== undefined) set("blockers_json", safeJson(listInput(input.blockers || input.blocked_by), []));
+  if (input.evidence !== undefined) set("evidence_json", safeJson(Array.isArray(input.evidence) ? input.evidence : [], []));
+  if (input.linked_work_order_id !== undefined || input.work_order_id !== undefined) set("linked_work_order_id", input.linked_work_order_id || input.work_order_id || null);
+  if (input.meta !== undefined) set("meta_json", safeJson(input.meta || {}, {}));
+  set("updated_by", normalizeAgentName(input.updated_by || input.agent_name || "") || null);
+  set("updated_at", nowIso());
+  params.push(id);
+  db.prepare(`UPDATE project_task SET ${updates.join(", ")} WHERE id=?`).run(...params);
+  return { ok: true, task: rowToProjectTask(db.prepare("SELECT * FROM project_task WHERE id=?").get(id)) };
+}
+
+function projectTaskList(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  const project = normalizeProject(input.project || input.name);
+  if (project) { where.push("project=?"); params.push(project); }
+  if (input.assigned_agent || input.agent_name) { where.push("assigned_agent=?"); params.push(normalizeAgentName(input.assigned_agent || input.agent_name)); }
+  if (input.owner_agent || input.owner) { where.push("owner_agent=?"); params.push(normalizeAgentName(input.owner_agent || input.owner)); }
+  if (input.status) { where.push("status=?"); params.push(normalizeTaskStatus(input.status)); }
+  else if (input.include_done !== true) where.push("status NOT IN ('done','closed','cancelled')");
+  params.push(clampInt(input.limit, 50, 1, 500));
+  const rows = db.prepare(`SELECT * FROM project_task WHERE ${where.join(" AND ")} ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, updated_at DESC LIMIT ?`).all(...params).map(rowToProjectTask);
+  return { ok: true, count: rows.length, tasks: rows };
+}
+
+function userIntentCapture(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const exactWords = textOrNull(input.exact_words || input.text || input.message || input.content, 8000);
+  const summary = textOrNull(input.summary || input.intent || exactWords, 600);
+  if (!summary) return { error: "summary_or_text required" };
+  const project = normalizeProject(input.project || input.name) || null;
+  const priority = inferUserIntentPriority((exactWords || "") + " " + summary, input.priority);
+  let linkedTaskId = input.linked_task_id || input.task_id || null;
+  const info = db.prepare(`
+    INSERT INTO user_intent
+      (scope, project, user_name, source_channel, message_ref, intent_kind, summary, exact_words, priority, status, linked_task_id, linked_work_order_id, meta_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    scope,
+    project,
+    textOrNull(input.user_name || input.user || input.actor, 160),
+    textOrNull(input.source_channel || input.channel || "telegram", 160),
+    textOrNull(input.message_ref || input.source_ref, 1000),
+    normalizeIntentKind(input.intent_kind || input.kind || "request"),
+    summary,
+    exactWords,
+    priority,
+    input.status || "captured",
+    linkedTaskId || null,
+    input.linked_work_order_id || input.work_order_id || null,
+    safeJson(input.meta || {}, {})
+  );
+  const intentId = info.lastInsertRowid;
+  let task = null;
+  if (input.create_task === true && project) {
+    const created = projectTaskCreate(db, {
+      scope,
+      project,
+      surface: input.surface,
+      title: input.task_title || summary,
+      summary,
+      category: input.intent_kind || input.kind || "user_request",
+      priority,
+      status: input.task_status || "open",
+      owner_agent: input.owner_agent,
+      assigned_agent: input.assigned_agent || input.agent_name,
+      source_kind: "user_intent",
+      source_id: String(intentId),
+      source_ref: input.message_ref || input.source_ref,
+      acceptance: input.acceptance || input.acceptance_criteria,
+      created_by: input.agent_name || "mnemo",
+      meta: { user_intent_id: intentId },
+    });
+    task = created.task || null;
+    linkedTaskId = task && task.id || null;
+    if (linkedTaskId) db.prepare("UPDATE user_intent SET linked_task_id=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(linkedTaskId, intentId);
+  }
+  if (input.set_focus === true && project) {
+    projectFocusSet(db, {
+      scope,
+      project,
+      surface: input.surface,
+      active_target: input.active_target || summary,
+      focus_summary: summary,
+      must_do: input.must_do || input.acceptance,
+      must_not_do: input.must_not_do || input.out_of_scope,
+      owner_agent: input.owner_agent,
+      coordinator_agent: input.coordinator_agent,
+      source_ref: input.message_ref || input.source_ref,
+      updated_by: input.agent_name || "mnemo",
+      meta: { user_intent_id: intentId },
+    });
+  }
+  return { ok: true, intent: rowToUserIntent(db.prepare("SELECT * FROM user_intent WHERE id=?").get(intentId)), task };
+}
+
+function projectChannelPolicySet(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  const defaultRules = [
+    "Telegram is for coordination, short status, explicit questions, and human-facing updates.",
+    "Mnemo Briefs are for durable assignments, findings, acceptance criteria, and cross-agent handoffs.",
+    "Work Orders are the execution contract for scoped work; done is only accepted with evidence.",
+    "Agents should propose useful next actions when a risk or project gap is visible, not wait for human phrasing."
+  ];
+  db.prepare(`
+    INSERT INTO project_channel_policy
+      (scope, project, telegram_role, brief_role, work_order_role, rules_json, status, meta_json, updated_by, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    ON CONFLICT(scope, project) DO UPDATE SET
+      telegram_role=excluded.telegram_role,
+      brief_role=excluded.brief_role,
+      work_order_role=excluded.work_order_role,
+      rules_json=excluded.rules_json,
+      status=excluded.status,
+      meta_json=excluded.meta_json,
+      updated_by=excluded.updated_by,
+      updated_at=excluded.updated_at
+  `).run(
+    scope,
+    project,
+    textOrNull(input.telegram_role, 2000) || "Fast team coordination and human-visible updates; not durable truth.",
+    textOrNull(input.brief_role, 2000) || "Durable cross-agent findings, assignments, acceptance criteria, and handoffs.",
+    textOrNull(input.work_order_role, 2000) || "Scoped execution contract with owner, target, resources, evidence, and done gate.",
+    safeJson(listInput(input.rules).length ? listInput(input.rules) : defaultRules, []),
+    input.status || "active",
+    safeJson(input.meta || {}, {}),
+    normalizeAgentName(input.updated_by || input.agent_name || "") || null
+  );
+  return projectChannelPolicyGet(db, { scope, project });
+}
+
+function projectChannelPolicyGet(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  const row = db.prepare("SELECT * FROM project_channel_policy WHERE scope=? AND project=?").get(scopeName(input.scope), project);
+  return { ok: !!row, policy: rowToProjectChannelPolicy(row), hint: row ? undefined : "Set policy with mem_project_channel_policy_set so Telegram, briefs, and Work Orders have clear roles." };
+}
+
+function latestRows(db, sql, params, mapper) {
+  try { return db.prepare(sql).all(...params).map(mapper || ((x) => x)); } catch { return []; }
+}
+
+function projectBoard(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  const limit = clampInt(input.limit, 25, 5, 100);
+  const focus = projectFocusGet(db, { scope, project }).focus || null;
+  const tasks = projectTaskList(db, { scope, project, include_done: input.include_done === true, limit }).tasks || [];
+  const policy = projectChannelPolicyGet(db, { scope, project }).policy || null;
+  const activeWorkOrders = latestRows(db, "SELECT * FROM work_order WHERE scope=? AND project=? AND status NOT IN ('done','closed','cancelled') ORDER BY updated_at DESC LIMIT ?", [scope, project, limit], rowToWorkOrder);
+  const pendingBriefs = tableExists(db, "agent_brief")
+    ? latestRows(db, "SELECT id, agent_name, source_agent, status, substr(content,1,240) AS preview, created_at FROM agent_brief WHERE status IN ('pending','dispatched') AND (content LIKE ? OR (json_valid(meta_json) AND json_extract(meta_json,'$.project')=?)) ORDER BY created_at DESC LIMIT ?", ["%" + project + "%", project, limit])
+    : [];
+  const intents = latestRows(db, "SELECT * FROM user_intent WHERE scope=? AND (project=? OR project IS NULL) AND status NOT IN ('done','closed','cancelled') ORDER BY created_at DESC LIMIT ?", [scope, project, limit], rowToUserIntent);
+  const byStatus = {};
+  tasks.forEach((task) => {
+    const key = task.status || "open";
+    if (!byStatus[key]) byStatus[key] = [];
+    byStatus[key].push(task);
+  });
+  const nextActions = [];
+  if (!focus) nextActions.push("Set active project focus with mem_project_focus_set.");
+  if (!policy) nextActions.push("Set channel policy so Telegram, briefs, and Work Orders are not mixed.");
+  const critical = tasks.filter((task) => task.priority === "critical" && !["done", "closed", "cancelled"].includes(task.status));
+  if (critical.length) nextActions.push("Resolve critical task #" + critical[0].id + ": " + critical[0].title);
+  if (!activeWorkOrders.length && tasks.length) nextActions.push("Create a Work Order for the top open task before risky execution.");
+  return {
+    ok: true,
+    project,
+    focus,
+    policy,
+    summary: {
+      open_tasks: tasks.filter((task) => !["done", "closed", "cancelled"].includes(task.status)).length,
+      critical_tasks: critical.length,
+      active_work_orders: activeWorkOrders.length,
+      pending_briefs: pendingBriefs.length,
+      open_intents: intents.length,
+    },
+    tasks_by_status: byStatus,
+    active_work_orders: activeWorkOrders,
+    pending_briefs: pendingBriefs,
+    user_intents: intents,
+    next_actions: nextActions,
+    channel_rule: "Telegram coordinates; Mnemo briefs assign durable work; Work Orders authorize execution; Company Ledger remains truth.",
+  };
+}
+
 const AGENT_GOVERNANCE_TOOL_DEFS = {
   mem_work_order_template_list: {
     description: "List agent-neutral Work Order templates. These are runtime-agnostic contracts for Claude, GPT/Codex, OpenClaw, and other adapters.",
@@ -1560,6 +2046,46 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
     description: "Compute a fact-based autonomy/trust score and suggested autonomy level from actions, briefs, findings, and token audit history.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, window_days: { type: "integer" }, days: { type: "integer" }, persist: { type: "boolean" } }, required: ["agent_name"] }
   },
+  mem_project_focus_set: {
+    description: "Set the active project focus so agents do not drift between portals, surfaces, or old tasks.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, surface: { type: "string" }, portal: { type: "string" }, active_target: { type: "string" }, target: { type: "string" }, focus_summary: { type: "string" }, summary: { type: "string" }, objective: { type: "string" }, status: { type: "string" }, owner_agent: { type: "string" }, coordinator_agent: { type: "string" }, current_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, must_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_not_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, out_of_scope: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, exclusions: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, source_ref: { type: "string" }, updated_by: { type: "string" }, agent_name: { type: "string" }, meta: { type: "object" } }, required: ["project"] }
+  },
+  mem_project_focus_get: {
+    description: "Get the current active project focus.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" } }, required: ["project"] }
+  },
+  mem_project_focus_list: {
+    description: "List active project focuses across the company.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, status: { type: "string" }, limit: { type: "integer" } } }
+  },
+  mem_project_task_create: {
+    description: "Create a durable project task from a finding, user request, brief, or agent idea. This is not execution permission; create a Work Order before risky work.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, surface: { type: "string" }, portal: { type: "string" }, title: { type: "string" }, summary: { type: "string" }, objective: { type: "string" }, description: { type: "string" }, task: { type: "string" }, category: { type: "string" }, kind: { type: "string" }, priority: { type: "string" }, status: { type: "string" }, owner_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, assignee: { type: "string" }, source_kind: { type: "string" }, source_id: { type: "string" }, brief_id: { type: "integer" }, finding_id: { type: "integer" }, source_ref: { type: "string" }, message_ref: { type: "string" }, url: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, done_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, evidence: { type: "array", items: { type: "object" } }, linked_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, created_by: { type: "string" }, updated_by: { type: "string" }, meta: { type: "object" } }, required: ["project"] }
+  },
+  mem_project_task_update: {
+    description: "Update a project task status, owner, evidence, blockers, or acceptance criteria.",
+    inputSchema: { type: "object", properties: { id: { type: "integer" }, task_id: { type: "integer" }, project: { type: "string" }, surface: { type: "string" }, title: { type: "string" }, summary: { type: "string" }, objective: { type: "string" }, description: { type: "string" }, category: { type: "string" }, kind: { type: "string" }, priority: { type: "string" }, status: { type: "string" }, owner_agent: { type: "string" }, owner: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, assignee: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, done_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, evidence: { type: "array", items: { type: "object" } }, linked_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, updated_by: { type: "string" }, meta: { type: "object" } } }
+  },
+  mem_project_task_list: {
+    description: "List durable project tasks by project, owner, assigned agent, status, or priority.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, owner_agent: { type: "string" }, owner: { type: "string" }, status: { type: "string" }, include_done: { type: "boolean" }, limit: { type: "integer" } } }
+  },
+  mem_user_intent_capture: {
+    description: "Capture what the human actually wants in durable form, optionally creating a project task and/or active focus. Use this when user wording is business intent, not agent-internal thinking.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, user_name: { type: "string" }, user: { type: "string" }, actor: { type: "string" }, source_channel: { type: "string" }, channel: { type: "string" }, message_ref: { type: "string" }, source_ref: { type: "string" }, intent_kind: { type: "string" }, kind: { type: "string" }, summary: { type: "string" }, intent: { type: "string" }, exact_words: { type: "string" }, text: { type: "string" }, message: { type: "string" }, content: { type: "string" }, priority: { type: "string" }, status: { type: "string" }, linked_task_id: { type: "integer" }, task_id: { type: "integer" }, linked_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, create_task: { type: "boolean" }, set_focus: { type: "boolean" }, task_title: { type: "string" }, task_status: { type: "string" }, surface: { type: "string" }, active_target: { type: "string" }, owner_agent: { type: "string" }, coordinator_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_not_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, out_of_scope: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, meta: { type: "object" } } }
+  },
+  mem_project_channel_policy_set: {
+    description: "Define what belongs in Telegram, Mnemo briefs, and Work Orders for one project so agent chatter does not become company truth.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, telegram_role: { type: "string" }, brief_role: { type: "string" }, work_order_role: { type: "string" }, rules: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, status: { type: "string" }, updated_by: { type: "string" }, agent_name: { type: "string" }, meta: { type: "object" } }, required: ["project"] }
+  },
+  mem_project_channel_policy_get: {
+    description: "Get the Telegram/Brief/Work-Order channel policy for one project.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" } }, required: ["project"] }
+  },
+  mem_project_board: {
+    description: "Render a project operating board: active focus, channel policy, tasks, active Work Orders, pending briefs, user intents, and next actions.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, include_done: { type: "boolean" }, limit: { type: "integer" } }, required: ["project"] }
+  },
 };
 
 function handleAgentGovernanceTool(db, name, input = {}) {
@@ -1581,6 +2107,16 @@ function handleAgentGovernanceTool(db, name, input = {}) {
   if (name === "mem_department_charter_list") return { handled: true, result: departmentCharterList(db, input || {}) };
   if (name === "mem_intent_route") return { handled: true, result: intentRoute(db, input || {}) };
   if (name === "mem_autonomy_score_report") return { handled: true, result: autonomyScoreReport(db, input || {}) };
+  if (name === "mem_project_focus_set") return { handled: true, result: projectFocusSet(db, input || {}) };
+  if (name === "mem_project_focus_get") return { handled: true, result: projectFocusGet(db, input || {}) };
+  if (name === "mem_project_focus_list") return { handled: true, result: projectFocusList(db, input || {}) };
+  if (name === "mem_project_task_create") return { handled: true, result: projectTaskCreate(db, input || {}) };
+  if (name === "mem_project_task_update") return { handled: true, result: projectTaskUpdate(db, input || {}) };
+  if (name === "mem_project_task_list") return { handled: true, result: projectTaskList(db, input || {}) };
+  if (name === "mem_user_intent_capture") return { handled: true, result: userIntentCapture(db, input || {}) };
+  if (name === "mem_project_channel_policy_set") return { handled: true, result: projectChannelPolicySet(db, input || {}) };
+  if (name === "mem_project_channel_policy_get") return { handled: true, result: projectChannelPolicyGet(db, input || {}) };
+  if (name === "mem_project_board") return { handled: true, result: projectBoard(db, input || {}) };
   return { handled: false };
 }
 
@@ -1604,6 +2140,17 @@ module.exports = {
   requiresCapabilityToken,
   departmentCharterSet,
   departmentCharterGet,
+  departmentCharterList,
   intentRoute,
   autonomyScoreReport,
+  projectFocusSet,
+  projectFocusGet,
+  projectFocusList,
+  projectTaskCreate,
+  projectTaskUpdate,
+  projectTaskList,
+  userIntentCapture,
+  projectChannelPolicySet,
+  projectChannelPolicyGet,
+  projectBoard,
 };

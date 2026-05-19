@@ -383,6 +383,72 @@ let workOrderId;
 }
 
 {
+  const policy = tool("mem_project_channel_policy_set", {
+    project: "apps.blun.ai",
+    updated_by: "alfred",
+  });
+  assert.strictEqual(policy.ok, true);
+  assert(policy.policy.rules.some((rule) => rule.includes("Telegram")));
+
+  const focus = tool("mem_project_focus_set", {
+    project: "apps.blun.ai",
+    surface: "wizard2",
+    active_target: "Wizard2 output only",
+    focus_summary: "Keep Wizard2 focused; do not mix Wizard1 or unrelated app work.",
+    must_do: ["Fix Wizard2 findings from verified QA"],
+    must_not_do: ["Do not mix Wizard1", "Do not change unrelated chat/mobile scope"],
+    owner_agent: "alfred",
+    coordinator_agent: "dieter",
+    updated_by: "alfred",
+  });
+  assert.strictEqual(focus.ok, true);
+  assert.strictEqual(focus.focus.surface, "wizard2");
+  assert(focus.focus.must_not_do.includes("Do not mix Wizard1"));
+
+  const intent = tool("mem_user_intent_capture", {
+    project: "apps.blun.ai",
+    source_channel: "telegram",
+    message_ref: "blungroup/7782",
+    exact_words: "Wizard2 nichts anderes. Demo blocker gefunden.",
+    summary: "Keep current execution on Wizard2 and capture demo blockers as tasks.",
+    create_task: true,
+    set_focus: true,
+    surface: "wizard2",
+    assigned_agent: "alfred",
+    agent_name: "alfred",
+    acceptance: ["Wizard2 task is visible on the project board", "Work Orders remain required before risky execution"],
+    must_not_do: ["Do not mix Wizard1"],
+  });
+  assert.strictEqual(intent.ok, true);
+  assert.strictEqual(intent.intent.priority, "critical");
+  assert(intent.task.id);
+
+  const updated = tool("mem_project_task_update", {
+    task_id: intent.task.id,
+    status: "active",
+    blockers: ["needs verified build"],
+    evidence: [{ check: "captured user words", result: "pass", message_ref: "blungroup/7782" }],
+    updated_by: "alfred",
+  });
+  assert.strictEqual(updated.ok, true);
+  assert.strictEqual(updated.task.status, "active");
+  assert(updated.task.blockers.includes("needs verified build"));
+
+  const tasks = tool("mem_project_task_list", { project: "apps.blun.ai", assigned_agent: "alfred" });
+  assert.strictEqual(tasks.ok, true);
+  assert(tasks.count >= 1);
+
+  const board = tool("mem_project_board", { project: "apps.blun.ai" });
+  assert.strictEqual(board.ok, true);
+  assert.strictEqual(board.focus.surface, "wizard2");
+  assert.strictEqual(board.policy.project, "apps.blun.ai");
+  assert(board.summary.open_tasks >= 1);
+  assert(board.summary.active_work_orders >= 1);
+  assert(board.tasks_by_status.active.some((task) => task.id === intent.task.id));
+  assert.strictEqual(board.channel_rule, "Telegram coordinates; Mnemo briefs assign durable work; Work Orders authorize execution; Company Ledger remains truth.");
+}
+
+{
   const revoked = tool("mem_capability_token_revoke", { token_id: tokenId, revoked_by: "alfred", reason: "done" });
   assert.strictEqual(revoked.ok, true);
   const blocked = tool("mem_capability_token_check", {

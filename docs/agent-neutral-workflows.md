@@ -86,6 +86,71 @@ Use `mem_context_restore_brief` to resume. Restore briefs are context, not
 company truth. The next agent must still check current repo state and Mnemo
 gates before editing.
 
+## Project Operating Board
+
+Use the project board tools when several agents, portals, or product surfaces
+are active at the same time. Their job is to keep project clarity durable
+instead of relying on Telegram memory or a single agent session.
+
+- `mem_project_focus_set` pins the active target, surface, owner, must-do list,
+  and explicit out-of-scope items.
+- `mem_user_intent_capture` stores the user's exact words and business intent.
+  It can optionally create a task and update project focus.
+- `mem_project_task_create` and `mem_project_task_update` maintain a durable
+  board of findings, user requests, and agent-proposed improvements.
+- `mem_project_channel_policy_set` defines what belongs in Telegram, Mnemo
+  briefs, and Work Orders for the project.
+- `mem_project_board` returns focus, policy, tasks, active Work Orders, pending
+  briefs, user intents, and suggested next actions in one call.
+
+Channel split:
+
+- Telegram is for short coordination, visible team updates, and explicit
+  questions.
+- Mnemo briefs are for durable findings, assignments, acceptance criteria, and
+  cross-agent handoffs.
+- Project tasks are the backlog and operating board.
+- Work Orders are execution contracts. They authorize risky work only when
+  paired with capability tokens and evidence gates.
+- Company Ledger remains the official truth for durable decisions and rules.
+
+Agents should create useful project tasks when they see a real risk, missing
+acceptance criterion, or project gap. They should not wait for the human to
+phrase every task. Risky execution still requires a Work Order and token.
+
+Example project focus:
+
+```json
+{
+  "tool": "mem_project_focus_set",
+  "args": {
+    "project": "apps.blun.ai",
+    "surface": "wizard2",
+    "active_target": "Wizard2 output only",
+    "must_do": ["Fix verified Wizard2 findings"],
+    "must_not_do": ["Do not mix Wizard1", "Do not change chat/mobile scope"],
+    "updated_by": "alfred"
+  }
+}
+```
+
+Example user intent capture:
+
+```json
+{
+  "tool": "mem_user_intent_capture",
+  "args": {
+    "project": "apps.blun.ai",
+    "source_channel": "telegram",
+    "exact_words": "Wizard2 nichts anderes.",
+    "summary": "Keep current execution on Wizard2 only.",
+    "create_task": true,
+    "set_focus": true,
+    "assigned_agent": "alfred"
+  }
+}
+```
+
 ## Adapter Contract
 
 Every runtime adapter should map its local names into Mnemo fields:
@@ -135,4 +200,3 @@ allowed, but durable truth must be promoted through Mnemo.
   }
 }
 ```
-
