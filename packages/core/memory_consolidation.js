@@ -14,6 +14,7 @@ const {
 
 const DEFAULT_SCOPE = "default";
 const PHASES = new Set(["light", "daily", "deep", "rem"]);
+const DREAM_BUCKET_KEYS = ["wrong_made", "right_made", "praise_received", "called_out", "broke_things"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -222,6 +223,35 @@ CREATE TABLE IF NOT EXISTS memory_promotion_proposal (
 CREATE INDEX IF NOT EXISTS idx_memory_promotion_status ON memory_promotion_proposal(scope, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_promotion_project ON memory_promotion_proposal(project, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_promotion_agent ON memory_promotion_proposal(agent_name, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS dreammode_run (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  agent_name TEXT NOT NULL DEFAULT '',
+  project TEXT NOT NULL DEFAULT '',
+  dream_date TEXT NOT NULL,
+  source_window_start TEXT NOT NULL,
+  source_window_end TEXT NOT NULL,
+  messages_examined INTEGER NOT NULL DEFAULT 0,
+  actions_examined INTEGER NOT NULL DEFAULT 0,
+  events_examined INTEGER NOT NULL DEFAULT 0,
+  wrong_made_json TEXT,
+  right_made_json TEXT,
+  praise_received_json TEXT,
+  called_out_json TEXT,
+  broke_things_json TEXT,
+  lessons_json TEXT,
+  rem_run_ids_json TEXT,
+  summary TEXT NOT NULL,
+  brief_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'draft',
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(scope, agent_name, project, dream_date)
+);
+CREATE INDEX IF NOT EXISTS idx_dreammode_date ON dreammode_run(scope, dream_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dreammode_project ON dreammode_run(project, dream_date DESC);
+CREATE INDEX IF NOT EXISTS idx_dreammode_agent ON dreammode_run(agent_name, dream_date DESC);
 `);
   try {
     db.exec(`
@@ -248,6 +278,12 @@ CREATE TRIGGER IF NOT EXISTS mnemo_journal_memory_promotion_ai AFTER INSERT ON m
     (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
   VALUES
     ('memory_promotion_proposal', NEW.project, 'internal', NEW.agent_name, 'memory_promotion_proposal_insert', 'memory_promotion_proposal', CAST(NEW.id AS TEXT), NEW.status, NEW.title || CASE WHEN NEW.body IS NULL THEN '' ELSE ': ' || NEW.body END, NEW.evidence_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_dreammode_ai AFTER INSERT ON dreammode_run BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('dreammode', NEW.project, 'internal', NEW.agent_name, 'dreammode_run_insert', 'dreammode_run', CAST(NEW.id AS TEXT), NEW.status, NEW.summary, NEW.lessons_json, NEW.meta_json, NEW.created_at);
 END;
 `);
   } catch {}
@@ -806,6 +842,401 @@ function runDailyReflection(db, input = {}, selection) {
       generated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `).run(date, events.length, corrections, praises, summary, "{}", "{}");
   return { date, events_examined: events.length, corrections, praises, summary };
+}
+
+function foldSignalText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\u00df/g, "ss");
+}
+
+function dreamDateWindow(input = {}) {
+  const date = (input.dream_date || input.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const since = input.since || `${date}T00:00:00Z`;
+  const until = input.until || `${date}T23:59:59Z`;
+  return { date, since, until };
+}
+
+function selectDreamRows(db, input = {}) {
+  const win = dreamDateWindow(input);
+  const limit = clampInt(input.limit, 800, 20, 5000);
+  const project = String(input.project || "").trim();
+  const agent = input.agent_name ? normalizeAgentName(input.agent_name) : "";
+  const feedbackActors = uniqueStrings(["mayk", "filedatabase", process.env.MNEMO_OWNER_NAME || "owner"]).map(normalizeAgentName);
+  const rows = [];
+  const pushRows = (values) => {
+    for (const row of values || []) {
+      rows.push(Object.assign({ status: null }, row));
+      if (rows.length >= limit * 2) break;
+    }
+  };
+
+  if (tableExists(db, "memory")) {
+    const where = ["occurred_at BETWEEN ? AND ?"];
+    const params = [win.since, win.until];
+    if (project) {
+      where.push("(COALESCE(topic,'')=? OR COALESCE(text,'') LIKE ? OR COALESCE(meta_json,'') LIKE ?)");
+      params.push(project, `%${project}%`, `%${project}%`);
+    }
+    if (agent) {
+      const ownerPlaceholders = feedbackActors.map(() => "?").join(",");
+      where.push(`(LOWER(COALESCE(actor,''))=? OR LOWER(COALESCE(actor,'')) IN (${ownerPlaceholders}) OR COALESCE(meta_json,'') LIKE ?)`);
+      params.push(agent, ...feedbackActors, `%${agent}%`);
+    }
+    params.push(limit);
+    pushRows(getRows(db, "memory", `
+      SELECT 'memory' AS ref_kind, CAST(id AS TEXT) AS ref_id, kind AS subtype, actor,
+             topic, occurred_at AS at, NULL AS status, importance,
+             substr(COALESCE(text,''),1,1200) AS preview
+      FROM memory
+      WHERE ${where.join(" AND ")}
+      ORDER BY occurred_at ASC
+      LIMIT ?
+    `, params));
+  }
+
+  if (tableExists(db, "mnemo_event_journal")) {
+    const where = ["occurred_at BETWEEN ? AND ?"];
+    const params = [win.since, win.until];
+    if (project) {
+      where.push("(COALESCE(channel,'')=? OR COALESCE(content,'') LIKE ? OR COALESCE(payload_json,'') LIKE ? OR COALESCE(meta_json,'') LIKE ?)");
+      params.push(project, `%${project}%`, `%${project}%`, `%${project}%`);
+    }
+    if (agent) {
+      const ownerPlaceholders = feedbackActors.map(() => "?").join(",");
+      where.push(`(LOWER(COALESCE(actor,''))=? OR LOWER(COALESCE(actor,'')) IN (${ownerPlaceholders}) OR COALESCE(meta_json,'') LIKE ?)`);
+      params.push(agent, ...feedbackActors, `%${agent}%`);
+    }
+    params.push(limit);
+    pushRows(getRows(db, "mnemo_event_journal", `
+      SELECT 'mnemo_event_journal' AS ref_kind, CAST(id AS TEXT) AS ref_id, event_kind AS subtype, actor,
+             channel AS topic, occurred_at AS at, status, 4 AS importance,
+             substr(COALESCE(content,'') || ' ' || COALESCE(payload_json,'') || ' ' || COALESCE(meta_json,''),1,1200) AS preview
+      FROM mnemo_event_journal
+      WHERE ${where.join(" AND ")}
+      ORDER BY occurred_at ASC
+      LIMIT ?
+    `, params));
+  }
+
+  if (tableExists(db, "agent_action")) {
+    const where = ["started_at BETWEEN ? AND ?"];
+    const params = [win.since, win.until];
+    if (project) {
+      where.push("(COALESCE(topic,'')=? OR COALESCE(payload_json,'') LIKE ? OR COALESCE(meta_json,'') LIKE ?)");
+      params.push(project, `%${project}%`, `%${project}%`);
+    }
+    if (agent) {
+      where.push("LOWER(COALESCE(agent_name,''))=?");
+      params.push(agent);
+    }
+    params.push(limit);
+    pushRows(getRows(db, "agent_action", `
+      SELECT 'agent_action' AS ref_kind, CAST(id AS TEXT) AS ref_id, action_kind AS subtype, agent_name AS actor,
+             topic, started_at AS at, status, 5 AS importance,
+             substr(COALESCE(action_kind,'') || ' ' || COALESCE(target,'') || ' status=' || COALESCE(status,'') || ' ' || COALESCE(result_json,'') || ' ' || COALESCE(payload_json,''),1,1200) AS preview
+      FROM agent_action
+      WHERE ${where.join(" AND ")}
+      ORDER BY started_at ASC
+      LIMIT ?
+    `, params));
+  }
+
+  if (tableExists(db, "quality_finding")) {
+    const where = ["created_at BETWEEN ? AND ?"];
+    const params = [win.since, win.until];
+    const qcols = tableColumns(db, "quality_finding");
+    const hasAssigned = qcols.includes("assigned_agent");
+    if (project) { where.push("project=?"); params.push(project); }
+    if (agent) {
+      where.push(hasAssigned ? "(LOWER(COALESCE(source_agent,''))=? OR LOWER(COALESCE(assigned_agent,''))=?)" : "LOWER(COALESCE(source_agent,''))=?");
+      params.push(agent);
+      if (hasAssigned) params.push(agent);
+    }
+    params.push(limit);
+    const actorExpr = hasAssigned ? "COALESCE(source_agent, assigned_agent)" : "source_agent";
+    pushRows(getRows(db, "quality_finding", `
+      SELECT 'quality_finding' AS ref_kind, CAST(id AS TEXT) AS ref_id, category AS subtype, ${actorExpr} AS actor,
+             project AS topic, created_at AS at, COALESCE(status,'open') AS status, 8 AS importance,
+             substr(COALESCE(severity,'') || ' ' || COALESCE(title,'') || ' ' || COALESCE(actual,'') || ' ' || COALESCE(expected,''),1,1200) AS preview
+      FROM quality_finding
+      WHERE ${where.join(" AND ")}
+      ORDER BY created_at ASC
+      LIMIT ?
+    `, params));
+  }
+
+  const dedup = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const key = `${row.ref_kind}:${row.ref_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedup.push(row);
+  }
+  dedup.sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+  return Object.assign(win, { rows: dedup.slice(0, limit) });
+}
+
+function emptyDreamBuckets() {
+  const out = {};
+  for (const key of DREAM_BUCKET_KEYS) out[key] = { count: 0, examples: [] };
+  return out;
+}
+
+function dreamBucketMatches(row) {
+  const text = foldSignalText([row.preview, row.subtype, row.status, row.topic].filter(Boolean).join(" "));
+  const matches = [];
+  const add = (key, reason) => matches.push({ key, reason });
+
+  if (/\b(super|perfekt|top|stark|danke|geil|sauber|besser|bestaetigt|bestatigt|demo-bereit|b[aehm]*hm|well done|great)\b/.test(text)) {
+    add("praise_received", "human/peer praise or green feedback");
+  }
+  if (/\b(ok|done|passed|pass|green|grun|gruen|verified|verifiziert|bestaetigt|bestatigt|gefixt|live|closed|acceptance|funktioniert wieder|passt jetzt|smoke grun|tests? grun|0 failed|70 passed)\b/.test(text)) {
+    add("right_made", "verified success or completed action");
+  }
+  if (/\b(falsch|fehler|bug|blocker|regression|nicht live|nichts geaendert|nichts geandert|geht nicht|funktioniert nicht|ignoriert|vermischt|fallback|404|502|broken|fail|failed|error|rot|kaputt)\b/.test(text)) {
+    add("wrong_made", "failure, bug, or red verification");
+  }
+  if (/\b(stop|hoer auf|hor auf|verdammt|nervt|spam|pennt|lump|kacke|scheiss|scheisse|was machst|du hast|nicht in die gruppe|konsole|heimlich)\b/.test(text)) {
+    add("called_out", "direct correction or frustration signal");
+  }
+  if (/\b(kaputt gemacht|abgeschossen|weg gefegt|weggefegt|server down|production-down|prod down|502|crash|crashed|kill|killed|orphan|stopped|telegram kaputt|deploy.*kaputt|service.*down)\b/.test(text)) {
+    add("broke_things", "incident or caused damage");
+  }
+
+  if (/^(done|ok|success|passed)$/i.test(String(row.status || ""))) {
+    add("right_made", "status indicates completed work");
+  } else if (/^(error|failed|fail|blocked)$/i.test(String(row.status || ""))) {
+    add("wrong_made", "status indicates failure/blocker");
+  }
+  return matches;
+}
+
+function addDreamExample(bucket, row, reason) {
+  bucket.count++;
+  if (bucket.examples.length >= 20) return;
+  bucket.examples.push({
+    ref_kind: row.ref_kind,
+    ref_id: row.ref_id,
+    actor: row.actor || null,
+    topic: row.topic || null,
+    at: row.at || null,
+    reason,
+    preview: compactContent(row.preview, 360),
+  });
+}
+
+function classifyDreamRows(rows) {
+  const buckets = emptyDreamBuckets();
+  for (const row of rows) {
+    for (const match of dreamBucketMatches(row)) {
+      addDreamExample(buckets[match.key], row, match.reason);
+    }
+  }
+  return buckets;
+}
+
+function dreamLessons(buckets) {
+  const lessons = [];
+  const firstRef = (key) => {
+    const ex = buckets[key] && buckets[key].examples && buckets[key].examples[0];
+    return ex ? `${ex.ref_kind}:${ex.ref_id}` : null;
+  };
+  if (buckets.broke_things.count > 0) {
+    lessons.push({ type: "stop_doing", text: "Production, Telegram, and deploy incidents need a gate, receipt, and rollback path before more changes.", evidence_ref: firstRef("broke_things") });
+  }
+  if (buckets.called_out.count > 0) {
+    lessons.push({ type: "behavior_adjustment", text: "User frustration is a hard signal: reduce spam, write in the requested channel, and keep status updates short.", evidence_ref: firstRef("called_out") });
+  }
+  if (buckets.wrong_made.count > 0) {
+    lessons.push({ type: "fix_next", text: "Red verifications and repeated bugs become next-day tasks until explicitly closed with evidence.", evidence_ref: firstRef("wrong_made") });
+  }
+  if (buckets.right_made.count > 0) {
+    lessons.push({ type: "keep_doing", text: "Keep the workflows that produced green verification: concrete checks, URLs, exit codes, and direct acceptance evidence.", evidence_ref: firstRef("right_made") });
+  }
+  if (buckets.praise_received.count > 0) {
+    lessons.push({ type: "positive_reinforcement", text: "Praise marks a useful pattern; preserve the exact behavior that led to it.", evidence_ref: firstRef("praise_received") });
+  }
+  if (!lessons.length) {
+    lessons.push({ type: "low_signal", text: "No strong praise/correction/failure signal was detected; keep collecting raw messages and evidence." });
+  }
+  return lessons;
+}
+
+function dreamSummary(input, source, buckets, lessons, remRuns) {
+  const labels = {
+    wrong_made: "Falsch gemacht",
+    right_made: "Richtig gemacht",
+    praise_received: "Lob bekommen",
+    called_out: "Angemacht/korrigiert",
+    broke_things: "Scheisse gebaut",
+  };
+  const lines = [];
+  lines.push(`# Dreammode Review: ${source.date}`);
+  lines.push("");
+  lines.push(`Scope: ${scopeName(input.scope)}${input.project ? ` | project: ${input.project}` : ""}${input.agent_name ? ` | agent: ${normalizeAgentName(input.agent_name)}` : ""}`);
+  lines.push(`Window: ${source.since} -> ${source.until}`);
+  lines.push(`Sources examined: ${source.rows.length} rows. REM phases: ${remRuns.map((r) => r.phase + "#" + r.run_id).join(", ") || "none"}.`);
+  lines.push("");
+  for (const key of DREAM_BUCKET_KEYS) {
+    const bucket = buckets[key];
+    lines.push(`## ${labels[key]} (${bucket.count})`);
+    if (!bucket.examples.length) {
+      lines.push("- none detected");
+    } else {
+      for (const ex of bucket.examples.slice(0, 8)) {
+        const who = ex.actor ? ` ${ex.actor}` : "";
+        const topic = ex.topic ? ` [${ex.topic}]` : "";
+        lines.push(`- ${ex.ref_kind}:${ex.ref_id}${topic}${who}: ${compactContent(ex.preview, 220)}`);
+      }
+    }
+    lines.push("");
+  }
+  lines.push("## Daraus lernen");
+  for (const lesson of lessons) {
+    lines.push(`- ${lesson.type}: ${lesson.text}${lesson.evidence_ref ? ` (${lesson.evidence_ref})` : ""}`);
+  }
+  lines.push("");
+  lines.push("Rule: Dreammode is draft processing. It may propose lessons, but official truth/rules still need explicit promotion or task updates.");
+  return compactContent(lines.join("\n"), 16000);
+}
+
+function rowToDreammodeRun(row) {
+  return row ? Object.assign({}, row, {
+    wrong_made: parseJson(row.wrong_made_json, { count: 0, examples: [] }),
+    right_made: parseJson(row.right_made_json, { count: 0, examples: [] }),
+    praise_received: parseJson(row.praise_received_json, { count: 0, examples: [] }),
+    called_out: parseJson(row.called_out_json, { count: 0, examples: [] }),
+    broke_things: parseJson(row.broke_things_json, { count: 0, examples: [] }),
+    lessons: parseJson(row.lessons_json, []),
+    rem_run_ids: parseJson(row.rem_run_ids_json, []),
+    meta: parseJson(row.meta_json, {}),
+  }) : null;
+}
+
+function dreammodeRun(db, input = {}) {
+  ensureMemoryConsolidationSchema(db);
+  const agent = input.agent_name ? normalizeAgentName(input.agent_name) : "";
+  const project = String(input.project || "").trim();
+  const scope = scopeName(input.scope);
+  const source = selectDreamRows(db, input);
+  const existing = db.prepare("SELECT * FROM dreammode_run WHERE scope=? AND agent_name=? AND project=? AND dream_date=?")
+    .get(scope, agent, project, source.date);
+  if (existing && input.force !== true) {
+    return { ok: true, skipped: true, reason: "dreammode already ran for this agent/project/date", run: rowToDreammodeRun(existing) };
+  }
+
+  const remRuns = [];
+  if (input.run_rem_phases !== false) {
+    const phases = input.phases && Array.isArray(input.phases) ? input.phases : ["light", "daily", "deep", "rem"];
+    for (const phase of phases) {
+      const normalized = String(phase || "").toLowerCase();
+      if (!PHASES.has(normalized)) continue;
+      const result = memoryRemRun(db, {
+        scope,
+        agent_name: agent || undefined,
+        project: project || undefined,
+        phase: normalized,
+        date: source.date,
+        days: normalized === "rem" ? clampInt(input.rem_days, 7, 1, 3650) : undefined,
+        meta: Object.assign({}, input.meta || {}, { dreammode: true, dream_date: source.date }),
+      });
+      if (result && result.ok) remRuns.push({ phase: normalized, run_id: result.run_id, promoted_memory_id: result.promoted_memory_id || null });
+    }
+  }
+
+  const buckets = classifyDreamRows(source.rows);
+  const lessons = dreamLessons(buckets);
+  const summary = dreamSummary(input, source, buckets, lessons, remRuns);
+  let briefId = null;
+  const writeBrief = input.write_brief !== false;
+  if (writeBrief && tableExists(db, "agent_brief")) {
+    const coordinator = normalizeAgentName(input.coordinator_agent || input.agent_name || "dieter");
+    const info = db.prepare("INSERT INTO agent_brief (agent_name, source_agent, content, meta_json) VALUES (?,?,?,?)")
+      .run(coordinator || "dieter", normalizeAgentName(input.source_agent || "mnemo-dreammode"), summary, safeJson({ kind: "dreammode_review", project: project || null, agent_name: agent || null, dream_date: source.date }, {}));
+    briefId = info.lastInsertRowid;
+  }
+
+  const insertArgs = [
+    scope,
+    agent,
+    project,
+    source.date,
+    source.since,
+    source.until,
+    source.rows.filter((row) => row.ref_kind === "memory").length,
+    source.rows.filter((row) => row.ref_kind === "agent_action").length,
+    source.rows.filter((row) => row.ref_kind === "mnemo_event_journal").length,
+    safeJson(buckets.wrong_made, {}),
+    safeJson(buckets.right_made, {}),
+    safeJson(buckets.praise_received, {}),
+    safeJson(buckets.called_out, {}),
+    safeJson(buckets.broke_things, {}),
+    safeJson(lessons, []),
+    safeJson(remRuns, []),
+    summary,
+    briefId,
+    input.status || "draft",
+    safeJson(Object.assign({}, input.meta || {}, { no_destructive_migration: true, human_style_review: true }), {}),
+  ];
+  const info = db.prepare(`
+    INSERT INTO dreammode_run
+      (scope, agent_name, project, dream_date, source_window_start, source_window_end, messages_examined, actions_examined, events_examined,
+       wrong_made_json, right_made_json, praise_received_json, called_out_json, broke_things_json, lessons_json, rem_run_ids_json, summary, brief_id, status, meta_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(scope, agent_name, project, dream_date) DO UPDATE SET
+      source_window_start=excluded.source_window_start,
+      source_window_end=excluded.source_window_end,
+      messages_examined=excluded.messages_examined,
+      actions_examined=excluded.actions_examined,
+      events_examined=excluded.events_examined,
+      wrong_made_json=excluded.wrong_made_json,
+      right_made_json=excluded.right_made_json,
+      praise_received_json=excluded.praise_received_json,
+      called_out_json=excluded.called_out_json,
+      broke_things_json=excluded.broke_things_json,
+      lessons_json=excluded.lessons_json,
+      rem_run_ids_json=excluded.rem_run_ids_json,
+      summary=excluded.summary,
+      brief_id=excluded.brief_id,
+      status=excluded.status,
+      meta_json=excluded.meta_json,
+      created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run(...insertArgs);
+  const row = db.prepare("SELECT * FROM dreammode_run WHERE scope=? AND agent_name=? AND project=? AND dream_date=?").get(scope, agent, project, source.date);
+  return {
+    ok: true,
+    skipped: false,
+    run_id: row ? row.id : info.lastInsertRowid,
+    dream_date: source.date,
+    source_count: source.rows.length,
+    brief_id: briefId,
+    rem_runs: remRuns,
+    buckets,
+    lessons,
+    summary,
+    run: rowToDreammodeRun(row),
+  };
+}
+
+function dreammodeStatus(db, input = {}) {
+  ensureMemoryConsolidationSchema(db);
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.project !== undefined) { where.push("project=?"); params.push(String(input.project || "").trim()); }
+  if (input.date || input.dream_date) { where.push("dream_date=?"); params.push(String(input.date || input.dream_date).slice(0, 10)); }
+  params.push(clampInt(input.limit, 20, 1, 200));
+  const rows = db.prepare(`
+    SELECT * FROM dreammode_run
+    WHERE ${where.join(" AND ")}
+    ORDER BY dream_date DESC, created_at DESC
+    LIMIT ?
+  `).all(...params).map(rowToDreammodeRun);
+  return { ok: true, count: rows.length, runs: rows };
 }
 
 function insertPromotedMemory(db, phase, input, runId, summary, selectedRefs) {
@@ -1414,6 +1845,34 @@ const MEMORY_CONSOLIDATION_TOOL_DEFS = {
     description: "Generate a coordinator morning brief from department journals, sleep notes, promotion proposals, active claims, pending approvals, and REM state. Optionally writes an agent_brief.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, days: { type: "integer", default: 1 }, since: { type: "string" }, write_brief: { type: "boolean" }, coordinator_agent: { type: "string" }, source_agent: { type: "string" } } },
   },
+  mem_dreammode_run: {
+    description: "Run the nightly human-style Dreammode: classify the day into wrong made, right made, praise received, called out, broke things, and lessons. Also runs REM phases by default. Draft only; no automatic truth promotion.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string" },
+        agent_name: { type: "string" },
+        project: { type: "string" },
+        dream_date: { type: "string" },
+        date: { type: "string" },
+        since: { type: "string" },
+        until: { type: "string" },
+        limit: { type: "integer" },
+        force: { type: "boolean" },
+        write_brief: { type: "boolean", default: true },
+        coordinator_agent: { type: "string" },
+        run_rem_phases: { type: "boolean", default: true },
+        phases: { type: "array", items: { type: "string", enum: ["light", "daily", "deep", "rem"] } },
+        rem_days: { type: "integer", default: 7 },
+        status: { type: "string" },
+        meta: { type: "object" },
+      },
+    },
+  },
+  mem_dreammode_status: {
+    description: "List recent Dreammode runs with human-style buckets and lessons.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, dream_date: { type: "string" }, date: { type: "string" }, limit: { type: "integer" } } },
+  },
 };
 
 function handleMemoryConsolidationTool(db, name, input = {}) {
@@ -1429,6 +1888,8 @@ function handleMemoryConsolidationTool(db, name, input = {}) {
   if (name === "mem_memory_promotion_list") return { handled: true, result: memoryPromotionList(db, input || {}) };
   if (name === "mem_memory_promotion_decide") return { handled: true, result: memoryPromotionDecide(db, input || {}) };
   if (name === "mem_company_rem_brief") return { handled: true, result: companyRemBrief(db, input || {}) };
+  if (name === "mem_dreammode_run") return { handled: true, result: dreammodeRun(db, input || {}) };
+  if (name === "mem_dreammode_status") return { handled: true, result: dreammodeStatus(db, input || {}) };
   return { handled: false };
 }
 
@@ -1448,4 +1909,6 @@ module.exports = {
   memoryPromotionList,
   memoryPromotionDecide,
   companyRemBrief,
+  dreammodeRun,
+  dreammodeStatus,
 };

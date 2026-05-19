@@ -77,6 +77,7 @@ const { ensureAccessRouteSchema, handleAccessRouteTool } = require("./access_rou
 const { ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCheck, validateProtectedScopeOverride, handleProtectedScopeTool } = require("./protected_scope_gate");
 const { ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool } = require("./runtime_governance");
+const { ensureMemoryConsolidationSchema, handleMemoryConsolidationTool, dreammodeRun } = require("./memory_consolidation");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
 const FACTS_DIR = process.env.MNEMO_FACTS_DIR || path.join(__dirname, "facts");
@@ -346,6 +347,7 @@ try {
   ensureUniversalJournalSchema(db);
 } catch (e) { console.error("[migrate]", e.message); }
 try { ensureUniversalJournalSchema(db); } catch (e) { console.error("[journal-schema]", e.message); }
+try { ensureMemoryConsolidationSchema(db); } catch (e) { console.error("[memory-consolidation-schema]", e.message); }
 
 // Auto-load skills from /root/mnemo/packages/core/skills/*/SKILL.md on startup
 try {
@@ -415,6 +417,7 @@ function tenantDb(id) {
     seedDefaultProtectedScopes(tdb);
     ensureResourceAccessSchema(tdb);
     ensureRuntimeGovernanceSchema(tdb);
+    ensureMemoryConsolidationSchema(tdb);
   } catch (e) { console.error("[tenant-bootstrap]", safe, e.message); }
   tenantPool.set(safe, tdb);
   return tdb;
@@ -1780,7 +1783,7 @@ const AUTO_INJECT_SKIP = new Set([
   "mem_recall","mem_recall_ids","mem_recall_layered","mem_recall_at_time","mem_recall_on_date","mem_recall_between",
   "mem_search","mem_question_answer","mem_neighbors","mem_get","mem_who_am_i",
   "mem_health","mem_loop_doctor","mem_agent_name_migrate","mem_brief_requeue_stale","mem_brief_reconcile_stale","mem_project_timeline_report","mem_work_report_feed","mem_brief_health","mem_brief_status","mem_brief_list","mem_brief_pull","mem_brief_done",
-  "mem_runtime_health","mem_agent_memory_health","mem_runtime_policy_set","mem_runtime_policy_get","mem_runtime_policy_check",
+  "mem_runtime_health","mem_agent_memory_health","mem_runtime_policy_set","mem_runtime_policy_get","mem_runtime_policy_check","mem_dreammode_run","mem_dreammode_status",
   "mem_action_log","mem_action_finish","mem_actions_recent","mem_actions_search",
   "mem_capture_ingest","mem_capture_ingest_batch","mem_capture_recent","mem_media_capture","mem_media_recent","mem_media_search","mem_media_get","mem_event_log","mem_event_recent","mem_source_coverage","mem_access_list","mem_access_guide","mem_access_route_resolve","mem_access_preflight","mem_access_event_log",
   "mem_connector_upsert","mem_connector_list","mem_agent_pass_set","mem_agent_pass_get","mem_agent_pass_list","mem_drift_check_report","mem_drift_status",
@@ -4380,6 +4383,8 @@ function handleTool(tdb, name, a) {
   if (accessRoute.handled) return accessRoute.result;
   const runtimeGovernance = handleRuntimeGovernanceTool(tdb, name, a || {});
   if (runtimeGovernance.handled) return runtimeGovernance.result;
+  const memoryConsolidation = handleMemoryConsolidationTool(tdb, name, a || {});
+  if (memoryConsolidation.handled) return memoryConsolidation.result;
   switch (name) {
     case "mem_recall": {
       return recallMemories(tdb, a || {});
@@ -7574,6 +7579,78 @@ function maybeRunDailyReflection() {
   }
 }
 
+// ---------- Dreammode nightly human-style review ----------
+const DREAMMODE_ENABLED = process.env.MNEMO_DREAMMODE_ENABLED !== "0";
+const DREAMMODE_HOUR = parseInt(process.env.MNEMO_DREAMMODE_HOUR || "2", 10);
+const DREAMMODE_MINUTE = parseInt(process.env.MNEMO_DREAMMODE_MINUTE || "15", 10);
+const DREAMMODE_COORDINATOR = process.env.MNEMO_DREAMMODE_COORDINATOR || "dieter";
+const DREAMMODE_WRITE_BRIEF = process.env.MNEMO_DREAMMODE_WRITE_BRIEF !== "0";
+
+function dreammodeLocalNow() {
+  return new Date(Date.now() + TZ_OFFSET_HOURS * 3600 * 1000);
+}
+
+function dreammodeTargetDate(localNow) {
+  return new Date(localNow.getTime() - 86400000).toISOString().slice(0, 10);
+}
+
+function dreammodeAgents() {
+  const configured = uniqueAgentNames(parseAgentCsv(process.env.MNEMO_DREAMMODE_AGENTS || process.env.MNEMO_LOCAL_AGENTS || process.env.MNEMO_TEAM_AGENTS));
+  if (configured.length) return configured;
+  try {
+    const online = db.prepare("SELECT agent_name FROM agent_registry WHERE status='online' ORDER BY agent_name").all().map((r) => r.agent_name);
+    const resolved = uniqueAgentNames(online);
+    if (resolved.length) return resolved;
+  } catch {}
+  return uniqueAgentNames([DEFAULT_AGENT]);
+}
+
+function dreammodeProjects() {
+  const configured = uniqueStrings(String(process.env.MNEMO_DREAMMODE_PROJECTS || "").split(","));
+  if (configured.length) return configured;
+  try {
+    const focus = db.prepare("SELECT project FROM project_focus WHERE status NOT IN ('done','closed','cancelled') ORDER BY updated_at DESC LIMIT 10").all().map((r) => r.project);
+    const resolved = uniqueStrings(focus);
+    if (resolved.length) return resolved;
+  } catch {}
+  try {
+    const tasks = db.prepare("SELECT project FROM project_task WHERE status NOT IN ('done','closed','cancelled') ORDER BY updated_at DESC LIMIT 10").all().map((r) => r.project);
+    const resolved = uniqueStrings(tasks);
+    if (resolved.length) return resolved;
+  } catch {}
+  return [""];
+}
+
+function dreammodeCycle() {
+  if (!DREAMMODE_ENABLED) return;
+  const local = dreammodeLocalNow();
+  const minute = local.getMinutes();
+  if (local.getHours() !== DREAMMODE_HOUR || minute < DREAMMODE_MINUTE || minute >= DREAMMODE_MINUTE + 10) return;
+  const date = dreammodeTargetDate(local);
+  let ran = 0;
+  for (const agent of dreammodeAgents()) {
+    for (const project of dreammodeProjects()) {
+      try {
+        const out = dreammodeRun(db, {
+          agent_name: agent,
+          project,
+          date,
+          coordinator_agent: DREAMMODE_COORDINATOR,
+          write_brief: DREAMMODE_WRITE_BRIEF,
+          meta: { source: "mnemo-daemon", schedule: "nightly", hour: DREAMMODE_HOUR, minute: DREAMMODE_MINUTE },
+        });
+        if (out && out.ok && !out.skipped) {
+          ran++;
+          console.log("[dreammode] " + agent + (project ? " project=" + project : "") + " date=" + date + " run=" + out.run_id);
+        }
+      } catch (e) {
+        console.error("[dreammode]", agent, project || "-", e.message);
+      }
+    }
+  }
+  if (ran) recordWrite("dreammode", ran, "alive");
+}
+
 // ---------- URL Watcher — polls tracked_url every 5 min ----------
 const url_module = require("url");
 function pollUrl(rec) {
@@ -7643,6 +7720,8 @@ function healthSweep() {
 
 scheduleBackgroundInterval(healthSweep, 5 * 60 * 1000);
 scheduleBackgroundInterval(maybeRunDailyReflection, 60 * 1000);
+scheduleBackgroundInterval(dreammodeCycle, 60 * 1000);
+scheduleBackgroundTimeout(dreammodeCycle, 20 * 1000);
 
 // #9 TTL job + #10 action-log rollup
 const BRIEF_TTL_HOURS = parseInt(process.env.BRIEF_TTL_HOURS || "168", 10);

@@ -114,6 +114,8 @@ const HUB_CANONICAL_OPS_TOOLS = new Set([
   "mem_memory_promotion_list",
   "mem_memory_promotion_decide",
   "mem_company_rem_brief",
+  "mem_dreammode_run",
+  "mem_dreammode_status",
   "mem_work_order_template_list",
   "mem_work_order_template_upsert",
   "mem_work_order_create_from_template",

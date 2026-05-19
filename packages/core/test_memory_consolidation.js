@@ -261,4 +261,34 @@ function tool(name, args) {
   assert(brief.brief_id, "company REM brief should optionally write agent_brief");
 }
 
+{
+  db.prepare("INSERT INTO memory (kind, source, source_ref, occurred_at, actor, topic, importance, text, hash) VALUES (?,?,?,?,?,?,?,?,?)")
+    .run("message", "telegram", "m2", now, "mayk", "account", 8, "Alfred stop, das war falsch und hat Telegram kaputt gemacht.", "h3");
+  db.prepare("INSERT INTO memory (kind, source, source_ref, occurred_at, actor, topic, importance, text, hash) VALUES (?,?,?,?,?,?,?,?,?)")
+    .run("message", "telegram", "m3", now, "mayk", "account", 8, "Super, jetzt ist es richtig gemacht und verified green.", "h4");
+  const dream = tool("mem_dreammode_run", {
+    project: "account",
+    agent_name: "alfred",
+    date: now.slice(0, 10),
+    write_brief: true,
+    coordinator_agent: "dieter",
+    force: true,
+  });
+  assert.strictEqual(dream.ok, true);
+  assert(dream.buckets.wrong_made.count >= 1, "Dreammode should classify wrong/failure signals");
+  assert(dream.buckets.right_made.count >= 1, "Dreammode should classify right/green signals");
+  assert(dream.buckets.praise_received.count >= 1, "Dreammode should classify praise signals");
+  assert(dream.buckets.called_out.count >= 1, "Dreammode should classify correction/callout signals");
+  assert(dream.buckets.broke_things.count >= 1, "Dreammode should classify damage/incidents");
+  assert(dream.summary.includes("Falsch gemacht"));
+  assert(dream.summary.includes("Richtig gemacht"));
+  assert(dream.summary.includes("Lob bekommen"));
+  assert(dream.summary.includes("Angemacht"));
+  assert(dream.summary.includes("Scheisse gebaut"));
+  assert(dream.brief_id, "Dreammode should write a coordinator brief by default");
+  const status = tool("mem_dreammode_status", { project: "account", agent_name: "alfred", date: now.slice(0, 10) });
+  assert.strictEqual(status.count, 1);
+  assert(status.runs[0].lessons.length >= 1);
+}
+
 console.log("test_memory_consolidation ok");
