@@ -18,6 +18,7 @@
     "mnemo-backfill-universal": "./universal_backfill.js",
     "mnemo-firm-hook": "./hooks/firm-runtime-hook.js",
     "mnemo-hook-doctor": "./hooks/hook-doctor.js",
+    "mnemo-hook-watchdog": "./hooks/hook-watchdog.js",
     "mnemo-site-contract-audit": "./bin/site-contract-audit.js",
     "mnemo-route-matrix-audit": "./bin/route-matrix-audit.js"
   },
@@ -39,12 +40,13 @@
     "hook:stop": "node hooks/firm-runtime-hook.js stop",
     "hook:session-end": "node hooks/firm-runtime-hook.js session-end",
     "hook:doctor": "node hooks/hook-doctor.js",
+    "hook:watchdog": "node hooks/hook-watchdog.js --flush --heal",
     "site-contract-audit": "node bin/site-contract-audit.js",
     "route-matrix-audit": "node bin/route-matrix-audit.js",
     "embed": "node embedding_writer.js",
     "loops": "node loop_scanner_v2.js",
     "export": "node export_declarative.js",
-    "test": "node test_shared_utils.js && node test_http_utils.js && node test_brief_coordination.js && node test_access_routes.js && node test_protected_scope_gate.js && node test_resource_access_control.js && node test_runtime_governance.js && node test_memory_consolidation.js && node test_agent_governance.js && node test_runtime_enforcement.js && node test_mcp_runtime_receipt_token.js && node test_semantic.js",
+    "test": "node test_shared_utils.js && node test_http_utils.js && node test_brief_coordination.js && node test_access_routes.js && node test_protected_scope_gate.js && node test_resource_access_control.js && node test_runtime_governance.js && node test_memory_consolidation.js && node test_agent_governance.js && node test_gstack_governance.js && node test_runtime_enforcement.js && node test_runtime_turn_resume_pack.js && node test_mcp_runtime_receipt_token.js && node test_semantic.js",
     "test:integration": "node test_universal_capture.js"
   },
   "dependencies": {

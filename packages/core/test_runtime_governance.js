@@ -196,16 +196,16 @@ function tool(name, args) {
 }
 
 {
-  const warn = tool("mem_runtime_policy_check", {
+  const blocked = tool("mem_runtime_policy_check", {
     runtime_name: "codexlink",
     agent_name: "dieter",
     channel: "telegram",
     project: "wizard2",
     messages_since_full_sync: 10,
   });
-  assert.strictEqual(warn.status, "warn");
-  assert.strictEqual(warn.allowed, true);
-  assert.strictEqual(warn.warning_token, "MNEMO_CONTEXT_STALE");
+  assert.strictEqual(blocked.status, "block");
+  assert.strictEqual(blocked.allowed, false);
+  assert.strictEqual(blocked.warning_token, "MNEMO_CONTEXT_STALE");
 }
 
 {
@@ -267,7 +267,7 @@ function tool(name, args) {
     },
     recall: (payload) => {
       recallCalls++;
-      assert(payload.query.includes("Memory"));
+      assert(payload.query.includes("Memory") || payload.query.includes("owner rule"));
       return [{ surface: "memory", ref_id: "1", actor: "Filedatabase", preview: "Memory muss automatisch sein." }];
     },
     briefPull: (payload) => {
@@ -317,8 +317,9 @@ function tool(name, args) {
   assert.strictEqual(first.recall.ok, true);
   assert.strictEqual(first.board, "wizard2-bridge");
   assert(first.context_block.includes("memory_checked: yes"));
+  assert(first.context_block.includes("governance_checked: yes"));
   assert.strictEqual(captureCalls, 1);
-  assert.strictEqual(recallCalls, 1);
+  assert.strictEqual(recallCalls, 2);
   assert.strictEqual(briefCalls, 1);
   assert.strictEqual(boardCalls, 1);
 

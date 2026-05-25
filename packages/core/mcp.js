@@ -739,7 +739,7 @@ function validateCaptureEnvelope(a = {}, content) {
   if (!occurredAt) errors.push("occurred_at required");
   if (!threadId) errors.push("thread_id/session_id required");
   if (!content && !hasMedia) errors.push("content or media attachment required");
-  if (isChatScoped || refKind === "telegram_message") {
+  if ((isChatScoped || refKind === "telegram_message") && !hasMedia) {
     if (!actorId) errors.push("actor_id required for telegram message");
     if (!chatId) errors.push("meta.chat_id required for telegram message");
     if (!messageId && !refId) errors.push("meta.message_id or ref_id required for telegram message");
@@ -6139,12 +6139,26 @@ ${args.first_invocation_outcome || "(none)"}
     handler: ({ agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta }) => {
       const now = new Date().toISOString();
       const normalizedAgent = normalizeAgentName(agent_name);
+      const metaJson = meta ? JSON.stringify(meta) : null;
+      try {
+        db.prepare(
+          "INSERT INTO agent_registry (agent_name, display_name, host, pid, skills_json, status, registered_at, last_seen_at, meta_json) " +
+          "VALUES (?,?,?,?,?, 'online', ?, ?, ?) " +
+          "ON CONFLICT(agent_name) DO UPDATE SET " +
+          "display_name=COALESCE(excluded.display_name, agent_registry.display_name), " +
+          "host=COALESCE(excluded.host, agent_registry.host), " +
+          "pid=COALESCE(excluded.pid, agent_registry.pid), " +
+          "skills_json=COALESCE(excluded.skills_json, agent_registry.skills_json), " +
+          "status='online', last_seen_at=excluded.last_seen_at, " +
+          "meta_json=COALESCE(excluded.meta_json, agent_registry.meta_json)"
+        ).run(normalizedAgent, agent_name || normalizedAgent, host || null, pid || null, null, now, now, metaJson);
+      } catch {}
       const existing = db.prepare("SELECT agent_name FROM agent_status_live WHERE agent_name=?").get(normalizedAgent);
       if (existing) {
-        db.prepare("UPDATE agent_status_live SET current_task=COALESCE(?, current_task), current_brief_id=COALESCE(?, current_brief_id), blocked_on=?, dnd_until=COALESCE(?, dnd_until), host=COALESCE(?, host), pid=COALESCE(?, pid), meta_json=COALESCE(?, meta_json), last_heartbeat_at=? WHERE agent_name=?").run(current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, meta ? JSON.stringify(meta) : null, now, normalizedAgent);
+        db.prepare("UPDATE agent_status_live SET current_task=COALESCE(?, current_task), current_brief_id=COALESCE(?, current_brief_id), blocked_on=?, dnd_until=COALESCE(?, dnd_until), host=COALESCE(?, host), pid=COALESCE(?, pid), meta_json=COALESCE(?, meta_json), last_heartbeat_at=? WHERE agent_name=?").run(current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, metaJson, now, normalizedAgent);
         return { agent_name: normalizedAgent, action: "updated", last_heartbeat_at: now };
       }
-      db.prepare("INSERT INTO agent_status_live (agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta_json, last_heartbeat_at) VALUES (?,?,?,?,?,?,?,?,?)").run(normalizedAgent, current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, meta ? JSON.stringify(meta) : null, now);
+      db.prepare("INSERT INTO agent_status_live (agent_name, current_task, current_brief_id, blocked_on, dnd_until, host, pid, meta_json, last_heartbeat_at) VALUES (?,?,?,?,?,?,?,?,?)").run(normalizedAgent, current_task || null, current_brief_id || null, blocked_on || null, dnd_until || null, host || null, pid || null, metaJson, now);
       return { agent_name: normalizedAgent, action: "created", last_heartbeat_at: now };
     },
   },
@@ -7643,9 +7657,58 @@ ${args.first_invocation_outcome || "(none)"}
       const team = await tools.mem_team_operating_model.handler({ agent_name: agent });
       const passport = await tools.mem_agent_pass_get.handler({ agent_name: agent });
       const statusBoard = project ? await tools.mem_status_board.handler({ projects: [project] }) : null;
+      const workReports = await tools.mem_work_report_feed.handler({ project, agent_name: agent, include_blocked: true, limit: 20 });
+      const timelineReport = project ? await tools.mem_project_timeline_report.handler({ project, agent_name: agent, days: 30, token_budget: 5000, max_items: 12 }) : null;
+      const recentDoneBriefs = await tools.mem_brief_list.handler({ agent_name: agent, status: "done", limit: 20, include_content: false });
+      const recentDispatchedBriefs = await tools.mem_brief_list.handler({ agent_name: agent, status: "dispatched", limit: 20, include_content: false });
+      const recentPendingBriefs = await tools.mem_brief_list.handler({ agent_name: agent, status: "pending", limit: 20, include_content: false });
+      const recallPrefix = [project, agent].filter(Boolean).join(" ");
+      const doneMemoryHits = await tools.mem_recall.handler({
+        query: [recallPrefix, "done erledigt completed live deployed verified handoff rollback what was built was wurde erledigt Done-Memory"].filter(Boolean).join(" "),
+        limit: 12,
+        mode: "hybrid",
+        include_journal: true,
+        journal_scopes: ["transcript", "brief", "event"]
+      });
+      const governanceHits = await tools.mem_recall.handler({
+        query: [recallPrefix, "owner rule Mayk forbidden verboten no-go final decision protected scope scar incident correction never again"].filter(Boolean).join(" "),
+        limit: 12,
+        mode: "hybrid",
+        include_journal: true,
+        journal_scopes: ["transcript", "brief", "event"]
+      });
+      const resumePack = {
+        loaded_at: isoNow(),
+        mandatory: true,
+        guard: "SessionStart without this resume_pack is incomplete; load it before planning or changing code.",
+        sources: ["mem_work_report_feed", "mem_project_timeline_report", "mem_brief_list:done", "mem_brief_list:dispatched", "mem_brief_list:pending"],
+        done_memory_count: workReports && workReports.feed_count || 0,
+        done_brief_count: recentDoneBriefs && recentDoneBriefs.count || 0,
+        dispatched_brief_count: recentDispatchedBriefs && recentDispatchedBriefs.count || 0,
+        pending_brief_count: recentPendingBriefs && recentPendingBriefs.count || 0,
+        done_memory_hit_count: Array.isArray(doneMemoryHits) ? doneMemoryHits.length : 0,
+        governance_hit_count: Array.isArray(governanceHits) ? governanceHits.length : 0,
+        latest_done: (workReports && workReports.feed || []).slice(0, 8).map((row) => ({
+          kind: row.kind,
+          id: row.id,
+          at: row.at,
+          agent_name: row.agent_name || row.assigned_agent || null,
+          project: row.project || null,
+          summary: row.summary || row.title || row.notes || "",
+          next_actions: row.next_actions || [],
+          blockers: row.blockers || []
+        })),
+        done_briefs: recentDoneBriefs && recentDoneBriefs.briefs || [],
+        dispatched_briefs: recentDispatchedBriefs && recentDispatchedBriefs.briefs || [],
+        pending_briefs: recentPendingBriefs && recentPendingBriefs.briefs || [],
+        done_memory_hits: Array.isArray(doneMemoryHits) ? doneMemoryHits.slice(0, 8) : [],
+        governance_hits: Array.isArray(governanceHits) ? governanceHits.slice(0, 8) : [],
+        project_next_actions: timelineReport && timelineReport.next_actions || [],
+        project_readiness: timelineReport && timelineReport.readiness || null
+      };
       try {
         db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'session_start', ?, 'done', ?, 'session_lifecycle')")
-          .run(agent, project || a.task || "session", JSON.stringify({ task: a.task || null, project, passport_lane: passport && passport.passport && passport.passport.lane || null }));
+          .run(agent, project || a.task || "session", JSON.stringify({ task: a.task || null, project, passport_lane: passport && passport.passport && passport.passport.lane || null, resume_pack_loaded: true, done_brief_count: resumePack.done_brief_count, done_memory_count: resumePack.done_memory_count }));
       } catch {}
       return {
         agent_name: agent,
@@ -7664,6 +7727,14 @@ ${args.first_invocation_outcome || "(none)"}
         team_operating_model: team,
         agent_passport: passport,
         status_board: statusBoard,
+        resume_pack: resumePack,
+        work_report_feed: workReports,
+        project_timeline_report: timelineReport,
+        recent_briefs: {
+          done: recentDoneBriefs,
+          dispatched: recentDispatchedBriefs,
+          pending: recentPendingBriefs
+        }
       };
     },
   },
@@ -8730,6 +8801,11 @@ for (const [name, def] of Object.entries(RUNTIME_TURN_TOOL_DEFS)) {
         projectBoard: (payload) => {
           const handled = handleAgentGovernanceTool(db, "mem_project_board", payload || {});
           return handled.handled ? handled.result : { error: "mem_project_board not available" };
+        },
+        workReportFeed: (payload) => workReportFeedData(db, payload || {}),
+        timelineReport: (payload) => {
+          const handled = handleTimelineReportTool(db, "mem_project_timeline_report", payload || {});
+          return handled.handled ? handled.result : { error: "mem_project_timeline_report not available" };
         },
         eventLog: (payload) => tools.mem_event_log.handler(payload || {}),
       });

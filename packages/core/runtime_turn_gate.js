@@ -294,6 +294,8 @@ function makeContextBlock(result = {}) {
     `turn_key: ${result.turn_key || ""}`,
     `message_captured: ${result.capture && result.capture.ok ? "yes" : "no"}`,
     `memory_checked: ${result.recall && result.recall.ok ? "yes" : "no"}`,
+    `governance_checked: ${result.governance_recall && result.governance_recall.ok ? "yes" : "no"}`,
+    `resume_pack: ${result.resume_pack_loaded ? "yes" : "no"}`,
     `full_sync: ${result.full_sync_ran ? "yes" : "no"}`,
     `audit_id: ${result.audit_id || ""}`,
   ];
@@ -351,7 +353,34 @@ function runtimeTurnBegin(db, input = {}, ops = {}) {
     });
   }
 
-  const preliminary = runtimePolicyCheck(db, checkInputFromState(input, state, { capture_ok: capture && capture.ok, recall_ok: recall.ok }));
+  let governanceRows = [];
+  let governanceRecall = { ok: false, error: "recall op missing", count: 0, rows: [] };
+  if (typeof ops.recall === "function") {
+    const governanceQuery = [
+      state.project || input.project || "",
+      state.agent_name || input.agent_name || "",
+      "owner rule forbidden no-go protected scope final decision scar incident never again correction completed done handoff"
+    ].filter(Boolean).join(" ");
+    try {
+      governanceRows = ops.recall({
+        query: input.governance_recall_query || governanceQuery,
+        limit: intFlag(input.governance_recall_limit, 8, 1, 30),
+        mode: "hybrid",
+        include_journal: true,
+        journal_scopes: ["transcript", "brief", "event"],
+        like_fallback: true,
+      }) || [];
+      governanceRecall = { ok: true, count: Array.isArray(governanceRows) ? governanceRows.length : 0, rows: compactRows(governanceRows, 8) };
+      state = upsertTurnState(db, input, {
+        increment: false,
+        meta: { last_governance_recall_at: now, last_governance_recall_count: governanceRecall.count },
+      });
+    } catch (e) {
+      governanceRecall = { ok: false, error: String(e.message || e), count: 0, rows: [] };
+    }
+  }
+
+  const preliminary = runtimePolicyCheck(db, checkInputFromState(input, state, { capture_ok: capture && capture.ok, recall_ok: recall.ok && governanceRecall.ok }));
   const required = new Set(preliminary.required_actions || []);
   const missingRequirements = new Set((preliminary.missing_context || []).map((entry) => entry.requirement));
   const fullSyncDue = !!preliminary.full_sync_due || missingRequirements.has("full_sync_every_messages");
@@ -387,6 +416,52 @@ function runtimeTurnBegin(db, input = {}, ops = {}) {
     } catch (e) {
       actionErrors.push("project_board: " + String(e.message || e));
       fullSync.project_board = { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  const resumePackDue = state.message_count <= 1 || fullSyncDue || required.has("mem_work_report_feed") || required.has("mem_project_timeline_report");
+  if (resumePackDue && typeof ops.workReportFeed === "function") {
+    try {
+      fullSync.work_report_feed = ops.workReportFeed({
+        project: state.project || input.project || null,
+        agent_name: state.agent_name,
+        include_blocked: true,
+        limit: intFlag(input.resume_limit, 12, 1, 50),
+      });
+      fullSync.ran = true;
+      state = upsertTurnState(db, input, {
+        increment: false,
+        meta: {
+          last_resume_pack_at: now,
+          last_work_report_feed_count: fullSync.work_report_feed && fullSync.work_report_feed.feed_count || 0,
+        },
+      });
+    } catch (e) {
+      actionErrors.push("work_report_feed: " + String(e.message || e));
+      fullSync.work_report_feed = { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  if (resumePackDue && typeof ops.timelineReport === "function" && (state.project || input.project)) {
+    try {
+      fullSync.project_timeline_report = ops.timelineReport({
+        project: state.project || input.project,
+        agent_name: state.agent_name,
+        days: intFlag(input.resume_days, 30, 1, 3650),
+        max_items: intFlag(input.resume_limit, 12, 3, 50),
+        token_budget: intFlag(input.resume_token_budget, 3600, 800, 24000),
+      });
+      fullSync.ran = true;
+      state = upsertTurnState(db, input, {
+        increment: false,
+        meta: {
+          last_resume_timeline_at: now,
+          last_resume_timeline_status: fullSync.project_timeline_report && fullSync.project_timeline_report.status || null,
+        },
+      });
+    } catch (e) {
+      actionErrors.push("project_timeline_report: " + String(e.message || e));
+      fullSync.project_timeline_report = { ok: false, error: String(e.message || e) };
     }
   }
 
@@ -429,7 +504,7 @@ function runtimeTurnBegin(db, input = {}, ops = {}) {
 
   const finalCheck = runtimePolicyCheck(db, Object.assign(
     {},
-    checkInputFromState(input, state, { capture_ok: capture && capture.ok, recall_ok: recall.ok }),
+    checkInputFromState(input, state, { capture_ok: capture && capture.ok, recall_ok: recall.ok && governanceRecall.ok }),
     { has_full_sync: fullSyncDue && fullSync.ran && !actionErrors.length }
   ));
   state = upsertTurnState(db, input, {
@@ -458,11 +533,15 @@ function runtimeTurnBegin(db, input = {}, ops = {}) {
     next_actions: finalCheck.required_actions || [],
     capture,
     recall,
+    governance_recall: governanceRecall,
+    resume_pack_loaded: !!(fullSync.work_report_feed || fullSync.project_timeline_report) && !actionErrors.some((err) => /work_report_feed|project_timeline_report/.test(err)),
     full_sync_ran: !!(fullSync.ran || fullSyncDue),
     full_sync_due: fullSyncDue,
     full_sync: {
       brief_pull_count: fullSync.brief_pull && fullSync.brief_pull.count || 0,
       project_board_loaded: !!fullSync.project_board && !fullSync.project_board.error,
+      work_report_feed_count: fullSync.work_report_feed && fullSync.work_report_feed.feed_count || 0,
+      project_timeline_loaded: !!fullSync.project_timeline_report && !fullSync.project_timeline_report.error,
       event_log_id: fullSync.event_log && fullSync.event_log.id || null,
     },
     policy_check: finalCheck,

@@ -15,6 +15,205 @@ const { normalizeResourceKind, normalizeResourceKey } = require("./resource_acce
 const DEFAULT_SCOPE = "default";
 const RISKY_ACTIONS = new Set(["code_edit", "write", "delete", "move", "deploy", "external_comm", "migration", "billing", "auth", "production"]);
 
+const GSTACK_WORKFLOW = ["think", "plan", "build", "review", "test", "ship", "reflect", "memorize"];
+
+const MNEMO_AGENT_OS_KERNEL = {
+  boot_order: [
+    "identify_agent_task_portal_risk",
+    "load_owner_rules",
+    "load_portal_rules",
+    "load_active_claims_and_locks",
+    "load_latest_receipts_and_handoffs",
+    "load_scars_and_forbidden_actions",
+    "select_gstack_role",
+    "create_or_attach_work_claim",
+    "produce_plan_before_build",
+    "write_receipts_during_work",
+    "write_handoff_before_stop"
+  ],
+  laws: [
+    "owner_rules_override_everything",
+    "forbidden_actions_block_execution",
+    "protected_scopes_need_claim_and_evidence",
+    "done_is_invalid_without_evidence",
+    "stop_is_invalid_without_handoff",
+    "repeated_failure_creates_a_scar"
+  ],
+  contract: [
+    "never_start_without_boot",
+    "never_edit_without_claim",
+    "never_mark_done_without_evidence",
+    "never_stop_without_handoff",
+    "never_ignore_owner_rules",
+    "never_overwrite_final_designs_or_protected_scopes",
+    "never_duplicate_work_already_claimed",
+    "never_hide_uncertainty_missing_tests_or_blockers",
+    "always_convert_important_telegram_or_brief_content_into_memory",
+    "always_create_scars_for_mistakes_that_must_not_repeat"
+  ]
+};
+
+const GSTACK_ROLE_CATALOG = [
+  {
+    role: "Product Planner",
+    department_name: "product",
+    aliases: ["YC Office Hours", "Product Interrogator", "CEO", "Founder Reviewer", "CEO / Founder Reviewer"],
+    mission: "Understand the user problem, define the narrowest valuable wedge, and keep scope honest before code starts.",
+    pre_work: ["problem understood", "existing work checked", "acceptance criteria written", "plan saved"],
+    during_work: ["decision changes captured", "scope drift flagged"],
+    post_work: ["outcome summarized", "remaining product risks marked"]
+  },
+  {
+    role: "System Architect",
+    department_name: "architecture",
+    aliases: ["Engineering Manager", "Architect", "Engineering Manager / Architect"],
+    mission: "Lock data flow, contracts, dependencies, failure modes, and cross-portal boundaries.",
+    pre_work: ["architecture context loaded", "dependencies checked", "protected scopes checked"],
+    during_work: ["architecture decisions captured", "risk map updated"],
+    post_work: ["architecture handoff written", "rollback path documented"]
+  },
+  {
+    role: "Backend Engineer",
+    department_name: "backend",
+    aliases: ["Backend", "API Engineer", "Data Engineer"],
+    mission: "Implement APIs, data models, workers, auth-adjacent backend logic, and reliable server behavior.",
+    pre_work: ["API rules checked", "data ownership checked", "work claim active"],
+    during_work: ["changed endpoints documented", "tests captured"],
+    post_work: ["server verification stored", "handoff written"]
+  },
+  {
+    role: "Frontend Engineer",
+    department_name: "frontend",
+    aliases: ["Senior Designer", "Designer", "UI Engineer", "Frontend", "Design Reviewer"],
+    mission: "Implement user-facing UI with responsive behavior, accessibility, and design-system alignment.",
+    pre_work: ["design rules loaded", "routes checked", "portal context loaded"],
+    during_work: ["screens and affected routes marked", "visual risks stored"],
+    post_work: ["browser evidence stored", "responsive checks captured"]
+  },
+  {
+    role: "Security Reviewer",
+    department_name: "security",
+    aliases: ["Chief Security Officer", "CSO", "Security"],
+    mission: "Review auth, data exposure, prompt injection, destructive actions, and protected scopes before release.",
+    pre_work: ["threat model context loaded", "protected systems checked"],
+    during_work: ["findings verified", "false positives excluded with reason"],
+    post_work: ["security verdict and evidence saved"]
+  },
+  {
+    role: "QA Tester",
+    department_name: "qa",
+    aliases: ["QA Lead", "QA", "Browser QA"],
+    mission: "Exercise real flows, capture regressions, verify fixes, and keep test evidence durable.",
+    pre_work: ["test matrix loaded", "known findings checked"],
+    during_work: ["each bug captured with reproduction", "fix verification stored"],
+    post_work: ["QA summary and remaining blockers written"]
+  },
+  {
+    role: "Release Manager",
+    department_name: "release",
+    aliases: ["Release Engineer", "Ship", "Deploy Manager"],
+    mission: "Coordinate ship, deploy, health checks, canaries, rollback, and final completion gate.",
+    pre_work: ["release rules checked", "evidence requirements checked"],
+    during_work: ["deploy receipts stored", "health status tracked"],
+    post_work: ["ship report and rollback status written"]
+  },
+  {
+    role: "Memory/Audit Officer",
+    department_name: "memory-audit",
+    aliases: ["Memory Officer", "Audit Officer", "Memorize", "Retro"],
+    mission: "Ensure every decision, change, blocker, evidence item, and handoff becomes structured Mnemo memory.",
+    pre_work: ["capture status checked", "recall and rules loaded"],
+    during_work: ["receipts enforced", "missing evidence blocked"],
+    post_work: ["handoff completeness verified"]
+  },
+  {
+    role: "Customer/Support Officer",
+    department_name: "support",
+    aliases: ["Support Officer", "Customer Officer", "Telegram/Brief Officer"],
+    mission: "Translate customer reports into tasks, status updates, acceptance criteria, and support-safe communication.",
+    pre_work: ["customer context loaded", "public/private channel rules checked"],
+    during_work: ["customer impact marked", "communication risks stored"],
+    post_work: ["support update prepared"]
+  },
+  {
+    role: "Portal Owner",
+    department_name: "portal-owner",
+    aliases: ["Portal", "Brand Owner", "Surface Owner"],
+    mission: "Own one portal's brand, domain, language, permissions, prices, design, and customer/partner rules.",
+    pre_work: ["portal context loaded", "global/portal/customer rules loaded"],
+    during_work: ["affected portal marked on every change"],
+    post_work: ["portal readiness and open risks updated"]
+  }
+];
+
+const GSTACK_CORE_SKILLS = [
+  ["office-hours", "Product Planner", "think", "Reframe the request with forcing questions before implementation."],
+  ["plan-ceo-review", "Product Planner", "plan", "Challenge scope and find the strongest product direction."],
+  ["plan-eng-review", "System Architect", "plan", "Lock architecture, data flow, edge cases, tests, and failure modes."],
+  ["plan-design-review", "Frontend Engineer", "plan", "Review visual quality and design requirements before build."],
+  ["plan-devex-review", "Product Planner", "plan", "Review developer experience, personas, and time-to-hello-world."],
+  ["autoplan", "System Architect", "plan", "Run product, design, engineering, and DX plan review as one gate."],
+  ["design-consultation", "Frontend Engineer", "plan", "Create a full design system and creative direction."],
+  ["review", "System Architect", "review", "Find bugs, completeness gaps, and production risks before landing."],
+  ["investigate", "Backend Engineer", "review", "Root-cause debugging; no fixes before investigation."],
+  ["design-review", "Frontend Engineer", "review", "Live visual audit and fix loop with browser evidence."],
+  ["devex-review", "QA Tester", "review", "Live developer-experience audit against real onboarding/docs."],
+  ["design-shotgun", "Frontend Engineer", "build", "Generate and compare multiple design directions before implementation."],
+  ["design-html", "Frontend Engineer", "build", "Turn approved design into production-quality HTML/CSS or framework code."],
+  ["qa", "QA Tester", "test", "Open a real browser, find bugs, fix, re-test, and store regression evidence."],
+  ["qa-only", "QA Tester", "test", "Report-only QA with reproductions and evidence."],
+  ["cso", "Security Reviewer", "review", "OWASP/STRIDE security audit with verified findings."],
+  ["ship", "Release Manager", "ship", "Run tests, docs checks, push/open PR, and verify readiness."],
+  ["land-and-deploy", "Release Manager", "ship", "Merge, deploy, wait for CI, and verify production health."],
+  ["canary", "Release Manager", "ship", "Post-deploy monitoring loop and regression watch."],
+  ["benchmark", "QA Tester", "test", "Performance and Core Web Vitals regression baseline."],
+  ["document-release", "Memory/Audit Officer", "reflect", "Update docs to match shipped changes."],
+  ["document-generate", "Memory/Audit Officer", "reflect", "Generate missing docs from code and decisions."],
+  ["retro", "Memory/Audit Officer", "reflect", "Team-aware retro, shipping streaks, test health, and lessons learned."]
+].map(([skill, role, phase, purpose]) => ({ skill, role, phase, purpose }));
+
+const GSTACK_POWER_TOOLS = [
+  ["codex", "cross-model second opinion and adversarial review"],
+  ["careful", "destructive-command warning"],
+  ["freeze", "directory edit lock"],
+  ["guard", "careful plus freeze full safety"],
+  ["unfreeze", "remove edit lock"],
+  ["context-save", "save work state, decisions, and remaining work"],
+  ["context-restore", "restore work state across sessions"],
+  ["learn", "manage persistent learnings"],
+  ["health", "code quality dashboard"],
+  ["browse", "real Chromium browser actions"],
+  ["open-gstack-browser", "visible browser with sidebar"],
+  ["setup-browser-cookies", "authenticated browser testing"],
+  ["pair-agent", "cross-agent shared browser with attribution"],
+  ["setup-deploy", "deploy configuration detection"],
+  ["setup-gbrain", "persistent brain onboarding pattern"],
+  ["sync-gbrain", "keep code and memory index current"],
+  ["gstack-upgrade", "self-updater pattern"],
+  ["benchmark-models", "cross-model benchmark"]
+].map(([tool, purpose]) => ({ tool, purpose }));
+
+const MNEMO_OS_COMMANDS = [
+  ["mnemo boot", "Load memory, claims, rules, scars, portal context, role, recent receipts, and board before work."],
+  ["mnemo claim", "Reserve scope before touching files, routes, APIs, deployments, prompts, or portal logic."],
+  ["mnemo receipt", "Append durable evidence for a meaningful action."],
+  ["mnemo handoff", "Close or pause work with completed/changed/failed/open/tested/rollback state."],
+  ["mnemo scar", "Create never-again prevention after a mistake, incident, or owner correction."],
+  ["mnemo mission", "Generate current company, portal, agent, claims, and open-work dashboard."],
+  ["/mnemo-office-hours", "Product interrogation and founder-style problem framing."],
+  ["/mnemo-autoplan", "Product, design, engineering, and DX plan review before implementation."],
+  ["/mnemo-eng-review", "Architecture, data-flow, edge-case, and failure-mode review."],
+  ["/mnemo-design-review", "Visual and UX review with browser evidence where relevant."],
+  ["/mnemo-review", "Bug, completeness, and production-risk review."],
+  ["/mnemo-investigate", "Root-cause investigation before any fix."],
+  ["/mnemo-qa", "Real-flow QA with reproduction, evidence, fix verification, and regression notes."],
+  ["/mnemo-ship", "Tests, docs, deploy/canary, health checks, and rollback evidence."],
+  ["/mnemo-retro", "Reflect, memorize, and update prevention after work completes."],
+  ["/mnemo-cso", "Security and protected-scope review."],
+  ["/mnemo-freeze", "Protect scope against parallel edits."],
+  ["/mnemo-learn", "Store durable owner, project, or operational learning."]
+].map(([command, purpose]) => ({ command, purpose }));
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -76,6 +275,129 @@ function listInput(value) {
 function textOrNull(value, max = 8000) {
   const text = compactContent(value, max);
   return text && text.trim() ? text : null;
+}
+
+function roleKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function canonicalRoleName(value) {
+  const key = roleKey(value);
+  const found = GSTACK_ROLE_CATALOG.find((role) => (
+    roleKey(role.role) === key ||
+    roleKey(role.department_name) === key ||
+    (Array.isArray(role.aliases) && role.aliases.some((alias) => roleKey(alias) === key))
+  ));
+  return found ? found.role : null;
+}
+
+function gstackRole(value) {
+  const name = canonicalRoleName(value);
+  return name ? GSTACK_ROLE_CATALOG.find((role) => role.role === name) : null;
+}
+
+function jsonList(value) {
+  if (Array.isArray(value)) return value.filter((item) => item !== undefined && item !== null && String(item).trim() !== "");
+  const parsed = parseMaybeJson(value, null);
+  if (Array.isArray(parsed)) return parsed;
+  if (value && typeof value === "object") return [value];
+  return String(value || "").split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function hasValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return String(value || "").trim().length > 0;
+}
+
+function portalName(input = {}) {
+  return textOrNull(input.portal || input.portal_name || input.surface || input.domain || "default", 200) || "default";
+}
+
+function rowToRoleAssignment(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    scope: row.scope,
+    project: row.project || null,
+    portal: row.portal || null,
+    agent_name: row.agent_name,
+    role_name: row.role_name,
+    department_name: row.department_name || null,
+    task: row.task || null,
+    plan_summary: row.plan_summary || null,
+    status: row.status,
+    selected_by: row.selected_by || null,
+    selected_at: row.selected_at,
+    updated_at: row.updated_at,
+    meta: parseJson(row.meta_json, {})
+  };
+}
+
+function rowToPortalContext(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    scope: row.scope,
+    project: row.project,
+    portal: row.portal,
+    portal_id: row.portal_id || row.portal || null,
+    portal_name: row.portal_name || row.portal || null,
+    company_name: row.company_name || null,
+    brand_name: row.brand_name || null,
+    domain: row.domain || null,
+    environment: row.environment || null,
+    country_or_market: parseJson(row.country_or_market_json, []),
+    user_role: row.user_role || null,
+    language: row.language || null,
+    supported_languages: parseJson(row.supported_languages_json, []),
+    design: parseJson(row.design_json, null),
+    credit_system: parseJson(row.credit_system_json, null),
+    pricing: parseJson(row.pricing_json, null),
+    rights: parseJson(row.rights_json, null),
+    billing_owner: row.billing_owner || null,
+    auth_owner: row.auth_owner || null,
+    deployment_owner: row.deployment_owner || null,
+    legal_owner: row.legal_owner || null,
+    forbidden_cross_portal_leaks: parseJson(row.forbidden_cross_portal_leaks_json, []),
+    shared_modules: parseJson(row.shared_modules_json, []),
+    protected_surfaces: parseJson(row.protected_surfaces_json, []),
+    global_rules: parseJson(row.global_rules_json, []),
+    portal_rules: parseJson(row.portal_rules_json, []),
+    customer_partner_rules: parseJson(row.customer_partner_rules_json, []),
+    dependencies: parseJson(row.dependencies_json, []),
+    status: row.status,
+    updated_by: row.updated_by || null,
+    updated_at: row.updated_at,
+    meta: parseJson(row.meta_json, {})
+  };
+}
+
+function latestRoleAssignment(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const agent = normalizeAgentName(input.agent_name);
+  const project = textOrNull(input.project, 500);
+  const portal = input.portal ? portalName(input) : null;
+  const where = ["scope=?", "agent_name=?", "status='active'"];
+  const params = [scope, agent];
+  if (project) { where.push("(project=? OR project IS NULL OR project='')"); params.push(project); }
+  if (portal) { where.push("(portal=? OR portal IS NULL OR portal='')"); params.push(portal); }
+  const row = db.prepare("SELECT * FROM agent_role_assignment WHERE " + where.join(" AND ") + " ORDER BY CASE WHEN project=? THEN 0 ELSE 1 END, CASE WHEN portal=? THEN 0 ELSE 1 END, updated_at DESC, id DESC LIMIT 1")
+    .get(...params, project || "", portal || "");
+  return rowToRoleAssignment(row);
+}
+
+function claimScopeKey(kind, value) {
+  const normalizedKind = String(kind || "file").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-") || "file";
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const base = normalizedKind === "file" ? raw.replace(/\\/g, "/").toLowerCase() : raw.toLowerCase().replace(/[^a-z0-9._:/-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${normalizedKind}:${base}`;
 }
 
 function ensureAgentGovernanceSchema(db) {
@@ -250,6 +572,83 @@ CREATE INDEX IF NOT EXISTS idx_context_snapshot_project ON context_snapshot(proj
 CREATE INDEX IF NOT EXISTS idx_context_snapshot_agent ON context_snapshot(agent_name, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_context_snapshot_work_order ON context_snapshot(work_order_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS agent_role_assignment (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  portal TEXT,
+  agent_name TEXT NOT NULL,
+  role_name TEXT NOT NULL,
+  department_name TEXT,
+  task TEXT,
+  plan_summary TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  selected_by TEXT,
+  meta_json TEXT,
+  selected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_role_assignment_agent ON agent_role_assignment(scope, agent_name, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_role_assignment_project ON agent_role_assignment(scope, project, role_name, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS portal_context (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT NOT NULL,
+  portal TEXT NOT NULL DEFAULT 'default',
+  portal_id TEXT,
+  portal_name TEXT,
+  company_name TEXT,
+  brand_name TEXT,
+  domain TEXT,
+  environment TEXT,
+  country_or_market_json TEXT,
+  user_role TEXT,
+  language TEXT,
+  supported_languages_json TEXT,
+  design_json TEXT,
+  credit_system_json TEXT,
+  pricing_json TEXT,
+  rights_json TEXT,
+  billing_owner TEXT,
+  auth_owner TEXT,
+  deployment_owner TEXT,
+  legal_owner TEXT,
+  forbidden_cross_portal_leaks_json TEXT,
+  shared_modules_json TEXT,
+  protected_surfaces_json TEXT,
+  global_rules_json TEXT,
+  portal_rules_json TEXT,
+  customer_partner_rules_json TEXT,
+  dependencies_json TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  updated_by TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(scope, project, portal)
+);
+CREATE INDEX IF NOT EXISTS idx_portal_context_project ON portal_context(scope, project, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_workflow_receipt (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  portal TEXT,
+  agent_name TEXT NOT NULL,
+  role_name TEXT,
+  phase TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  evidence_json TEXT,
+  risks_json TEXT,
+  affected_portals_json TEXT,
+  status TEXT NOT NULL DEFAULT 'done',
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_workflow_receipt_agent ON agent_workflow_receipt(scope, agent_name, project, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_workflow_receipt_project ON agent_workflow_receipt(scope, project, phase, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS quality_gate_run (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'default',
@@ -389,6 +788,22 @@ CREATE TABLE IF NOT EXISTS project_channel_policy (
 CREATE INDEX IF NOT EXISTS idx_project_channel_policy_status ON project_channel_policy(status, updated_at DESC);
 `);
   try {
+    const cols = new Set(db.prepare("PRAGMA table_info(portal_context)").all().map((col) => col.name));
+    const add = (name, type) => { if (!cols.has(name)) db.exec(`ALTER TABLE portal_context ADD COLUMN ${name} ${type}`); };
+    add("portal_id", "TEXT");
+    add("portal_name", "TEXT");
+    add("environment", "TEXT");
+    add("country_or_market_json", "TEXT");
+    add("supported_languages_json", "TEXT");
+    add("billing_owner", "TEXT");
+    add("auth_owner", "TEXT");
+    add("deployment_owner", "TEXT");
+    add("legal_owner", "TEXT");
+    add("forbidden_cross_portal_leaks_json", "TEXT");
+    add("shared_modules_json", "TEXT");
+    add("protected_surfaces_json", "TEXT");
+  } catch {}
+  try {
     db.exec(`
 CREATE TRIGGER IF NOT EXISTS mnemo_journal_work_order_ai AFTER INSERT ON work_order BEGIN
   INSERT INTO mnemo_event_journal
@@ -437,6 +852,24 @@ CREATE TRIGGER IF NOT EXISTS mnemo_journal_user_intent_ai AFTER INSERT ON user_i
     (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
   VALUES
     ('user_intent', NEW.project, 'inbound', NEW.user_name, 'user_intent_capture', 'user_intent', CAST(NEW.id AS TEXT), NEW.status, NEW.summary, NEW.exact_words, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_agent_role_assignment_ai AFTER INSERT ON agent_role_assignment BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('agent_role', NEW.project, 'internal', NEW.selected_by, 'agent_role_select', 'agent_role_assignment', CAST(NEW.id AS TEXT), NEW.status, NEW.agent_name || ' -> ' || NEW.role_name, NEW.plan_summary, NEW.meta_json, NEW.selected_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_portal_context_ai AFTER INSERT ON portal_context BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('portal_context', NEW.project, 'internal', NEW.updated_by, 'portal_context_set', 'portal_context', CAST(NEW.id AS TEXT), NEW.status, NEW.project || ':' || NEW.portal || ' ' || COALESCE(NEW.brand_name, ''), NEW.portal_rules_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_workflow_receipt_ai AFTER INSERT ON agent_workflow_receipt BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('workflow_receipt', NEW.project, 'internal', NEW.agent_name, 'workflow_receipt', 'agent_workflow_receipt', CAST(NEW.id AS TEXT), NEW.status, NEW.phase || ': ' || NEW.summary, NEW.evidence_json, NEW.meta_json, NEW.created_at);
 END;
 `);
   } catch {}
@@ -2107,6 +2540,391 @@ function briefTaskIngest(db, input = {}) {
   };
 }
 
+function gstackCatalog(input = {}) {
+  const includePowerTools = input.include_power_tools !== false;
+  return {
+    ok: true,
+    source: "gstack-inspired Mnemo Agent OS operating model",
+    principle: "gstack supplies workflow, specialist roles, and operating rhythm; Mnemo remains memory, claims, rules, audit, evidence, and company truth.",
+    kernel: MNEMO_AGENT_OS_KERNEL,
+    workflow: GSTACK_WORKFLOW,
+    role_count: GSTACK_ROLE_CATALOG.length,
+    roles: GSTACK_ROLE_CATALOG,
+    core_skill_count: GSTACK_CORE_SKILLS.length,
+    core_skills: GSTACK_CORE_SKILLS,
+    power_tools: includePowerTools ? GSTACK_POWER_TOOLS : [],
+    commands: MNEMO_OS_COMMANDS,
+    gates: {
+      pre_work: ["understand_problem", "check_existing_work", "check_rules", "load_portal_context", "check_dependencies", "set_work_claim", "save_plan"],
+      during_work: ["document_each_change", "mark_affected_portals", "save_decisions", "save_tests", "save_risks"],
+      post_work: ["save_result", "save_evidence", "write_handoff", "mark_open_points", "produce_telegram_or_brief_update", "memorize_done_state"]
+    },
+    prevention_engines: ["duplicate_task_detection", "never_again_scar_check", "owner_rule_validation", "protected_scope_validation", "completion_guard"],
+    multiportal_rule_layers: ["global_rules", "portal_rules", "customer_partner_rules"],
+    hundred_agent_model: {
+      shard_by: ["portal", "role", "project", "risk_class"],
+      requires: ["role assignment", "portal context", "work claim", "capability token for risky work", "evidence receipts", "handoff"],
+      coordination_views: ["mem_agent_company_board", "mem_project_board", "mem_work_report_feed", "mem_project_timeline_report"]
+    }
+  };
+}
+
+function agentRoleSelect(db, input = {}) {
+  if (!input.agent_name || !input.role) return { error: "agent_name + role required" };
+  ensureAgentGovernanceSchema(db);
+  const role = gstackRole(input.role);
+  if (!role) return { error: "unknown_role", role: input.role, allowed_roles: GSTACK_ROLE_CATALOG.map((row) => row.role) };
+  const scope = scopeName(input.scope);
+  const agent = normalizeAgentName(input.agent_name);
+  const project = textOrNull(input.project, 500);
+  const portal = input.portal || input.portal_name || input.surface ? portalName(input) : null;
+  if (input.replace_active !== false) {
+    const where = ["scope=?", "agent_name=?", "status='active'"];
+    const params = [scope, agent];
+    if (project) { where.push("(project=? OR project IS NULL OR project='')"); params.push(project); }
+    if (portal) { where.push("(portal=? OR portal IS NULL OR portal='')"); params.push(portal); }
+    db.prepare("UPDATE agent_role_assignment SET status='superseded', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE " + where.join(" AND ")).run(...params);
+  }
+  const info = db.prepare("INSERT INTO agent_role_assignment (scope, project, portal, agent_name, role_name, department_name, task, plan_summary, status, selected_by, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    .run(scope, project, portal, agent, role.role, role.department_name, textOrNull(input.task, 4000), textOrNull(input.plan || input.plan_summary, 8000), input.status || "active", input.selected_by || input.updated_by || agent, safeJson(input.meta || {}, {}));
+  const assignment = rowToRoleAssignment(db.prepare("SELECT * FROM agent_role_assignment WHERE id=?").get(info.lastInsertRowid));
+  try {
+    db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'agent_role_select', ?, 'done', ?, 'agent_governance')")
+      .run(agent, project || portal || role.role, JSON.stringify({ assignment_id: assignment.id, role: role.role, project, portal, task: input.task || null }));
+  } catch {}
+  return { ok: true, assignment, role_contract: role };
+}
+
+function agentRoleGet(db, input = {}) {
+  if (!input.agent_name) return { error: "agent_name required" };
+  const assignment = latestRoleAssignment(db, input);
+  return assignment ? { ok: true, assignment, role_contract: gstackRole(assignment.role_name) } : { error: "missing_role_assignment", agent_name: normalizeAgentName(input.agent_name), hint: "Call mem_agent_role_select before work starts." };
+}
+
+function agentRoleList(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const where = ["scope=?"];
+  const params = [scope];
+  if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.project) { where.push("project=?"); params.push(String(input.project)); }
+  if (input.role) { where.push("role_name=?"); params.push(canonicalRoleName(input.role) || input.role); }
+  if (input.status) { where.push("status=?"); params.push(String(input.status)); }
+  else if (!input.include_inactive) where.push("status='active'");
+  const rows = db.prepare("SELECT * FROM agent_role_assignment WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC, id DESC LIMIT ?").all(...params, clampInt(input.limit, 100, 1, 1000)).map(rowToRoleAssignment);
+  return { ok: true, count: rows.length, assignments: rows };
+}
+
+function portalContextSet(db, input = {}) {
+  if (!input.project) return { error: "project required" };
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = String(input.project);
+  const portal = portalName(input);
+  const info = db.prepare(
+    "INSERT INTO portal_context (scope, project, portal, portal_id, portal_name, company_name, brand_name, domain, environment, country_or_market_json, user_role, language, supported_languages_json, design_json, credit_system_json, pricing_json, rights_json, billing_owner, auth_owner, deployment_owner, legal_owner, forbidden_cross_portal_leaks_json, shared_modules_json, protected_surfaces_json, global_rules_json, portal_rules_json, customer_partner_rules_json, dependencies_json, status, updated_by, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
+    "ON CONFLICT(scope, project, portal) DO UPDATE SET portal_id=excluded.portal_id, portal_name=excluded.portal_name, company_name=excluded.company_name, brand_name=excluded.brand_name, domain=excluded.domain, environment=excluded.environment, country_or_market_json=excluded.country_or_market_json, user_role=excluded.user_role, language=excluded.language, supported_languages_json=excluded.supported_languages_json, design_json=excluded.design_json, credit_system_json=excluded.credit_system_json, pricing_json=excluded.pricing_json, rights_json=excluded.rights_json, billing_owner=excluded.billing_owner, auth_owner=excluded.auth_owner, deployment_owner=excluded.deployment_owner, legal_owner=excluded.legal_owner, forbidden_cross_portal_leaks_json=excluded.forbidden_cross_portal_leaks_json, shared_modules_json=excluded.shared_modules_json, protected_surfaces_json=excluded.protected_surfaces_json, global_rules_json=excluded.global_rules_json, portal_rules_json=excluded.portal_rules_json, customer_partner_rules_json=excluded.customer_partner_rules_json, dependencies_json=excluded.dependencies_json, status=excluded.status, updated_by=excluded.updated_by, meta_json=excluded.meta_json, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+  ).run(
+    scope,
+    project,
+    portal,
+    textOrNull(input.portal_id || portal, 500),
+    textOrNull(input.portal_name || input.name || portal, 1000),
+    textOrNull(input.company_name || input.company || input.company_or_brand || input.brand_owner, 1000),
+    textOrNull(input.brand_name || input.brand || input.company_or_brand || input.brand_owner, 1000),
+    textOrNull(input.domain, 1000),
+    textOrNull(input.environment, 100),
+    safeJson(jsonList(input.country_or_market || input.market || input.country), []),
+    textOrNull(input.user_role || input.role_context, 1000),
+    textOrNull(input.language || input.language_default || input.locale, 100),
+    safeJson(jsonList(input.supported_languages || input.languages), []),
+    safeJson(input.design || input.design_rules || input.theme_or_design_source || {}, {}),
+    safeJson(input.credit_system || input.credits || {}, {}),
+    safeJson(input.pricing || input.prices || input.pricing_source_of_truth || {}, {}),
+    safeJson(input.rights || input.permissions || {}, {}),
+    textOrNull(input.billing_owner, 500),
+    textOrNull(input.auth_owner, 500),
+    textOrNull(input.deployment_owner || input.deploy_owner, 500),
+    textOrNull(input.legal_owner, 500),
+    safeJson(jsonList(input.forbidden_cross_portal_leaks), []),
+    safeJson(jsonList(input.shared_modules), []),
+    safeJson(jsonList(input.protected_surfaces), []),
+    safeJson(jsonList(input.global_rules), []),
+    safeJson(jsonList(input.portal_rules || input.rules), []),
+    safeJson(jsonList(input.customer_partner_rules || input.customer_rules || input.partner_rules), []),
+    safeJson(jsonList(input.dependencies || input.required_checks), []),
+    input.status || "active",
+    input.updated_by || input.agent_name || "unknown",
+    safeJson(input.meta || {}, {})
+  );
+  const context = rowToPortalContext(db.prepare("SELECT * FROM portal_context WHERE scope=? AND project=? AND portal=?").get(scope, project, portal));
+  try {
+    db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'portal_context_set', ?, 'done', ?, 'agent_governance')")
+      .run(input.updated_by || input.agent_name || "unknown", project + ":" + portal, JSON.stringify({ portal_context_id: context.id, changes: info.changes }));
+  } catch {}
+  return { ok: true, context };
+}
+
+function portalContextGet(db, input = {}) {
+  if (!input.project) return { error: "project required" };
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = String(input.project);
+  const portal = portalName(input);
+  let row = db.prepare("SELECT * FROM portal_context WHERE scope=? AND project=? AND portal=? AND status='active' ORDER BY updated_at DESC LIMIT 1").get(scope, project, portal);
+  if (!row && portal !== "default") row = db.prepare("SELECT * FROM portal_context WHERE scope=? AND project=? AND portal='default' AND status='active' ORDER BY updated_at DESC LIMIT 1").get(scope, project);
+  return row ? { ok: true, context: rowToPortalContext(row) } : { error: "missing_portal_context", project, portal, hint: "Call mem_portal_context_set with company/brand/domain/language/design/credits/prices/rights and all three rule layers." };
+}
+
+function portalContextList(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const where = ["scope=?"];
+  const params = [scope];
+  if (input.project) { where.push("project=?"); params.push(String(input.project)); }
+  if (input.status) { where.push("status=?"); params.push(String(input.status)); }
+  else if (!input.include_inactive) where.push("status='active'");
+  const rows = db.prepare("SELECT * FROM portal_context WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC LIMIT ?").all(...params, clampInt(input.limit, 100, 1, 1000)).map(rowToPortalContext);
+  return { ok: true, count: rows.length, contexts: rows };
+}
+
+function activeClaimsForAgent(db, input = {}) {
+  if (!tableExists(db, "work_claim") || !input.agent_name) return [];
+  const params = [input.agent_name];
+  const where = ["agent_name=?", "status IN ('active','stale')"];
+  if (input.project) { where.push("project=?"); params.push(input.project); }
+  return db.prepare("SELECT id, project, file_path, claim_kind, scope_value, scope_key, summary, status, expires_at, heartbeat_at FROM work_claim WHERE " + where.join(" AND ") + " ORDER BY heartbeat_at DESC, id DESC LIMIT 100").all(...params);
+}
+
+function activeClaimsForScopeKeys(db, input = {}) {
+  if (!tableExists(db, "work_claim")) return [];
+  const keys = Array.isArray(input.scope_keys) ? input.scope_keys.filter(Boolean) : [];
+  if (!keys.length) return [];
+  const where = ["status IN ('active','stale')", "scope_key IN (" + keys.map(() => "?").join(",") + ")"];
+  const params = keys.slice();
+  if (input.project) { where.push("project=?"); params.push(input.project); }
+  return db.prepare("SELECT id, project, file_path, agent_name, claim_kind, scope_value, scope_key, summary, status, expires_at, heartbeat_at FROM work_claim WHERE " + where.join(" AND ") + " ORDER BY heartbeat_at DESC, id DESC LIMIT 100").all(...params);
+}
+
+function recentWorkflowReceipts(db, input = {}) {
+  if (!tableExists(db, "agent_workflow_receipt")) return [];
+  const where = ["scope=?"];
+  const params = [scopeName(input.scope)];
+  if (input.project) { where.push("project=?"); params.push(input.project); }
+  if (input.agent_name) { where.push("agent_name=?"); params.push(normalizeAgentName(input.agent_name)); }
+  if (input.portal) { where.push("(portal=? OR portal IS NULL OR portal='')"); params.push(portalName(input)); }
+  return db.prepare("SELECT id, project, portal, agent_name, role_name, phase, summary, status, created_at FROM agent_workflow_receipt WHERE " + where.join(" AND ") + " ORDER BY created_at DESC, id DESC LIMIT ?")
+    .all(...params, clampInt(input.limit, 20, 1, 100));
+}
+
+function agentCompanyPreflight(db, input = {}) {
+  if (!input.agent_name || !input.task) return { error: "agent_name + task required" };
+  ensureAgentGovernanceSchema(db);
+  const checks = [];
+  const blockers = [];
+  const warnings = [];
+  const project = textOrNull(input.project, 500);
+  const portal = portalName(input);
+  const agent = normalizeAgentName(input.agent_name);
+  const requestedRole = input.role || input.role_name;
+  const assignment = requestedRole ? { role_name: canonicalRoleName(requestedRole), source: "input" } : latestRoleAssignment(db, { scope: input.scope, agent_name: agent, project, portal });
+  if (!assignment || !assignment.role_name) { checks.push({ name: "role_selection", result: "block" }); blockers.push("missing gstack/Mnemo role selection"); }
+  else if (!gstackRole(assignment.role_name)) { checks.push({ name: "role_selection", result: "block", role: assignment.role_name }); blockers.push("unknown role: " + assignment.role_name); }
+  else checks.push({ name: "role_selection", result: "ok", role: assignment.role_name, source: assignment.source || "assignment" });
+
+  let portalContext = null;
+  const requirePortal = input.require_portal_context === true || (!!project && input.require_portal_context !== false);
+  if (project && requirePortal) {
+    const contextResult = portalContextGet(db, { scope: input.scope, project, portal });
+    portalContext = contextResult.context || null;
+    if (!portalContext) { checks.push({ name: "portal_context", result: "block", portal }); blockers.push("missing portal context for " + project + ":" + portal); }
+    else {
+      const missingFields = [];
+      for (const field of [
+        "portal_id",
+        "portal_name",
+        "brand_name",
+        "domain",
+        "environment",
+        "country_or_market",
+        "user_role",
+        "language",
+        "supported_languages",
+        "design",
+        "credit_system",
+        "pricing",
+        "rights",
+        "billing_owner",
+        "auth_owner",
+        "deployment_owner",
+        "legal_owner",
+        "forbidden_cross_portal_leaks",
+        "shared_modules",
+        "protected_surfaces"
+      ]) if (!hasValue(portalContext[field])) missingFields.push(field);
+      const missingLayers = [];
+      for (const layer of ["global_rules", "portal_rules", "customer_partner_rules"]) if (!hasValue(portalContext[layer])) missingLayers.push(layer);
+      checks.push({ name: "portal_context", result: missingFields.length || missingLayers.length ? "block" : "ok", portal, missing_fields: missingFields, missing_rule_layers: missingLayers });
+      if (missingFields.length) blockers.push("portal context missing fields: " + missingFields.join(", "));
+      if (missingLayers.length) blockers.push("portal context missing rule layers: " + missingLayers.join(", "));
+    }
+  }
+  const claims = activeClaimsForAgent(db, { agent_name: agent, project });
+  const files = Array.isArray(input.files) ? input.files : [];
+  const missingClaimKeys = files.map((file) => claimScopeKey("file", file)).filter(Boolean).filter((key) => !claims.some((claim) => String(claim.scope_key || "") === key));
+  const conflictingClaims = activeClaimsForScopeKeys(db, { project, scope_keys: files.map((file) => claimScopeKey("file", file)).filter(Boolean) })
+    .filter((claim) => normalizeAgentName(claim.agent_name) !== agent);
+  checks.push({ name: "work_claim", result: missingClaimKeys.length || conflictingClaims.length ? "block" : "ok", active_claims: claims.length, missing_claims: missingClaimKeys, conflicting_claims: conflictingClaims });
+  if (missingClaimKeys.length && input.require_work_claim !== false) blockers.push("missing active work claims: " + missingClaimKeys.join(", "));
+  if (conflictingClaims.length) blockers.push("scope already claimed by another agent: " + conflictingClaims.map((claim) => `${claim.agent_name}:${claim.scope_key}`).join(", "));
+  const hasPlan = !!textOrNull(input.plan || input.plan_summary, 8000) || !!(assignment && assignment.plan_summary);
+  checks.push({ name: "plan_receipt", result: hasPlan ? "ok" : "block" });
+  if (!hasPlan && input.require_plan !== false) blockers.push("missing saved plan/plan_summary");
+  if (Array.isArray(input.dependencies) && input.dependencies.length) checks.push({ name: "dependencies", result: "ok", dependencies: input.dependencies });
+  else warnings.push("dependencies not provided");
+  const status = blockers.length ? "block" : "ok";
+  try {
+    db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'company_preflight', ?, ?, ?, 'agent_governance')")
+      .run(agent, project || input.task, status, JSON.stringify({ task: input.task, role: assignment && assignment.role_name || null, portal, blockers, checks, warnings }));
+  } catch {}
+  return { status, ok: status === "ok", agent_name: agent, project, portal, role: assignment && assignment.role_name || null, workflow: GSTACK_WORKFLOW, blockers, warnings, checks, portal_context: portalContext, active_claims: claims, hint: status === "ok" ? "Proceed through build/review/test/ship/reflect/memorize with receipts and handoff." : "Resolve blockers before changing code, text, prices, design, or logic." };
+}
+
+function workflowReceiptCreate(db, input = {}) {
+  if (!input.agent_name || !input.phase || !input.summary) return { error: "agent_name + phase + summary required" };
+  ensureAgentGovernanceSchema(db);
+  const phase = roleKey(input.phase);
+  if (!GSTACK_WORKFLOW.includes(phase) && !["decision", "risk", "evidence", "handoff"].includes(phase)) return { error: "invalid_phase", allowed: GSTACK_WORKFLOW };
+  const agent = normalizeAgentName(input.agent_name);
+  const role = input.role || input.role_name || (latestRoleAssignment(db, { scope: input.scope, agent_name: agent, project: input.project, portal: input.portal }) || {}).role_name || null;
+  const info = db.prepare("INSERT INTO agent_workflow_receipt (scope, project, portal, agent_name, role_name, phase, summary, evidence_json, risks_json, affected_portals_json, status, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(scopeName(input.scope), input.project || null, input.portal ? portalName(input) : null, agent, role, phase, textOrNull(input.summary, 12000), safeJson(input.evidence || [], []), safeJson(input.risks || [], []), safeJson(input.affected_portals || [], []), input.status || "done", safeJson(input.meta || {}, {}));
+  try {
+    db.prepare("INSERT INTO agent_action (agent_name, action_kind, target, status, payload_json, topic) VALUES (?, 'workflow_receipt', ?, 'done', ?, 'agent_governance')")
+      .run(agent, input.project || phase, JSON.stringify({ receipt_id: info.lastInsertRowid, phase, role }));
+  } catch {}
+  return { ok: true, id: info.lastInsertRowid, phase, role };
+}
+
+function agentOsBoot(db, input = {}) {
+  if (!input.agent_name || !input.task) return { error: "agent_name + task required" };
+  ensureAgentGovernanceSchema(db);
+  const agent = normalizeAgentName(input.agent_name);
+  const project = textOrNull(input.project, 500);
+  const portal = portalName(input);
+  let roleAssignment = null;
+  let roleContract = null;
+  if (input.role || input.role_name) {
+    const selected = agentRoleSelect(db, {
+      scope: input.scope,
+      agent_name: agent,
+      role: input.role || input.role_name,
+      project,
+      portal,
+      task: input.task,
+      plan: input.plan || input.plan_summary,
+      replace_active: input.replace_active,
+      selected_by: input.selected_by || agent,
+      meta: Object.assign({}, input.meta || {}, { source: "mem_agent_os_boot" })
+    });
+    if (selected.error) return selected;
+    roleAssignment = selected.assignment;
+    roleContract = selected.role_contract;
+  } else {
+    const existing = agentRoleGet(db, { scope: input.scope, agent_name: agent, project, portal });
+    roleAssignment = existing.assignment || null;
+    roleContract = existing.role_contract || null;
+  }
+  const preflight = agentCompanyPreflight(db, {
+    scope: input.scope,
+    agent_name: agent,
+    role: roleAssignment && roleAssignment.role_name || input.role || input.role_name,
+    project,
+    portal,
+    task: input.task,
+    plan: input.plan || input.plan_summary,
+    files: Array.isArray(input.files) ? input.files : [],
+    dependencies: Array.isArray(input.dependencies) ? input.dependencies : [],
+    require_portal_context: input.require_portal_context,
+    require_work_claim: input.require_work_claim,
+    require_plan: input.require_plan
+  });
+  const board = agentCompanyBoard(db, { scope: input.scope, project, scale_target_agents: input.scale_target_agents || 100 });
+  const receipts = recentWorkflowReceipts(db, { scope: input.scope, project, portal, agent_name: agent, limit: input.receipt_limit || 20 });
+  return {
+    ok: preflight.status === "ok",
+    status: preflight.status,
+    agent_name: agent,
+    project,
+    portal,
+    boot_sequence: MNEMO_AGENT_OS_KERNEL.boot_order,
+    kernel_laws: MNEMO_AGENT_OS_KERNEL.laws,
+    contract: MNEMO_AGENT_OS_KERNEL.contract,
+    role_assignment: roleAssignment,
+    role_contract: roleContract,
+    preflight,
+    recent_receipts: receipts,
+    mission_control: {
+      capacity: board.capacity,
+      missing_roles: board.missing_roles,
+      active_claims: board.active_claims,
+      open_work_orders: board.open_work_orders,
+      recommendations: board.recommendations
+    },
+    next_required_action: preflight.status === "ok" ? "Write workflow receipts while working and a handoff before stopping." : "Resolve preflight blockers before editing or deploying."
+  };
+}
+
+function agentCompanyBoard(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const scope = scopeName(input.scope);
+  const project = textOrNull(input.project, 500);
+  const roleRows = agentRoleList(db, { scope, project, include_inactive: false, limit: 1000 }).assignments || [];
+  const contexts = portalContextList(db, { scope, project, limit: 1000 }).contexts || [];
+  const role_counts = {};
+  for (const row of roleRows) role_counts[row.role_name] = (role_counts[row.role_name] || 0) + 1;
+  const missing_roles = GSTACK_ROLE_CATALOG.map((role) => role.role).filter((role) => !role_counts[role]);
+  let active_claims = [];
+  if (tableExists(db, "work_claim")) {
+    const where = ["status IN ('active','stale')"];
+    const params = [];
+    if (project) { where.push("project=?"); params.push(project); }
+    active_claims = db.prepare("SELECT id, project, agent_name, claim_kind, scope_value, file_path, status, expires_at, heartbeat_at FROM work_claim WHERE " + where.join(" AND ") + " ORDER BY heartbeat_at DESC LIMIT 500").all(...params);
+  }
+  let open_work_orders = [];
+  if (tableExists(db, "work_order")) {
+    const where = ["status NOT IN ('done','completed','cancelled')"];
+    const params = [];
+    if (project) { where.push("project=?"); params.push(project); }
+    open_work_orders = db.prepare("SELECT id, project, title, assigned_agent, owner_agent, department_name, status, risk_class, updated_at FROM work_order WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC LIMIT 100").all(...params);
+  }
+  return {
+    ok: true,
+    scope,
+    project,
+    capacity: {
+      active_agent_roles: roleRows.length,
+      active_claims: active_claims.length,
+      portal_contexts: contexts.length,
+      open_work_orders: open_work_orders.length,
+      scale_target_agents: clampInt(input.scale_target_agents, 100, 1, 10000),
+      coverage_percent: Math.round(((GSTACK_ROLE_CATALOG.length - missing_roles.length) / GSTACK_ROLE_CATALOG.length) * 100)
+    },
+    role_counts,
+    missing_roles,
+    active_roles: roleRows,
+    portal_contexts: contexts,
+    active_claims,
+    open_work_orders,
+    recommendations: [
+      "Keep one Memory/Audit Officer active per busy portal.",
+      "Route every task through mem_agent_company_preflight before code/text/pricing/design/logic changes.",
+      "Shard 100 agents by portal + role + risk class; never by chat thread alone.",
+      "Use capability tokens and evidence gates for risky or production work."
+    ]
+  };
+}
+
 function userIntentCapture(db, input = {}) {
   ensureAgentGovernanceSchema(db);
   const scope = scopeName(input.scope);
@@ -2389,6 +3207,50 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
     description: "Convert pending Mnemo agent briefs into durable project tasks with deterministic dedupe. Use this before project boards so old briefs stop reappearing as loose work.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, brief_id: { type: "integer" }, brief_ids: { type: "array", items: { type: "integer" } }, agent_name: { type: "string" }, source_agent: { type: "string" }, project: { type: "string" }, default_project: { type: "string" }, status: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, statuses: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, limit: { type: "integer" }, title: { type: "string" }, summary: { type: "string" }, category: { type: "string" }, kind: { type: "string" }, priority: { type: "string" }, assigned_agent: { type: "string" }, assignee: { type: "string" }, owner_agent: { type: "string" }, owner: { type: "string" }, created_by: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, mark_brief_status: { type: "string" }, include_done: { type: "boolean" }, include_all_statuses: { type: "boolean" }, dry_run: { type: "boolean" } } }
   },
+  mem_gstack_catalog: {
+    description: "Return the Mnemo-native Agent OS adoption of gstack: kernel, role catalog, 23 core skills, commands, power tools, workflow gates, and 100-agent operating model.",
+    inputSchema: { type: "object", properties: { include_power_tools: { type: "boolean" } } }
+  },
+  mem_agent_os_boot: {
+    description: "Session-start boot gate for Mnemo Agent OS. Loads/sets role, checks portal context, claims, plan, conflicts, recent receipts, kernel contract, and mission-control state.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, role: { type: "string" }, role_name: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, task: { type: "string" }, plan: { type: "string" }, plan_summary: { type: "string" }, files: { type: "array", items: { type: "string" } }, dependencies: { type: "array", items: { type: "string" } }, require_portal_context: { type: "boolean" }, require_work_claim: { type: "boolean" }, require_plan: { type: "boolean" }, replace_active: { type: "boolean" }, selected_by: { type: "string" }, scale_target_agents: { type: "integer" }, receipt_limit: { type: "integer" }, meta: { type: "object" } }, required: ["agent_name", "task"] }
+  },
+  mem_agent_role_select: {
+    description: "Select the required gstack-style Mnemo role for an agent before work starts.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, role: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, task: { type: "string" }, plan: { type: "string" }, plan_summary: { type: "string" }, replace_active: { type: "boolean" }, selected_by: { type: "string" }, updated_by: { type: "string" }, status: { type: "string" }, meta: { type: "object" } }, required: ["agent_name", "role"] }
+  },
+  mem_agent_role_get: {
+    description: "Get the active gstack-style Mnemo role for an agent/project/portal.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, portal: { type: "string" } }, required: ["agent_name"] }
+  },
+  mem_agent_role_list: {
+    description: "List active gstack-style role assignments across agents, projects, portals, and roles.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, role: { type: "string" }, status: { type: "string" }, include_inactive: { type: "boolean" }, limit: { type: "integer" } } }
+  },
+  mem_portal_context_set: {
+    description: "Store required multiportal context: brand, domain, user role, language, design, credits, pricing, rights, and all rule layers.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, portal_id: { type: "string" }, portal_name: { type: "string" }, environment: { type: "string" }, country_or_market: { anyOf: [{ type: "array" }, { type: "string" }] }, company_name: { type: "string" }, company: { type: "string" }, company_or_brand: { type: "string" }, brand_owner: { type: "string" }, brand_name: { type: "string" }, brand: { type: "string" }, domain: { type: "string" }, user_role: { type: "string" }, language: { type: "string" }, language_default: { type: "string" }, supported_languages: { anyOf: [{ type: "array" }, { type: "string" }] }, locale: { type: "string" }, design: { type: "object" }, design_rules: { type: "object" }, theme_or_design_source: {}, credit_system: {}, credits: { type: "object" }, pricing: {}, prices: { type: "object" }, pricing_source_of_truth: {}, rights: { type: "object" }, permissions: { type: "object" }, billing_owner: { type: "string" }, auth_owner: { type: "string" }, deployment_owner: { type: "string" }, legal_owner: { type: "string" }, forbidden_cross_portal_leaks: { anyOf: [{ type: "array" }, { type: "string" }] }, shared_modules: { anyOf: [{ type: "array" }, { type: "string" }] }, protected_surfaces: { anyOf: [{ type: "array" }, { type: "string" }] }, global_rules: { anyOf: [{ type: "array" }, { type: "string" }] }, portal_rules: { anyOf: [{ type: "array" }, { type: "string" }] }, rules: { anyOf: [{ type: "array" }, { type: "string" }] }, customer_partner_rules: { anyOf: [{ type: "array" }, { type: "string" }] }, dependencies: { anyOf: [{ type: "array" }, { type: "string" }] }, required_checks: { anyOf: [{ type: "array" }, { type: "string" }] }, status: { type: "string" }, updated_by: { type: "string" }, agent_name: { type: "string" }, meta: { type: "object" } }, required: ["project"] }
+  },
+  mem_portal_context_get: {
+    description: "Get the active multiportal context for a project/portal.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, portal: { type: "string" } }, required: ["project"] }
+  },
+  mem_portal_context_list: {
+    description: "List multiportal contexts.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, status: { type: "string" }, include_inactive: { type: "boolean" }, limit: { type: "integer" } } }
+  },
+  mem_agent_company_preflight: {
+    description: "Company-scale preflight for 100-agent operation. Blocks work until role, portal context, rule layers, work claims, and plan receipt are present.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, role: { type: "string" }, role_name: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, task: { type: "string" }, plan: { type: "string" }, plan_summary: { type: "string" }, files: { type: "array", items: { type: "string" } }, dependencies: { type: "array", items: { type: "string" } }, require_portal_context: { type: "boolean" }, require_work_claim: { type: "boolean" }, require_plan: { type: "boolean" } }, required: ["agent_name", "task"] }
+  },
+  mem_workflow_receipt_create: {
+    description: "Store a gstack-style workflow receipt for think/plan/build/review/test/ship/reflect/memorize, risks, decisions, handoffs, or evidence.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, agent_name: { type: "string" }, role: { type: "string" }, role_name: { type: "string" }, phase: { type: "string" }, summary: { type: "string" }, evidence: { type: "array", items: { type: "object" } }, risks: { type: "array", items: { type: "object" } }, affected_portals: { type: "array", items: { type: "string" } }, status: { type: "string" }, meta: { type: "object" } }, required: ["agent_name", "phase", "summary"] }
+  },
+  mem_agent_company_board: {
+    description: "Render a 100-agent operating board: roles, missing coverage, portal contexts, active claims, and open Work Orders.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, scale_target_agents: { type: "integer" } } }
+  },
   mem_user_intent_capture: {
     description: "Capture what the human actually wants in durable form, optionally creating a project task and/or active focus. Use this when user wording is business intent, not agent-internal thinking.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, user_name: { type: "string" }, user: { type: "string" }, actor: { type: "string" }, source_channel: { type: "string" }, channel: { type: "string" }, message_ref: { type: "string" }, source_ref: { type: "string" }, intent_kind: { type: "string" }, kind: { type: "string" }, summary: { type: "string" }, intent: { type: "string" }, exact_words: { type: "string" }, text: { type: "string" }, message: { type: "string" }, content: { type: "string" }, priority: { type: "string" }, status: { type: "string" }, linked_task_id: { type: "integer" }, task_id: { type: "integer" }, linked_work_order_id: { type: "integer" }, work_order_id: { type: "integer" }, create_task: { type: "boolean" }, set_focus: { type: "boolean" }, task_title: { type: "string" }, task_status: { type: "string" }, surface: { type: "string" }, active_target: { type: "string" }, owner_agent: { type: "string" }, coordinator_agent: { type: "string" }, assigned_agent: { type: "string" }, agent_name: { type: "string" }, acceptance: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, acceptance_criteria: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, must_not_do: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, out_of_scope: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, meta: { type: "object" } } }
@@ -2433,6 +3295,17 @@ function handleAgentGovernanceTool(db, name, input = {}) {
   if (name === "mem_project_task_update") return { handled: true, result: projectTaskUpdate(db, input || {}) };
   if (name === "mem_project_task_list") return { handled: true, result: projectTaskList(db, input || {}) };
   if (name === "mem_brief_task_ingest") return { handled: true, result: briefTaskIngest(db, input || {}) };
+  if (name === "mem_gstack_catalog") return { handled: true, result: gstackCatalog(input || {}) };
+  if (name === "mem_agent_os_boot") return { handled: true, result: agentOsBoot(db, input || {}) };
+  if (name === "mem_agent_role_select") return { handled: true, result: agentRoleSelect(db, input || {}) };
+  if (name === "mem_agent_role_get") return { handled: true, result: agentRoleGet(db, input || {}) };
+  if (name === "mem_agent_role_list") return { handled: true, result: agentRoleList(db, input || {}) };
+  if (name === "mem_portal_context_set") return { handled: true, result: portalContextSet(db, input || {}) };
+  if (name === "mem_portal_context_get") return { handled: true, result: portalContextGet(db, input || {}) };
+  if (name === "mem_portal_context_list") return { handled: true, result: portalContextList(db, input || {}) };
+  if (name === "mem_agent_company_preflight") return { handled: true, result: agentCompanyPreflight(db, input || {}) };
+  if (name === "mem_workflow_receipt_create") return { handled: true, result: workflowReceiptCreate(db, input || {}) };
+  if (name === "mem_agent_company_board") return { handled: true, result: agentCompanyBoard(db, input || {}) };
   if (name === "mem_user_intent_capture") return { handled: true, result: userIntentCapture(db, input || {}) };
   if (name === "mem_project_channel_policy_set") return { handled: true, result: projectChannelPolicySet(db, input || {}) };
   if (name === "mem_project_channel_policy_get") return { handled: true, result: projectChannelPolicyGet(db, input || {}) };
@@ -2470,6 +3343,17 @@ module.exports = {
   projectTaskUpdate,
   projectTaskList,
   briefTaskIngest,
+  gstackCatalog,
+  agentOsBoot,
+  agentRoleSelect,
+  agentRoleGet,
+  agentRoleList,
+  portalContextSet,
+  portalContextGet,
+  portalContextList,
+  agentCompanyPreflight,
+  workflowReceiptCreate,
+  agentCompanyBoard,
   userIntentCapture,
   projectChannelPolicySet,
   projectChannelPolicyGet,

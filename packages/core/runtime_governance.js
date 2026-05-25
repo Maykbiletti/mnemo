@@ -156,10 +156,10 @@ function defaultRuntimePolicy(input = {}) {
     required_board: "",
     stale_after_minutes: 15,
     full_sync_every_messages: 10,
-    response_allowed_when_context_missing: true,
+    response_allowed_when_context_missing: false,
     warning_token_required: true,
     status: "active",
-    required_actions: ["mem_capture_ingest", "mem_brief_pull", "mem_recall", "mem_project_board", "mem_event_log"],
+    required_actions: ["mem_capture_ingest", "mem_brief_pull", "mem_recall", "mem_project_board", "mem_work_report_feed", "mem_project_timeline_report", "mem_event_log"],
     meta: { source: "default" },
     updated_by: null,
     created_at: null,
@@ -170,7 +170,7 @@ function defaultRuntimePolicy(input = {}) {
     base.response_allowed_when_context_missing = false;
   } else if (agent === "dieter") {
     base.required_board = "wizard2-bridge";
-    base.response_allowed_when_context_missing = true;
+    base.response_allowed_when_context_missing = false;
   }
   return base;
 }

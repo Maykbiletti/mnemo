@@ -50,6 +50,34 @@ function asciiJson(value) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryAttempts() {
+  const n = Number(process.env.MNEMO_HOOK_RETRY_ATTEMPTS || 4);
+  return Math.max(1, Number.isFinite(n) ? n : 4);
+}
+
+function retryBaseMs() {
+  const n = Number(process.env.MNEMO_HOOK_RETRY_BASE_MS || 350);
+  return Math.max(50, Number.isFinite(n) ? n : 350);
+}
+
+function retryMaxMs() {
+  const n = Number(process.env.MNEMO_HOOK_RETRY_MAX_MS || 5000);
+  return Math.max(retryBaseMs(), Number.isFinite(n) ? n : 5000);
+}
+
+function retryDelayMs(attempt) {
+  const base = Math.min(retryMaxMs(), retryBaseMs() * Math.pow(2, Math.max(0, attempt - 1)));
+  return Math.floor(base + Math.random() * Math.min(250, base));
+}
+
+function retryableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
 function readUtf8Lines(file) {
   return fs.readFileSync(file).toString("utf8").replace(/^\uFEFF/, "").split(/\r?\n/).filter(Boolean);
 }
@@ -79,16 +107,31 @@ function listQueueFiles(dir) {
 }
 
 async function callTool(baseUrl, name, args) {
-  const res = await fetch(`${String(baseUrl || "").replace(/\/+$/, "")}/tool/${name}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(args || {})
-  });
-  const text = await res.text();
-  let json = {};
-  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error(`${name} ${res.status}: ${text.slice(0, 300)}`);
-  return json && typeof json === "object" && "result" in json ? json.result : json;
+  let lastError = null;
+  for (let attempt = 1; attempt <= retryAttempts(); attempt++) {
+    let res = null;
+    let text = "";
+    try {
+      res = await fetch(`${String(baseUrl || "").replace(/\/+$/, "")}/tool/${name}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(args || {})
+      });
+      text = await res.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retryAttempts()) throw lastError;
+      await sleep(retryDelayMs(attempt));
+      continue;
+    }
+    let json = {};
+    try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+    if (res.ok) return json && typeof json === "object" && "result" in json ? json.result : json;
+    lastError = new Error(`${name} ${res.status}: ${text.slice(0, 300)}`);
+    if (!retryableStatus(res.status) || attempt >= retryAttempts()) throw lastError;
+    await sleep(retryDelayMs(attempt));
+  }
+  throw lastError || new Error(`${name} failed`);
 }
 
 function rewriteQueueFile(file, rows) {
