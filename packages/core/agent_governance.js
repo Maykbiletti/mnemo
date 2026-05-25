@@ -649,6 +649,60 @@ CREATE TABLE IF NOT EXISTS agent_workflow_receipt (
 CREATE INDEX IF NOT EXISTS idx_agent_workflow_receipt_agent ON agent_workflow_receipt(scope, agent_name, project, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_workflow_receipt_project ON agent_workflow_receipt(scope, project, phase, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS rule_violation_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  portal TEXT,
+  agent_name TEXT NOT NULL,
+  rule_key TEXT NOT NULL,
+  rule_text TEXT,
+  action_kind TEXT,
+  target TEXT,
+  severity TEXT NOT NULL DEFAULT 'M',
+  status TEXT NOT NULL DEFAULT 'open',
+  evidence_json TEXT,
+  prevention_json TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rule_violation_project ON rule_violation_log(scope, project, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rule_violation_agent ON rule_violation_log(agent_name, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rule_violation_rule ON rule_violation_log(rule_key, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS owner_rule_snapshot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT NOT NULL,
+  rules_hash TEXT NOT NULL,
+  rules_json TEXT NOT NULL,
+  created_by TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_owner_rule_snapshot_project ON owner_rule_snapshot(scope, project, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS task_fingerprint (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL DEFAULT 'default',
+  project TEXT,
+  portal TEXT,
+  fingerprint TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  normalized_text TEXT NOT NULL,
+  agent_name TEXT,
+  source_kind TEXT,
+  source_id TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  linked_task_id INTEGER,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_task_fingerprint_project ON task_fingerprint(scope, project, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_fingerprint_hash ON task_fingerprint(scope, fingerprint, status);
+
 CREATE TABLE IF NOT EXISTS quality_gate_run (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL DEFAULT 'default',
@@ -870,6 +924,24 @@ CREATE TRIGGER IF NOT EXISTS mnemo_journal_workflow_receipt_ai AFTER INSERT ON a
     (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
   VALUES
     ('workflow_receipt', NEW.project, 'internal', NEW.agent_name, 'workflow_receipt', 'agent_workflow_receipt', CAST(NEW.id AS TEXT), NEW.status, NEW.phase || ': ' || NEW.summary, NEW.evidence_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_rule_violation_ai AFTER INSERT ON rule_violation_log BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('rule_violation', NEW.project, 'internal', NEW.agent_name, 'rule_violation_log', 'rule_violation_log', CAST(NEW.id AS TEXT), NEW.status, NEW.rule_key || ': ' || COALESCE(NEW.rule_text, ''), NEW.evidence_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_owner_rule_snapshot_ai AFTER INSERT ON owner_rule_snapshot BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('owner_rule_snapshot', NEW.project, 'internal', NEW.created_by, 'owner_rule_snapshot', 'owner_rule_snapshot', CAST(NEW.id AS TEXT), 'captured', NEW.project || ' rules hash ' || NEW.rules_hash, NEW.rules_json, NEW.meta_json, NEW.created_at);
+END;
+CREATE TRIGGER IF NOT EXISTS mnemo_journal_task_fingerprint_ai AFTER INSERT ON task_fingerprint BEGIN
+  INSERT INTO mnemo_event_journal
+    (source, channel, direction, actor, event_kind, ref_kind, ref_id, status, content, payload_json, meta_json, occurred_at)
+  VALUES
+    ('task_fingerprint', NEW.project, 'internal', NEW.agent_name, 'task_fingerprint', 'task_fingerprint', CAST(NEW.id AS TEXT), NEW.status, NEW.summary, NEW.fingerprint, NEW.meta_json, NEW.created_at);
 END;
 `);
   } catch {}
@@ -2806,6 +2878,274 @@ function workflowReceiptCreate(db, input = {}) {
   return { ok: true, id: info.lastInsertRowid, phase, role };
 }
 
+const PROJECT_RULE_JSON_KEYS = ["canonical_nav", "allowed_domains", "auth_matrix", "language_matrix", "pricing_rules", "checkout_rules", "vat_rules", "deploy_rules", "design_rules", "required_gates"];
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.keys(value).sort().reduce((out, key) => {
+      out[key] = stableValue(value[key]);
+      return out;
+    }, {});
+  }
+  return value;
+}
+
+function stableJson(value) {
+  return JSON.stringify(stableValue(value));
+}
+
+function loadProjectRuleBundle(db, project) {
+  if (!project || !tableExists(db, "project_rules")) return null;
+  const row = db.prepare("SELECT * FROM project_rules WHERE project=?").get(project);
+  if (!row) return null;
+  const out = { project: row.project, notes: row.notes || null, updated_by: row.updated_by || null, updated_at: row.updated_at || null };
+  for (const key of PROJECT_RULE_JSON_KEYS) out[key] = parseJson(row[key], null);
+  return out;
+}
+
+function flattenRuleBundle(value, prefix = "", out = {}) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of Object.keys(value).sort()) {
+      flattenRuleBundle(value[key], prefix ? prefix + "." + key : key, out);
+    }
+    return out;
+  }
+  out[prefix || "value"] = stableJson(value);
+  return out;
+}
+
+function diffRuleBundles(before, after) {
+  const left = flattenRuleBundle(before || {});
+  const right = flattenRuleBundle(after || {});
+  const keys = Array.from(new Set(Object.keys(left).concat(Object.keys(right)))).sort();
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const key of keys) {
+    if (!(key in left)) added.push({ path: key, value: parseJson(right[key], right[key]) });
+    else if (!(key in right)) removed.push({ path: key, value: parseJson(left[key], left[key]) });
+    else if (left[key] !== right[key]) changed.push({ path: key, before: parseJson(left[key], left[key]), after: parseJson(right[key], right[key]) });
+  }
+  return { added, removed, changed, changed_count: added.length + removed.length + changed.length };
+}
+
+function ownerRuleDiff(db, input = {}) {
+  const project = normalizeProject(input.project || input.name);
+  if (!project) return { error: "project required" };
+  ensureAgentGovernanceSchema(db);
+  const current = loadProjectRuleBundle(db, project);
+  if (!current) return { error: "project_rules_not_found", project };
+  const scope = scopeName(input.scope);
+  let previous = null;
+  if (input.before_snapshot_id || input.snapshot_id) {
+    previous = db.prepare("SELECT * FROM owner_rule_snapshot WHERE id=?").get(parseInt(input.before_snapshot_id || input.snapshot_id, 10));
+  } else {
+    previous = db.prepare("SELECT * FROM owner_rule_snapshot WHERE scope=? AND project=? ORDER BY created_at DESC, id DESC LIMIT 1").get(scope, project);
+  }
+  const currentHash = sha(stableJson(current));
+  const previousRules = previous ? parseJson(previous.rules_json, {}) : null;
+  const diff = previousRules ? diffRuleBundles(previousRules, current) : { added: [], removed: [], changed: [], changed_count: 0 };
+  let snapshotId = null;
+  if (input.create_snapshot !== false) {
+    const info = db.prepare("INSERT INTO owner_rule_snapshot (scope, project, rules_hash, rules_json, created_by, meta_json) VALUES (?,?,?,?,?,?)")
+      .run(scope, project, currentHash, stableJson(current), input.agent_name || input.created_by || input.updated_by || "unknown", safeJson(Object.assign({}, input.meta || {}, { previous_snapshot_id: previous && previous.id || null, previous_hash: previous && previous.rules_hash || null }), {}));
+    snapshotId = info.lastInsertRowid;
+  }
+  return { ok: true, project, current_hash: currentHash, previous_snapshot_id: previous && previous.id || null, previous_hash: previous && previous.rules_hash || null, snapshot_id: snapshotId, diff };
+}
+
+function normalizedTaskFingerprintText(input = {}) {
+  const parts = [
+    input.summary,
+    input.task,
+    input.title,
+    input.objective,
+    input.customer_request,
+    input.symptoms,
+    input.message_ref,
+    input.source_ref,
+    input.project,
+    input.portal
+  ];
+  for (const key of ["files", "routes", "urls", "modules", "tags"]) {
+    if (Array.isArray(input[key])) parts.push(...input[key]);
+    else if (input[key]) parts.push(input[key]);
+  }
+  return normalizeEvidenceText(parts.filter(Boolean).join(" "));
+}
+
+function tokenSet(text) {
+  return new Set(String(text || "").split(/\s+/).filter((token) => token.length > 3));
+}
+
+function tokenSimilarity(a, b) {
+  const left = tokenSet(a);
+  const right = tokenSet(b);
+  if (!left.size || !right.size) return 0;
+  let common = 0;
+  for (const token of left) if (right.has(token)) common++;
+  return common / Math.max(left.size, right.size);
+}
+
+function taskFingerprint(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const normalized = normalizedTaskFingerprintText(input);
+  if (!normalized) return { error: "summary/task/title required" };
+  const scope = scopeName(input.scope);
+  const project = normalizeProject(input.project || input.name) || null;
+  const portal = input.portal ? portalName(input) : null;
+  const fingerprint = sha(normalized).slice(0, 32);
+  const where = ["scope=?", "status='active'"];
+  const params = [scope];
+  if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+  const rows = db.prepare("SELECT * FROM task_fingerprint WHERE " + where.join(" AND ") + " ORDER BY updated_at DESC LIMIT 200").all(...params);
+  const exact = rows.filter((row) => row.fingerprint === fingerprint);
+  const similar = rows
+    .map((row) => Object.assign({}, row, { similarity: tokenSimilarity(normalized, row.normalized_text) }))
+    .filter((row) => row.similarity >= (Number(input.similarity_threshold) || 0.65))
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 10);
+  let id = null;
+  if (input.persist !== false) {
+    const info = db.prepare("INSERT INTO task_fingerprint (scope, project, portal, fingerprint, summary, normalized_text, agent_name, source_kind, source_id, status, linked_task_id, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(scope, project, portal, fingerprint, textOrNull(input.summary || input.task || input.title || normalized, 2000), normalized, input.agent_name || null, input.source_kind || null, input.source_id || input.message_ref || null, input.status || "active", input.linked_task_id || input.task_id || null, safeJson(input.meta || {}, {}));
+    id = info.lastInsertRowid;
+  }
+  return { ok: true, id, fingerprint, duplicate: exact.length > 0, exact_matches: exact, similar_matches: similar };
+}
+
+function ruleViolationLog(db, input = {}) {
+  if (!input.agent_name || !input.rule_key) return { error: "agent_name + rule_key required" };
+  ensureAgentGovernanceSchema(db);
+  const info = db.prepare("INSERT INTO rule_violation_log (scope, project, portal, agent_name, rule_key, rule_text, action_kind, target, severity, status, evidence_json, prevention_json, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run(
+      scopeName(input.scope),
+      normalizeProject(input.project || input.name) || null,
+      input.portal ? portalName(input) : null,
+      normalizeAgentName(input.agent_name),
+      textOrNull(input.rule_key, 300) || "unknown",
+      textOrNull(input.rule_text || input.rule || input.summary, 4000),
+      textOrNull(input.action_kind || input.action, 300),
+      textOrNull(input.target || input.file_path || input.route || input.system_name, 1000),
+      textOrNull(input.severity, 20) || "M",
+      textOrNull(input.status, 50) || "open",
+      safeJson(input.evidence || [], []),
+      safeJson(input.prevention || input.prevention_rule || {}, {}),
+      safeJson(input.meta || {}, {})
+    );
+  return { ok: true, id: info.lastInsertRowid };
+}
+
+function neverAgainCheck(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const project = normalizeProject(input.project || input.name) || null;
+  const scope = scopeName(input.scope);
+  const summary = textOrNull(input.summary || input.task || input.action || input.title, 4000);
+  if (!summary && !project) return { error: "summary_or_project required" };
+  const blockers = [];
+  const warnings = [];
+  const matches = { rule_violations: [], ops_incidents: [], task_duplicates: [] };
+  if (tableExists(db, "rule_violation_log")) {
+    const where = ["scope=?", "status IN ('open','active')"];
+    const params = [scope];
+    if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+    matches.rule_violations = db.prepare("SELECT id, project, portal, agent_name, rule_key, rule_text, action_kind, target, severity, status, created_at FROM rule_violation_log WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT 50").all(...params);
+    for (const row of matches.rule_violations) {
+      if (String(row.severity || "").toUpperCase() === "H" || String(row.severity || "").toLowerCase() === "critical") blockers.push("open high-severity rule violation: #" + row.id + " " + row.rule_key);
+    }
+  }
+  if (tableExists(db, "ops_incident")) {
+    const where = ["status='open'"];
+    const params = [];
+    if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+    matches.ops_incidents = db.prepare("SELECT id, project, system_name, title, severity, cause, prevention, opened_at FROM ops_incident WHERE " + where.join(" AND ") + " ORDER BY opened_at DESC LIMIT 25").all(...params);
+    for (const row of matches.ops_incidents) {
+      if (String(row.severity || "").toUpperCase() === "H") blockers.push("open high-severity incident: #" + row.id + " " + row.title);
+      else warnings.push("open incident to consider: #" + row.id + " " + row.title);
+    }
+  }
+  if (summary) {
+    const fp = taskFingerprint(db, Object.assign({}, input, { persist: false, project, scope }));
+    matches.task_duplicates = (fp.exact_matches || []).concat(fp.similar_matches || []);
+    if (fp.duplicate) blockers.push("duplicate task fingerprint already exists: " + fp.fingerprint);
+    else if ((fp.similar_matches || []).length) warnings.push("similar task fingerprint exists: " + fp.similar_matches[0].id);
+  }
+  const projectRules = project ? loadProjectRuleBundle(db, project) : null;
+  if (project && !projectRules) warnings.push("project rules not found for never-again check");
+  const status = blockers.length ? "block" : "ok";
+  return { status, ok: status === "ok", project, blockers, warnings, matches, project_rules_loaded: !!projectRules };
+}
+
+function agentBlameReport(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const agent = input.agent_name ? normalizeAgentName(input.agent_name) : null;
+  const project = normalizeProject(input.project || input.name) || null;
+  const days = clampInt(input.days, 7, 1, 365);
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const report = { ok: true, agent_name: agent, project, days, since, counts: {}, samples: {}, reliability: {} };
+  if (tableExists(db, "agent_action")) {
+    const where = ["started_at>=?"];
+    const params = [since];
+    if (agent) { where.push("agent_name=?"); params.push(agent); }
+    if (project) { where.push("(target LIKE ? OR topic LIKE ?)"); params.push("%" + project + "%", "%" + project + "%"); }
+    report.counts.actions_by_status = db.prepare("SELECT status, COUNT(*) count FROM agent_action WHERE " + where.join(" AND ") + " GROUP BY status").all(...params);
+    report.samples.failed_actions = db.prepare("SELECT id, agent_name, action_kind, target, status, started_at FROM agent_action WHERE " + where.join(" AND ") + " AND status NOT IN ('done','ok','success','captured') ORDER BY started_at DESC LIMIT 20").all(...params);
+  }
+  if (tableExists(db, "rule_violation_log")) {
+    const where = ["created_at>=?"];
+    const params = [since];
+    if (agent) { where.push("agent_name=?"); params.push(agent); }
+    if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+    report.counts.rule_violations = db.prepare("SELECT severity, status, COUNT(*) count FROM rule_violation_log WHERE " + where.join(" AND ") + " GROUP BY severity, status").all(...params);
+    report.samples.rule_violations = db.prepare("SELECT id, agent_name, rule_key, severity, status, created_at FROM rule_violation_log WHERE " + where.join(" AND ") + " ORDER BY created_at DESC LIMIT 20").all(...params);
+  }
+  if (tableExists(db, "agent_workflow_receipt")) {
+    const where = ["created_at>=?"];
+    const params = [since];
+    if (agent) { where.push("agent_name=?"); params.push(agent); }
+    if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+    report.counts.workflow_receipts = db.prepare("SELECT phase, status, COUNT(*) count FROM agent_workflow_receipt WHERE " + where.join(" AND ") + " GROUP BY phase, status").all(...params);
+  }
+  if (tableExists(db, "session_handoff")) {
+    const where = ["created_at>=?"];
+    const params = [since];
+    if (agent) { where.push("agent_name=?"); params.push(agent); }
+    if (project) { where.push("(project=? OR project IS NULL)"); params.push(project); }
+    report.counts.handoffs = db.prepare("SELECT COUNT(*) count FROM session_handoff WHERE " + where.join(" AND ")).get(...params).count;
+  }
+  const failures = (report.samples.failed_actions || []).length;
+  const violations = (report.samples.rule_violations || []).length;
+  const receipts = (report.counts.workflow_receipts || []).reduce((sum, row) => sum + row.count, 0);
+  const handoffs = Number(report.counts.handoffs || 0);
+  const score = Math.max(0, Math.min(100, 80 + Math.min(10, receipts) + Math.min(10, handoffs * 2) - failures * 3 - violations * 8));
+  report.reliability = { score, band: score >= 90 ? "high" : score >= 70 ? "normal" : "risk", factors: { failures, violations, receipts, handoffs } };
+  return report;
+}
+
+function completionGuardCheck(db, input = {}) {
+  ensureAgentGovernanceSchema(db);
+  const evidence = Array.isArray(input.evidence) ? input.evidence : [];
+  const required = uniqueStrings(listInput(input.required_evidence || input.requirements).concat(input.work_order_id && tableExists(db, "work_order") ? (rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(parseInt(input.work_order_id, 10))) || {}).required_evidence || [] : []));
+  const invalid = evidence.map(validateEvidenceItem).filter(Boolean).concat(evidence.map(nonPassEvidenceReason).filter(Boolean));
+  const missing = required.filter((requirement) => !evidence.some((item) => evidenceMatchesRequirement(item, requirement)));
+  const blockers = [];
+  if (!evidence.length && input.require_evidence !== false) blockers.push("evidence required");
+  if (invalid.length) blockers.push("invalid/non-passing evidence");
+  if (missing.length) blockers.push("missing required evidence: " + missing.join(", "));
+  const tests = Array.isArray(input.tests) ? input.tests : [];
+  const hasTestEvidence = tests.length > 0 || evidence.some((item) => /\b(test|check|smoke|verify|qa|integrity|npm|unit)\b/i.test(evidenceText(item)));
+  if (!hasTestEvidence && input.require_tests !== false) blockers.push("tests/checks not provided");
+  const handoffId = input.handoff_id || input.session_handoff_id;
+  if (!handoffId && input.require_handoff !== false) blockers.push("handoff required");
+  const openBlockers = listInput(input.blockers || input.open_blockers);
+  if (openBlockers.length) blockers.push("unfinished blockers: " + openBlockers.join(", "));
+  const never = input.skip_never_again === true ? null : neverAgainCheck(db, { scope: input.scope, project: input.project, task: input.summary || input.task || input.title });
+  if (never && never.status === "block") blockers.push(...never.blockers.map((item) => "never-again: " + item));
+  const status = blockers.length ? "block" : "pass";
+  return { status, ok: status === "pass", blockers, invalid_evidence: invalid, missing_required: missing, required_evidence: required, tests_checked: hasTestEvidence, handoff_id: handoffId || null, never_again: never };
+}
+
 function agentOsBoot(db, input = {}) {
   if (!input.agent_name || !input.task) return { error: "agent_name + task required" };
   ensureAgentGovernanceSchema(db);
@@ -3247,6 +3587,30 @@ const AGENT_GOVERNANCE_TOOL_DEFS = {
     description: "Store a gstack-style workflow receipt for think/plan/build/review/test/ship/reflect/memorize, risks, decisions, handoffs, or evidence.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, agent_name: { type: "string" }, role: { type: "string" }, role_name: { type: "string" }, phase: { type: "string" }, summary: { type: "string" }, evidence: { type: "array", items: { type: "object" } }, risks: { type: "array", items: { type: "object" } }, affected_portals: { type: "array", items: { type: "string" } }, status: { type: "string" }, meta: { type: "object" } }, required: ["agent_name", "phase", "summary"] }
   },
+  mem_rule_violation_log: {
+    description: "Persist an owner/project/protected-scope rule violation with responsible agent, action, evidence, and prevention rule.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, portal: { type: "string" }, agent_name: { type: "string" }, rule_key: { type: "string" }, rule_text: { type: "string" }, rule: { type: "string" }, summary: { type: "string" }, action_kind: { type: "string" }, action: { type: "string" }, target: { type: "string" }, file_path: { type: "string" }, route: { type: "string" }, system_name: { type: "string" }, severity: { type: "string" }, status: { type: "string" }, evidence: { type: "array", items: { type: "object" } }, prevention: {}, prevention_rule: {}, meta: { type: "object" } }, required: ["agent_name", "rule_key"] }
+  },
+  mem_owner_rule_diff: {
+    description: "Snapshot current project owner rules and diff against the previous or specified snapshot so changed/added/removed rules are explicit.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, before_snapshot_id: { type: "integer" }, snapshot_id: { type: "integer" }, create_snapshot: { type: "boolean" }, agent_name: { type: "string" }, created_by: { type: "string" }, updated_by: { type: "string" }, meta: { type: "object" } }, required: ["project"] }
+  },
+  mem_task_fingerprint: {
+    description: "Create/check a semantic task fingerprint to prevent duplicate parallel work across similar wording, files, symptoms, messages, and portals.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, portal: { type: "string" }, agent_name: { type: "string" }, summary: { type: "string" }, task: { type: "string" }, title: { type: "string" }, objective: { type: "string" }, customer_request: { type: "string" }, symptoms: { type: "string" }, message_ref: { type: "string" }, source_ref: { type: "string" }, files: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, urls: { type: "array", items: { type: "string" } }, modules: { type: "array", items: { type: "string" } }, tags: { type: "array", items: { type: "string" } }, source_kind: { type: "string" }, source_id: { type: "string" }, linked_task_id: { type: "integer" }, task_id: { type: "integer" }, status: { type: "string" }, persist: { type: "boolean" }, similarity_threshold: { type: "number" }, meta: { type: "object" } } }
+  },
+  mem_never_again_check: {
+    description: "Before acting, check active high-severity rule violations, incidents, scars, and duplicate task fingerprints that must not repeat.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, name: { type: "string" }, portal: { type: "string" }, agent_name: { type: "string" }, summary: { type: "string" }, task: { type: "string" }, title: { type: "string" }, action: { type: "string" }, files: { type: "array", items: { type: "string" } }, routes: { type: "array", items: { type: "string" } }, symptoms: { type: "string" }, message_ref: { type: "string" } } }
+  },
+  mem_agent_blame_report: {
+    description: "Audit report for accountability: actions, failures, rule violations, receipts, handoffs, and a reliability score by agent/project/window.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, agent_name: { type: "string" }, project: { type: "string" }, name: { type: "string" }, days: { type: "integer" } } }
+  },
+  mem_completion_guard_check: {
+    description: "Final completion guard: blocks COMPLETE unless evidence, tests, owner-rule/never-again checks, no blockers, and handoff are present.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, agent_name: { type: "string" }, task: { type: "string" }, title: { type: "string" }, summary: { type: "string" }, work_order_id: { type: "integer" }, evidence: { type: "array", items: { type: "object" } }, required_evidence: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, requirements: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, tests: { type: "array", items: { type: "string" } }, handoff_id: { type: "integer" }, session_handoff_id: { type: "integer" }, blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, open_blockers: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, require_evidence: { type: "boolean" }, require_tests: { type: "boolean" }, require_handoff: { type: "boolean" }, skip_never_again: { type: "boolean" } } }
+  },
   mem_agent_company_board: {
     description: "Render a 100-agent operating board: roles, missing coverage, portal contexts, active claims, and open Work Orders.",
     inputSchema: { type: "object", properties: { scope: { type: "string" }, project: { type: "string" }, scale_target_agents: { type: "integer" } } }
@@ -3305,6 +3669,12 @@ function handleAgentGovernanceTool(db, name, input = {}) {
   if (name === "mem_portal_context_list") return { handled: true, result: portalContextList(db, input || {}) };
   if (name === "mem_agent_company_preflight") return { handled: true, result: agentCompanyPreflight(db, input || {}) };
   if (name === "mem_workflow_receipt_create") return { handled: true, result: workflowReceiptCreate(db, input || {}) };
+  if (name === "mem_rule_violation_log") return { handled: true, result: ruleViolationLog(db, input || {}) };
+  if (name === "mem_owner_rule_diff") return { handled: true, result: ownerRuleDiff(db, input || {}) };
+  if (name === "mem_task_fingerprint") return { handled: true, result: taskFingerprint(db, input || {}) };
+  if (name === "mem_never_again_check") return { handled: true, result: neverAgainCheck(db, input || {}) };
+  if (name === "mem_agent_blame_report") return { handled: true, result: agentBlameReport(db, input || {}) };
+  if (name === "mem_completion_guard_check") return { handled: true, result: completionGuardCheck(db, input || {}) };
   if (name === "mem_agent_company_board") return { handled: true, result: agentCompanyBoard(db, input || {}) };
   if (name === "mem_user_intent_capture") return { handled: true, result: userIntentCapture(db, input || {}) };
   if (name === "mem_project_channel_policy_set") return { handled: true, result: projectChannelPolicySet(db, input || {}) };
@@ -3353,6 +3723,12 @@ module.exports = {
   portalContextList,
   agentCompanyPreflight,
   workflowReceiptCreate,
+  ruleViolationLog,
+  ownerRuleDiff,
+  taskFingerprint,
+  neverAgainCheck,
+  agentBlameReport,
+  completionGuardCheck,
   agentCompanyBoard,
   userIntentCapture,
   projectChannelPolicySet,

@@ -52,8 +52,40 @@ CREATE TABLE work_claim (
   takeover_count INTEGER NOT NULL DEFAULT 0,
   meta_json TEXT
 );
+CREATE TABLE project_rules (
+  project TEXT PRIMARY KEY,
+  canonical_nav TEXT,
+  allowed_domains TEXT,
+  auth_matrix TEXT,
+  language_matrix TEXT,
+  pricing_rules TEXT,
+  checkout_rules TEXT,
+  vat_rules TEXT,
+  deploy_rules TEXT,
+  design_rules TEXT,
+  required_gates TEXT,
+  notes TEXT,
+  updated_by TEXT,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE session_handoff (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT,
+  project TEXT,
+  summary TEXT,
+  changed_files TEXT,
+  tests TEXT,
+  deploys TEXT,
+  blockers TEXT,
+  next_actions TEXT,
+  claims_released TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 `);
 ensureAgentGovernanceSchema(db);
+db.prepare("INSERT INTO project_rules (project, deploy_rules, design_rules, required_gates, notes, updated_by) VALUES (?,?,?,?,?,?)")
+  .run("mnemo", JSON.stringify({ completion_guard: true }), JSON.stringify({ owner_rules_are_blockers: true }), JSON.stringify(["evidence_required"]), "initial", "test");
 
 function tool(name, args) {
   const handled = handleAgentGovernanceTool(db, name, args || {});
@@ -210,6 +242,77 @@ function tool(name, args) {
   assert(boot.boot_sequence.includes("load_latest_receipts_and_handoffs"));
   assert.strictEqual(boot.role_assignment.role_name, "Backend Engineer");
   assert(boot.recent_receipts.length >= 1);
+}
+
+{
+  const first = tool("mem_owner_rule_diff", { project: "mnemo", agent_name: "otto" });
+  assert.strictEqual(first.ok, true);
+  assert(first.snapshot_id);
+  db.prepare("UPDATE project_rules SET required_gates=?, updated_by='test2' WHERE project='mnemo'")
+    .run(JSON.stringify(["evidence_required", "agent_os_boot"]));
+  const diff = tool("mem_owner_rule_diff", { project: "mnemo", before_snapshot_id: first.snapshot_id, agent_name: "otto" });
+  assert.strictEqual(diff.ok, true);
+  assert(diff.diff.changed_count > 0);
+
+  const fp1 = tool("mem_task_fingerprint", {
+    project: "mnemo",
+    portal: "default",
+    agent_name: "otto",
+    task: "Build Agent OS rule violation and never again checks",
+    files: ["packages/core/agent_governance.js"],
+  });
+  assert.strictEqual(fp1.ok, true);
+  const fp2 = tool("mem_task_fingerprint", {
+    project: "mnemo",
+    portal: "default",
+    agent_name: "angel",
+    task: "Build Agent OS rule violation and never again checks",
+    files: ["packages/core/agent_governance.js"],
+    persist: false,
+  });
+  assert.strictEqual(fp2.duplicate, true);
+
+  const violation = tool("mem_rule_violation_log", {
+    project: "mnemo",
+    agent_name: "otto",
+    rule_key: "test-no-repeat",
+    rule_text: "Do not repeat this test violation.",
+    severity: "H",
+    evidence: [{ test_step: "unit", result: "captured", file_path: "packages/core/test_gstack_governance.js" }],
+  });
+  assert.strictEqual(violation.ok, true);
+
+  const never = tool("mem_never_again_check", {
+    project: "mnemo",
+    agent_name: "otto",
+    task: "Build Agent OS rule violation and never again checks",
+  });
+  assert.strictEqual(never.status, "block");
+  assert(never.blockers.some((item) => item.includes("rule violation")));
+
+  const guardBlocked = tool("mem_completion_guard_check", {
+    project: "mnemo",
+    agent_name: "otto",
+    summary: "Finish without evidence",
+    skip_never_again: true,
+  });
+  assert.strictEqual(guardBlocked.status, "block");
+
+  const guardPass = tool("mem_completion_guard_check", {
+    project: "mnemo",
+    agent_name: "otto",
+    summary: "Finish with evidence",
+    required_evidence: ["unit"],
+    evidence: [{ test_step: "unit", result: "passed", file_path: "packages/core/test_gstack_governance.js" }],
+    tests: ["node test_gstack_governance.js"],
+    handoff_id: 1,
+    skip_never_again: true,
+  });
+  assert.strictEqual(guardPass.status, "pass");
+
+  const blame = tool("mem_agent_blame_report", { agent_name: "otto", project: "mnemo", days: 30 });
+  assert.strictEqual(blame.ok, true);
+  assert(blame.reliability.score >= 0);
 }
 
 console.log("test_gstack_governance ok");

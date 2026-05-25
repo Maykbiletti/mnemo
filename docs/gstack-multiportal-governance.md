@@ -24,6 +24,12 @@ rules, timestamps, claims, audit, receipts, and team knowledge.
 - `mem_portal_context_list`
 - `mem_agent_company_preflight`
 - `mem_workflow_receipt_create`
+- `mem_rule_violation_log`
+- `mem_owner_rule_diff`
+- `mem_task_fingerprint`
+- `mem_never_again_check`
+- `mem_agent_blame_report`
+- `mem_completion_guard_check`
 - `mem_agent_company_board`
 
 ## Roles
@@ -57,6 +63,23 @@ Kernel law:
 Command concepts exposed by `mem_gstack_catalog` include `mnemo boot`,
 `mnemo claim`, `mnemo receipt`, `mnemo handoff`, `mnemo scar`, `mnemo mission`,
 and the gstack-style `/mnemo-*` review, QA, ship, retro, and security commands.
+
+## Never-Again Layer
+
+The second governance layer turns Mayk's "no forgetting" rules into explicit
+tools:
+
+- `mem_rule_violation_log` records every rule break with agent, rule, action,
+  target, evidence, severity, and prevention.
+- `mem_owner_rule_diff` snapshots project rules and shows added, removed, and
+  changed rule paths.
+- `mem_task_fingerprint` detects duplicate tasks even when phrased differently.
+- `mem_never_again_check` blocks or warns before repeating known mistakes,
+  active incidents, high-severity violations, or duplicate work.
+- `mem_agent_blame_report` gives an accountability report with actions,
+  failures, violations, receipts, handoffs, and a reliability score.
+- `mem_completion_guard_check` blocks COMPLETE without evidence, tests,
+  no-open-blockers state, never-again check, and handoff.
 
 ## Portal Context
 
