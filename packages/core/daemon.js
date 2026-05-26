@@ -7229,6 +7229,7 @@ server.on("error", (err) => {
 server.listen(PORT, HOST, () => {
   console.log(`[mnemo-daemon] HTTP on ${HOST}:${PORT}`);
   if (!BACKGROUND_JOBS_ENABLED) console.log("[mnemo-daemon] background jobs disabled by MNEMO_BACKGROUND_JOBS=0");
+  seedDefaultWatchdogs();
   recordWrite("daemon_boot", 0, "alive");
 });
 
@@ -7897,6 +7898,39 @@ async function antiLoopCycle() {
 scheduleBackgroundInterval(() => { antiLoopCycle().catch(() => {}); }, 30 * 60 * 1000);
 
 // Phase 6 Sprint 2: watchdog runner — 5 min cycle, http checks
+function defaultWatchdogTargets() {
+  const configured = String(process.env.MNEMO_DEFAULT_WATCHDOG_TARGETS || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (configured.length) return configured;
+  return [`http://127.0.0.1:${PORT}/health`];
+}
+
+function seedDefaultWatchdogs() {
+  if (process.env.MNEMO_WATCHDOG_AUTO_SEED === "0") return;
+  const owner = process.env.MNEMO_WATCHDOG_OWNER || DEFAULT_AGENT;
+  const threshold = JSON.stringify({ consecutive_failures: 2, source: "default_seed" });
+  for (const target of defaultWatchdogTargets()) {
+    try {
+      const existing = db.prepare("SELECT id FROM watchdog WHERE target=? AND check_kind='http' LIMIT 1").get(target);
+      if (existing) continue;
+      db.prepare("INSERT INTO watchdog (target, check_kind, owner_agent, threshold_json, enabled) VALUES (?,?,?,?,1)")
+        .run(target, "http", owner, threshold);
+    } catch (e) {
+      console.error("[watchdog-seed]", target, e.message);
+    }
+  }
+}
+
+function watchdogThreshold(row) {
+  let threshold = {};
+  try { threshold = JSON.parse(row && row.threshold_json || "{}"); } catch {}
+  const raw = threshold.consecutive_failures || threshold.failures || threshold.fail_after || 1;
+  const value = parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
 async function watchdogCycle() {
   try {
     const wds = db.prepare("SELECT id, target, check_kind, owner_agent, threshold_json, consecutive_failures FROM watchdog WHERE enabled=1").all();
@@ -7919,8 +7953,10 @@ async function watchdogCycle() {
         } else {
           const fails = (w.consecutive_failures || 0) + 1;
           db.prepare("UPDATE watchdog SET last_check_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), last_status='fail', consecutive_failures=? WHERE id=?").run(fails, w.id);
-          // Open incident on first fail
-          if (fails === 1) {
+          const openAfter = watchdogThreshold(w);
+          if (fails >= openAfter) {
+            const alreadyOpen = db.prepare("SELECT id FROM watchdog_incident WHERE watchdog_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1").get(w.id);
+            if (alreadyOpen) continue;
             db.prepare("INSERT INTO watchdog_incident (watchdog_id, notes) VALUES (?,?)").run(w.id, "auto-detected by watchdog cycle");
             // Drop brief to owner
             if (w.owner_agent) {
