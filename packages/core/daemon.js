@@ -497,6 +497,7 @@ function journalEvent(tdb, event) {
       meta,
       event.occurred_at || now()
     );
+    try { if (tdb === db) recordWrite("event_journal", 1, "alive"); } catch {}
     return { id: r.lastInsertRowid };
   } catch (e) {
     try { recordWrite("event_journal", 0, "error: " + String(e.message || e).slice(0, 100)); } catch {}

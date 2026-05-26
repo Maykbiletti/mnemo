@@ -65,6 +65,10 @@ async function main() {
   assert.strictEqual(memHealth.status, 200);
   assert(memHealth.body && memHealth.body.result, "mem_health result missing");
   assert(Array.isArray(memHealth.body.result.writers), "mem_health should return writers array");
+  const journalWriter = memHealth.body.result.writers.find((row) => row.writer === "event_journal");
+  assert(journalWriter, "mem_health should include event_journal writer");
+  assert.strictEqual(journalWriter.status, "alive");
+  assert.strictEqual(journalWriter.healthy, true);
 
   const watchdog = await fetchJson(`http://127.0.0.1:${port}/tool/mem_watchdog_list`, {
     method: "POST",
