@@ -4473,6 +4473,14 @@ function handleTool(tdb, name, a) {
     case "mem_runtime_health": {
       return runtimeHealth(tdb, a || {});
     }
+    case "mem_health": {
+      const writers = enrichWriterHealthRows(tdb.prepare("SELECT * FROM writer_health ORDER BY last_write_at DESC NULLS LAST").all());
+      const recent = tdb.prepare(
+        "SELECT source, COUNT(*) c, MAX(occurred_at) last_at " +
+        "FROM memory WHERE ingested_at >= date('now', '-1 day') GROUP BY source"
+      ).all();
+      return { writers, last_24h_by_source: recent };
+    }
     case "mem_agent_memory_health": {
       return memoryHealth(tdb, a || {});
     }
