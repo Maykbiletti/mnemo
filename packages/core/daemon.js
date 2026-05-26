@@ -78,6 +78,7 @@ const { ensureProtectedScopeSchema, seedDefaultProtectedScopes, protectedScopeCh
 const { ensureResourceAccessSchema, resourceAccessCheck, handleResourceAccessTool } = require("./resource_access_control");
 const { ensureRuntimeGovernanceSchema, handleRuntimeGovernanceTool } = require("./runtime_governance");
 const { runtimeTurnBegin, runtimeTurnFinish } = require("./runtime_turn_gate");
+const { assessWriterHealth, enrichWriterHealthRows } = require("./writer_health");
 const { ensureMemoryConsolidationSchema, handleMemoryConsolidationTool, dreammodeRun } = require("./memory_consolidation");
 const DEFAULT_AGENT = process.env.MNEMO_DEFAULT_AGENT || process.env.MNEMO_AGENT || "agent";
 const DEFAULT_SCOPE = cleanScope(process.env.MNEMO_DEFAULT_SCOPE || "default");
@@ -461,7 +462,7 @@ const upsertWriter = db.prepare(`
   INSERT INTO writer_health (writer, last_write_at, rows_written, status, last_check_at)
   VALUES (?,?,?,?,?)
   ON CONFLICT(writer) DO UPDATE SET
-    last_write_at=excluded.last_write_at,
+    last_write_at=COALESCE(excluded.last_write_at, writer_health.last_write_at),
     rows_written=writer_health.rows_written + excluded.rows_written,
     status=excluded.status,
     last_check_at=excluded.last_check_at
@@ -2753,17 +2754,16 @@ function buildDriftCheckReport(tdb, input = {}) {
   try {
     const writers = tdb.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all();
     for (const writer of writers) {
-      const ageDays = isoAgeDays(writer.last_write_at || writer.last_check_at);
-      const freshness = freshnessFromAgeDays(ageDays, 2, 7);
-      if ((writer.status && writer.status !== "ok") || freshness !== "fresh") {
+      const health = assessWriterHealth(writer);
+      if (health.drift) {
         push({
           system_name: writer.writer,
           drift_kind: "writer_health",
-          severity: freshness === "critical" ? "H" : "M",
-          freshness_status: freshness,
+          severity: health.drift_severity,
+          freshness_status: health.freshness,
           expected: "writer recently healthy",
-          actual: `status=${writer.status || "unknown"} last_write=${writer.last_write_at || "never"}`,
-          details: writer,
+          actual: `status=${writer.status || "unknown"} last_write=${writer.last_write_at || "never"} reason=${health.health_reason}`,
+          details: Object.assign({}, writer, health),
         });
       }
     }
@@ -5335,7 +5335,7 @@ function handleTool(tdb, name, a) {
         "SUM(CASE WHEN status='duplicate' THEN 1 ELSE 0 END) AS duplicates " +
         "FROM capture_receipt WHERE occurred_at >= ? GROUP BY source, COALESCE(channel,'') ORDER BY last_capture_at DESC"
       ).all(since);
-      const writers = tdb.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all();
+      const writers = enrichWriterHealthRows(tdb.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all());
       return { since, sources: rows, captures, writers };
     }
     case "mem_access_upsert": {
@@ -7839,14 +7839,9 @@ scheduleBackgroundTimeout(() => { urlSweep().catch(() => {}); }, 5000);
 
 // ---------- Health-checker every 5 min ----------
 function healthSweep() {
-  const writers = db.prepare("SELECT writer, last_write_at FROM writer_health").all();
-  const now_ms = Date.now();
+  const writers = db.prepare("SELECT writer, status, last_write_at, last_check_at FROM writer_health").all();
   for (const w of writers) {
-    if (!w.last_write_at) continue;
-    const ageMs = now_ms - new Date(w.last_write_at).getTime();
-    let status = "alive";
-    if (ageMs > 24 * 3600 * 1000) status = "dead";
-    else if (ageMs > 2 * 3600 * 1000) status = "stale";
+    const status = assessWriterHealth(w).next_status;
     db.prepare("UPDATE writer_health SET status=?, last_check_at=? WHERE writer=?")
       .run(status, now(), w.writer);
   }

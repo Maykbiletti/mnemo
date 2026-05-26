@@ -42,6 +42,7 @@ const { RUNTIME_GOVERNANCE_TOOL_DEFS, ensureRuntimeGovernanceSchema, handleRunti
 const { RUNTIME_TURN_TOOL_DEFS, runtimeTurnBegin, runtimeTurnFinish } = require("./runtime_turn_gate");
 const { MEMORY_CONSOLIDATION_TOOL_DEFS, ensureMemoryConsolidationSchema, handleMemoryConsolidationTool } = require("./memory_consolidation");
 const { AGENT_GOVERNANCE_TOOL_DEFS, ensureAgentGovernanceSchema, handleAgentGovernanceTool, capabilityTokenCheck, requiresCapabilityToken } = require("./agent_governance");
+const { assessWriterHealth, enrichWriterHealthRows } = require("./writer_health");
 
 const readline = require("readline");
 
@@ -2159,17 +2160,16 @@ function buildDriftCheckReport(tdb, input = {}) {
   try {
     const writers = db.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all();
     for (const writer of writers) {
-      const ageDays = isoAgeDays(writer.last_write_at || writer.last_check_at);
-      const freshness = freshnessFromAgeDays(ageDays, 2, 7);
-      if ((writer.status && writer.status !== "ok") || freshness !== "fresh") {
+      const health = assessWriterHealth(writer);
+      if (health.drift) {
         push({
           system_name: writer.writer,
           drift_kind: "writer_health",
-          severity: freshness === "critical" ? "H" : "M",
-          freshness_status: freshness,
+          severity: health.drift_severity,
+          freshness_status: health.freshness,
           expected: "writer recently healthy",
-          actual: `status=${writer.status || "unknown"} last_write=${writer.last_write_at || "never"}`,
-          details: writer,
+          actual: `status=${writer.status || "unknown"} last_write=${writer.last_write_at || "never"} reason=${health.health_reason}`,
+          details: Object.assign({}, writer, health),
         });
       }
     }
@@ -3860,7 +3860,7 @@ const tools = {
     description: "Writer-health: which ingestion sources are alive, when each last wrote, dead-since timestamps.",
     inputSchema: { type: "object", properties: {} },
     handler: () => {
-      const writers = db.prepare("SELECT * FROM writer_health ORDER BY last_write_at DESC NULLS LAST").all();
+      const writers = enrichWriterHealthRows(db.prepare("SELECT * FROM writer_health ORDER BY last_write_at DESC NULLS LAST").all());
       const recent = db.prepare(`
         SELECT source, COUNT(*) c, MAX(occurred_at) last_at
         FROM memory
@@ -8465,7 +8465,7 @@ ${args.first_invocation_outcome || "(none)"}
       const since = a.since || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
       const sources = db.prepare("SELECT source, COALESCE(channel,'') AS channel, COUNT(*) AS events, MAX(occurred_at) AS last_event_at, SUM(CASE WHEN status IN ('error','exception','failed') THEN 1 ELSE 0 END) AS errors FROM mnemo_event_journal WHERE occurred_at >= ? GROUP BY source, COALESCE(channel,'') ORDER BY last_event_at DESC").all(since);
       const captures = db.prepare("SELECT source, COALESCE(channel,'') AS channel, COUNT(*) AS receipts, MAX(occurred_at) AS last_capture_at, SUM(CASE WHEN status='duplicate' THEN 1 ELSE 0 END) AS duplicates FROM capture_receipt WHERE occurred_at >= ? GROUP BY source, COALESCE(channel,'') ORDER BY last_capture_at DESC").all(since);
-      const writers = db.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all();
+      const writers = enrichWriterHealthRows(db.prepare("SELECT writer, status, last_write_at, last_check_at, rows_written FROM writer_health ORDER BY writer").all());
       return { since, sources, captures, writers };
     },
   },
