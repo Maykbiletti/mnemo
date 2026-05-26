@@ -1737,6 +1737,67 @@ function validateWorkOrderCompletionEvidence(order, input = {}, evidence = []) {
   return { ok: true, status, missing_required: [], invalid: [], required_evidence: order.required_evidence || [] };
 }
 
+function approvalIdList(value) {
+  return listInput(value).map((item) => String(item || "").trim()).filter(Boolean);
+}
+
+function approvalRefsCheck(db, input = {}) {
+  const ids = uniqueStrings(approvalIdList(input.approval_ids).concat(approvalIdList(input.approval_id)));
+  const requireApprovals = input.require_approval === true || input.require_approvals === true;
+  const result = {
+    ok: true,
+    ids,
+    approved: [],
+    missing: [],
+    invalid: [],
+    pending: [],
+    expired: [],
+    blockers: [],
+  };
+  if (!ids.length) {
+    if (requireApprovals) {
+      result.ok = false;
+      result.blockers.push("approval required");
+    }
+    return result;
+  }
+  if (!tableExists(db, "approval_request")) {
+    result.ok = false;
+    result.blockers.push("approval_request table missing");
+    return result;
+  }
+  const now = Date.now();
+  for (const id of ids) {
+    const approvalId = parseInt(id, 10);
+    if (!Number.isFinite(approvalId)) {
+      result.invalid.push({ id, reason: "approval id must be numeric" });
+      continue;
+    }
+    const row = db.prepare("SELECT * FROM approval_request WHERE id=?").get(approvalId);
+    if (!row) {
+      result.missing.push(id);
+      continue;
+    }
+    const status = String(row.status || "").toLowerCase();
+    const expiresAt = row.expires_at ? Date.parse(row.expires_at) : null;
+    if (expiresAt && Number.isFinite(expiresAt) && expiresAt < now) {
+      result.expired.push({ id, status, expires_at: row.expires_at });
+      continue;
+    }
+    if (status !== "approved") {
+      result.pending.push({ id, status: status || "unknown" });
+      continue;
+    }
+    result.approved.push({ id, status, decided_by: row.decided_by || null, decided_at: row.decided_at || null });
+  }
+  if (result.invalid.length) result.blockers.push("invalid approval ids: " + result.invalid.map((item) => item.id).join(", "));
+  if (result.missing.length) result.blockers.push("missing approvals: " + result.missing.join(", "));
+  if (result.pending.length) result.blockers.push("approvals not approved: " + result.pending.map((item) => item.id + "=" + item.status).join(", "));
+  if (result.expired.length) result.blockers.push("expired approvals: " + result.expired.map((item) => item.id).join(", "));
+  result.ok = result.blockers.length === 0;
+  return result;
+}
+
 function workOrderComplete(db, input = {}) {
   ensureAgentGovernanceSchema(db);
   const id = parseInt(input.id || input.work_order_id, 10);
@@ -1750,6 +1811,35 @@ function workOrderComplete(db, input = {}) {
     return Object.assign({ work_order_id: id }, evidenceCheck);
   }
   const status = evidenceCheck.status || "done";
+  const completionGuard = status === "done" ? completionGuardCheck(db, {
+    scope: input.scope || order.scope,
+    project: input.project || order.project,
+    work_order_id: id,
+    summary: input.completion_summary || input.summary || input.result || order.title || order.objective,
+    evidence,
+    tests: Array.isArray(input.tests) ? input.tests : [],
+    handoff_id: input.handoff_id || input.session_handoff_id || null,
+    blockers: input.blockers || input.open_blockers || [],
+    approval_ids: uniqueStrings(
+      approvalIdList(input.approval_ids)
+        .concat(approvalIdList(input.approval_id))
+        .concat((order.approval_ids || []).map(String))
+    ),
+    require_evidence: input.require_evidence,
+    require_tests: input.require_tests,
+    require_handoff: input.require_handoff,
+    require_approval: input.require_approval,
+    require_approvals: input.require_approvals,
+    skip_never_again: input.skip_never_again === true,
+  }) : null;
+  if (completionGuard && !completionGuard.ok) {
+    return {
+      work_order_id: id,
+      error: "completion_guard_blocked",
+      completion_guard: completionGuard,
+      hint: "done requires passing evidence, tests/checks, a handoff, approved approval refs when present, and no unfinished blockers.",
+    };
+  }
   const completedAtSql = status === "done" || status === "cancelled"
     ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
     : "completed_at";
@@ -1764,7 +1854,7 @@ function workOrderComplete(db, input = {}) {
     safeJson(evidence, []),
     id
   );
-  return { ok: true, status, evidence_check: evidenceCheck, work_order: rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(id)) };
+  return { ok: true, status, evidence_check: evidenceCheck, completion_guard: completionGuard, work_order: rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(id)) };
 }
 
 function capabilityTokenIssue(db, input = {}) {
@@ -1926,13 +2016,13 @@ function capabilityTokenCheck(db, input = {}) {
   const requested = requestedResources(input);
   const resourceMatch = matchRequestedResources(token.allowed_resources || [], requested);
   if (!resourceMatch.ok) blockers.push("requested resources not covered by token");
-  const approvals = uniqueStrings([])
-    .concat(Array.isArray(input.approval_ids) ? input.approval_ids.map(String) : [])
-    .concat(token.approval_ids || []);
-  const missingApproval = (input.require_approval === true || boolFlag(token.meta && token.meta.requires_approval, false) || isCriticalRisk(token.risk_class)) &&
-    approvals.length === 0 &&
-    !boolFlag(token.meta && token.meta.approval_not_required, false);
-  if (missingApproval) blockers.push("approval required for token risk class");
+  const approvals = uniqueStrings(approvalIdList(input.approval_ids).concat(approvalIdList(input.approval_id)).concat((token.approval_ids || []).map(String)));
+  const approvalNotRequired = boolFlag(token.meta && token.meta.approval_not_required, false);
+  const approvalRequired = input.require_approval === true || boolFlag(token.meta && token.meta.requires_approval, false) || isCriticalRisk(token.risk_class);
+  const approvalCheck = (approvals.length || (approvalRequired && !approvalNotRequired))
+    ? approvalRefsCheck(db, { approval_ids: approvals, require_approval: approvalRequired && !approvalNotRequired })
+    : { ok: true, ids: [], approved: [], missing: [], invalid: [], pending: [], expired: [], blockers: [] };
+  if (!approvalCheck.ok) blockers.push(...approvalCheck.blockers.map((entry) => "approval " + entry));
   const result = {
     ok: blockers.length === 0,
     granted: blockers.length === 0,
@@ -1943,7 +2033,8 @@ function capabilityTokenCheck(db, input = {}) {
     agent_name: token.agent_name,
     project: token.project,
     matched_scope: { resources: resourceMatch.matched, missing_resources: resourceMatch.missing, tool_name: input.tool_name || null },
-    missing_approval: missingApproval,
+    missing_approval: !approvalCheck.ok,
+    approval_check: approvalCheck,
     required_evidence: token.required_evidence || [],
     expires_at: token.expires_at,
   };
@@ -3126,7 +3217,10 @@ function agentBlameReport(db, input = {}) {
 function completionGuardCheck(db, input = {}) {
   ensureAgentGovernanceSchema(db);
   const evidence = Array.isArray(input.evidence) ? input.evidence : [];
-  const required = uniqueStrings(listInput(input.required_evidence || input.requirements).concat(input.work_order_id && tableExists(db, "work_order") ? (rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(parseInt(input.work_order_id, 10))) || {}).required_evidence || [] : []));
+  const workOrder = input.work_order_id && tableExists(db, "work_order")
+    ? rowToWorkOrder(db.prepare("SELECT * FROM work_order WHERE id=?").get(parseInt(input.work_order_id, 10)))
+    : null;
+  const required = uniqueStrings(listInput(input.required_evidence || input.requirements).concat(workOrder ? workOrder.required_evidence || [] : []));
   const invalid = evidence.map(validateEvidenceItem).filter(Boolean).concat(evidence.map(nonPassEvidenceReason).filter(Boolean));
   const missing = required.filter((requirement) => !evidence.some((item) => evidenceMatchesRequirement(item, requirement)));
   const blockers = [];
@@ -3140,10 +3234,19 @@ function completionGuardCheck(db, input = {}) {
   if (!handoffId && input.require_handoff !== false) blockers.push("handoff required");
   const openBlockers = listInput(input.blockers || input.open_blockers);
   if (openBlockers.length) blockers.push("unfinished blockers: " + openBlockers.join(", "));
+  const approvalCheck = approvalRefsCheck(db, {
+    approval_ids: uniqueStrings(
+      approvalIdList(input.approval_ids)
+        .concat(approvalIdList(input.approval_id))
+        .concat(workOrder ? (workOrder.approval_ids || []).map(String) : [])
+    ),
+    require_approval: input.require_approval === true || input.require_approvals === true,
+  });
+  if (!approvalCheck.ok) blockers.push(...approvalCheck.blockers.map((entry) => "approval " + entry));
   const never = input.skip_never_again === true ? null : neverAgainCheck(db, { scope: input.scope, project: input.project, task: input.summary || input.task || input.title });
   if (never && never.status === "block") blockers.push(...never.blockers.map((item) => "never-again: " + item));
   const status = blockers.length ? "block" : "pass";
-  return { status, ok: status === "pass", blockers, invalid_evidence: invalid, missing_required: missing, required_evidence: required, tests_checked: hasTestEvidence, handoff_id: handoffId || null, never_again: never };
+  return { status, ok: status === "pass", blockers, invalid_evidence: invalid, missing_required: missing, required_evidence: required, tests_checked: hasTestEvidence, handoff_id: handoffId || null, approval_check: approvalCheck, never_again: never };
 }
 
 function agentOsBoot(db, input = {}) {

@@ -103,6 +103,30 @@ function tool(name, args) {
   });
   assert.strictEqual(noEvidence.error, "evidence_required");
 
+  const weakEvidence = runtimeToolReceiptFinish(db, {
+    receipt_id: receipt.receipt_id,
+    status: "done",
+    result_summary: "patched",
+    evidence: [{ test_step: "unit test" }],
+  });
+  assert.strictEqual(weakEvidence.error, "evidence_invalid");
+
+  const failingEvidence = runtimeToolReceiptFinish(db, {
+    receipt_id: receipt.receipt_id,
+    status: "done",
+    result_summary: "patched",
+    evidence: [{ file_path: "packages/core/mcp.js", test_step: "unit test", result: "failed", exit_code: 0 }],
+  });
+  assert.strictEqual(failingEvidence.error, "evidence_not_passing");
+
+  const missingHandoff = runtimeToolReceiptFinish(db, {
+    receipt_id: receipt.receipt_id,
+    status: "done",
+    result_summary: "patched",
+    handoff_id: 99,
+  });
+  assert.strictEqual(missingHandoff.error, "handoff_table_missing");
+
   const done = runtimeToolReceiptFinish(db, {
     receipt_id: receipt.receipt_id,
     status: "done",
@@ -111,6 +135,35 @@ function tool(name, args) {
   });
   assert.strictEqual(done.ok, true);
   assert.strictEqual(done.evidence_count, 1);
+}
+
+{
+  db.exec("CREATE TABLE IF NOT EXISTS session_handoff (id INTEGER PRIMARY KEY, meta_json TEXT)");
+  db.prepare("INSERT INTO session_handoff (id, meta_json) VALUES (?, ?)").run(42, JSON.stringify({
+    evidence: [{ file_path: "packages/core/runtime_governance.js", test_step: "runtime receipt negative test", result: "pass", exit_code: 0 }]
+  }));
+  const receipt = runtimeToolReceiptStart(db, {
+    runtime_name: "openclaw",
+    agent_name: "alfred",
+    project: "mnemo",
+    task: "finish with handoff evidence",
+    action_type: "code_edit",
+    tool_name: "browser.click",
+    files: ["packages/core/runtime_governance.js"],
+    request_id: "handoff-evidence-ok",
+  }, {
+    preflight: { status: "ok", preflight_action_id: 124, blockers: [], claims: [{ id: 78 }] },
+  });
+  assert.strictEqual(receipt.allowed, true);
+  const done = runtimeToolReceiptFinish(db, {
+    receipt_id: receipt.receipt_id,
+    status: "done",
+    result_summary: "handoff carries evidence",
+    handoff_id: 42,
+  });
+  assert.strictEqual(done.ok, true);
+  assert.strictEqual(done.handoff_evidence.ok, true);
+  assert.strictEqual(done.handoff_evidence.evidence_count, 1);
 }
 
 {

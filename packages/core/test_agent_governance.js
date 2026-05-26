@@ -8,6 +8,10 @@ const {
   capabilityTokenCheck,
   requiresCapabilityToken,
 } = require("./agent_governance");
+const {
+  ensureResourceAccessSchema,
+  handleResourceAccessTool,
+} = require("./resource_access_control");
 
 const db = new Database(":memory:");
 db.exec(`
@@ -75,10 +79,17 @@ CREATE TABLE quality_finding (
 );
 `);
 ensureAgentGovernanceSchema(db);
+ensureResourceAccessSchema(db);
 
 function tool(name, args) {
   const handled = handleAgentGovernanceTool(db, name, args || {});
   assert(handled.handled, "tool not handled: " + name);
+  return handled.result;
+}
+
+function resourceTool(name, args) {
+  const handled = handleResourceAccessTool(db, name, args || {});
+  assert(handled.handled, "resource tool not handled: " + name);
   return handled.result;
 }
 
@@ -310,6 +321,14 @@ let workOrderId;
   });
   assert.strictEqual(failingResult.error, "evidence_not_passing");
 
+  const noHandoff = tool("mem_work_order_complete", {
+    work_order_id: workOrderId,
+    completion_summary: "done",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass" }],
+  });
+  assert.strictEqual(noHandoff.error, "completion_guard_blocked");
+  assert(noHandoff.completion_guard.blockers.includes("handoff required"));
+
   const needsReview = tool("mem_work_order_complete", {
     work_order_id: workOrderId,
     status: "needs_review",
@@ -322,11 +341,14 @@ let workOrderId;
   const complete = tool("mem_work_order_complete", {
     work_order_id: workOrderId,
     completion_summary: "token gate implemented",
+    handoff_id: 1,
+    tests: ["node test_agent_governance.js"],
     evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass", files: ["packages/core/test_agent_governance.js"] }],
   });
   assert.strictEqual(complete.ok, true);
   assert.strictEqual(complete.work_order.status, "done");
   assert.strictEqual(complete.evidence_check.ok, true);
+  assert.strictEqual(complete.completion_guard.ok, true);
 }
 
 {
@@ -351,9 +373,67 @@ let workOrderId;
   const okDone = tool("mem_work_order_complete", {
     work_order_id: noRequired.work_order.id,
     completion_summary: "docs note written",
+    handoff_id: 2,
+    tests: ["diff reviewed"],
     evidence: [{ check: "diff reviewed", file_path: "docs/work-orders-capability-tokens.md", result: "pass" }],
   });
   assert.strictEqual(okDone.ok, true);
+}
+
+{
+  const missingApproval = tool("mem_completion_guard_check", {
+    project: "mnemo",
+    summary: "approval consistency negative test",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass" }],
+    tests: ["node test_agent_governance.js"],
+    handoff_id: 3,
+    approval_ids: ["9999"],
+    skip_never_again: true,
+  });
+  assert.strictEqual(missingApproval.status, "block");
+  assert(missingApproval.blockers.some((entry) => entry.includes("approval missing approvals")));
+
+  const approval = resourceTool("mem_approval_request", {
+    project: "mnemo",
+    resource_kind: "system",
+    resource_key: "production_infra",
+    requester_agent: "alfred",
+    owner_agent: "alfred",
+    permission: "deploy",
+    reason: "approval consistency unit test",
+  });
+  assert.strictEqual(approval.ok, true);
+
+  const pendingApproval = tool("mem_completion_guard_check", {
+    project: "mnemo",
+    summary: "approval consistency pending test",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass" }],
+    tests: ["node test_agent_governance.js"],
+    handoff_id: 4,
+    approval_ids: [String(approval.id)],
+    skip_never_again: true,
+  });
+  assert.strictEqual(pendingApproval.status, "block");
+  assert(pendingApproval.blockers.some((entry) => entry.includes("approval approvals not approved")));
+
+  const decision = resourceTool("mem_approval_decide", {
+    id: approval.id,
+    decided_by: "alfred",
+    status: "approved",
+  });
+  assert.strictEqual(decision.ok, true);
+
+  const approved = tool("mem_completion_guard_check", {
+    project: "mnemo",
+    summary: "approval consistency approved test",
+    evidence: [{ check: "unit tests", command: "node test_agent_governance.js", exit_code: 0, result: "pass" }],
+    tests: ["node test_agent_governance.js"],
+    handoff_id: 5,
+    approval_ids: [String(approval.id)],
+    skip_never_again: true,
+  });
+  assert.strictEqual(approved.status, "pass");
+  assert.strictEqual(approved.approval_check.ok, true);
 }
 
 {

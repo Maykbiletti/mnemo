@@ -91,6 +91,87 @@ function parseJsonField(value, fallback) {
   return parseMaybeJson(value, fallback);
 }
 
+function tableExists(db, tableName) {
+  try {
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?").get(tableName);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeEvidenceText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function runtimeEvidenceText(item = {}) {
+  return [
+    item.check,
+    item.name,
+    item.label,
+    item.test_step,
+    item.command,
+    item.file_path,
+    item.url,
+    item.output_ref,
+    item.result,
+    item.status
+  ].filter(Boolean).join(" ");
+}
+
+function validateRuntimeEvidenceItem(item, index) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return "evidence[" + index + "] must be an object";
+  }
+  const hasOutcome = item.result != null || item.status != null || item.exit_code != null || item.exitCode != null;
+  const hasCheck = !!String(item.check || item.name || item.label || item.test_step || item.command || "").trim();
+  const hasTarget = !!String(item.file_path || item.url || item.output_ref || item.receipt_id || item.screenshot_path || item.media_id || "").trim()
+    || ["files", "urls", "artifacts", "screenshots"].some((field) => Array.isArray(item[field]) && item[field].length > 0);
+  if (!hasOutcome) return "evidence[" + index + "] needs result/status/exit_code";
+  if (!hasCheck && !hasTarget) return "evidence[" + index + "] needs command/test_step/check or file/url/artifact reference";
+  if (item.command && item.exit_code == null && item.exitCode == null) return "evidence[" + index + "] command evidence needs exit_code";
+  return null;
+}
+
+function nonPassRuntimeEvidenceReason(item, index) {
+  const exitCode = item && (item.exit_code != null ? item.exit_code : item.exitCode);
+  if (exitCode != null) {
+    const n = Number(exitCode);
+    if (!Number.isFinite(n) || n !== 0) {
+      return "evidence[" + index + "] exit_code must be 0 for done";
+    }
+  }
+  const outcome = normalizeEvidenceText([item && item.result, item && item.status].filter(Boolean).join(" "));
+  if (outcome && /\b(fail|failed|failure|error|errored|exception|blocked|block|needs review|needs_review|incomplete|missing|skipped|cancelled|canceled|timeout|timed out|red|not ok|nok)\b/.test(outcome)) {
+    return "evidence[" + index + "] outcome is not passing for done";
+  }
+  return null;
+}
+
+function validateRuntimeEvidenceSet(evidence = []) {
+  const invalid = evidence.map(validateRuntimeEvidenceItem).filter(Boolean);
+  if (invalid.length) return { ok: false, error: "evidence_invalid", invalid };
+  const failing = evidence.map(nonPassRuntimeEvidenceReason).filter(Boolean);
+  if (failing.length) return { ok: false, error: "evidence_not_passing", invalid: failing };
+  return { ok: true, invalid: [] };
+}
+
+function handoffEvidenceCheck(db, handoffId) {
+  const id = parseInt(handoffId, 10);
+  if (!id) return { ok: false, error: "handoff_id_invalid", evidence_count: 0 };
+  if (!tableExists(db, "session_handoff")) return { ok: false, error: "handoff_table_missing", handoff_id: id, evidence_count: 0 };
+  const row = db.prepare("SELECT * FROM session_handoff WHERE id=?").get(id);
+  if (!row) return { ok: false, error: "handoff_not_found", handoff_id: id, evidence_count: 0 };
+  const meta = parseJsonField(row.meta_json, {});
+  const evidence = Array.isArray(meta.evidence) ? meta.evidence : [];
+  if (!evidence.length) return { ok: false, error: "handoff_evidence_required", handoff_id: id, evidence_count: 0 };
+  const check = validateRuntimeEvidenceSet(evidence);
+  return Object.assign({}, check, { handoff_id: id, evidence_count: evidence.length });
+}
+
 function normalizePolicyPart(value, fallback = "*") {
   const raw = String(value == null ? "" : value).trim();
   if (!raw || raw === "*") return fallback;
@@ -830,18 +911,45 @@ function runtimeToolReceiptFinish(db, input = {}) {
     };
   }
   const evidence = Array.isArray(input.evidence) ? input.evidence : [];
-  if (status === "done" && !!row.evidence_required && !evidence.length && !input.handoff_id) {
-    return {
-      error: "evidence_required",
-      receipt_id: receiptId,
-      hint: "Pass evidence=[{target|url|file_path|server|screenshot_path, test_step, result, timestamp}] or link a handoff_id that contains evidence."
-    };
+  let evidenceCheck = { ok: true, invalid: [] };
+  let handoffEvidence = null;
+  if (status === "done" && !!row.evidence_required) {
+    if (evidence.length) {
+      evidenceCheck = validateRuntimeEvidenceSet(evidence);
+      if (!evidenceCheck.ok) {
+        return {
+          error: evidenceCheck.error,
+          receipt_id: receiptId,
+          invalid: evidenceCheck.invalid,
+          hint: "done requires passing evidence with result/status/exit_code and a concrete command, check, file, URL, or artifact reference."
+        };
+      }
+    } else if (input.handoff_id) {
+      handoffEvidence = handoffEvidenceCheck(db, input.handoff_id);
+      if (!handoffEvidence.ok) {
+        return {
+          error: handoffEvidence.error,
+          receipt_id: receiptId,
+          handoff_id: input.handoff_id,
+          invalid: handoffEvidence.invalid || [],
+          hint: "Linked handoff must exist and contain passing evidence in meta.evidence."
+        };
+      }
+    } else {
+      return {
+        error: "evidence_required",
+        receipt_id: receiptId,
+        hint: "Pass evidence=[{target|url|file_path|server|screenshot_path, test_step, result, timestamp}] or link a handoff_id that contains passing evidence."
+      };
+    }
   }
   const shapedEvidence = evidence.map((item) => Object.assign({}, item, { timestamp: item && item.timestamp || nowIso() }));
   const resultSummary = compactContent(input.result_summary || input.summary || input.result || input.error || status, 1200);
   const meta = Object.assign(parseJsonField(row.meta_json, {}), input.meta || {}, {
     handoff_id: input.handoff_id || null,
     output_ref: input.output_ref || null,
+    evidence_check: evidenceCheck,
+    handoff_evidence: handoffEvidence,
   });
   db.prepare(
     "UPDATE runtime_tool_receipt SET status=?, evidence_json=?, result_summary=?, result_json=?, error=?, meta_json=?, finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE receipt_id=?"
@@ -854,7 +962,7 @@ function runtimeToolReceiptFinish(db, input = {}) {
     safeJson(meta, {}),
     receiptId
   );
-  return { ok: true, receipt_id: receiptId, status, evidence_count: shapedEvidence.length, handoff_id: input.handoff_id || null };
+  return { ok: true, receipt_id: receiptId, status, evidence_count: shapedEvidence.length, handoff_id: input.handoff_id || null, evidence_check: evidenceCheck, handoff_evidence: handoffEvidence };
 }
 
 function rowToReceipt(row) {
