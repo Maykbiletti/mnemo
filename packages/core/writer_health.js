@@ -1,6 +1,6 @@
 "use strict";
 
-const DEFAULT_REQUIRED_FRESH_WRITERS = ["capture:codexlink", "capture:agent-runtime"];
+const DEFAULT_REQUIRED_FRESH_WRITERS = [];
 const DEFAULT_STALE_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_DEAD_MS = 24 * 60 * 60 * 1000;
 
